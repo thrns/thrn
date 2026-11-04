@@ -3,11 +3,18 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 message="${1:-}"
-[[ -n "$message" ]] || { echo 'Usage: finish-task.sh "feat: ..."' >&2; exit 2; }
+pr_title="${2:-$message}"
+[[ -n "$message" ]] || { echo 'Usage: finish-task.sh "type: commit message" ["PR title"]' >&2; exit 2; }
 branch="$(git branch --show-current)"
 if [[ ! "$branch" =~ ^(feature|fix|refactor|docs|test|chore|security)/[a-z0-9][a-z0-9._-]*$ ]] || [[ "$branch" == *codex* ]]; then
   echo 'Invalid task branch; refusing to commit or push.' >&2; exit 1
 fi
+origin_url="$(git remote get-url origin 2>/dev/null)" || { echo 'No origin configured.' >&2; exit 1; }
+case "$origin_url" in
+  https://github.com/thrns/thrn|https://github.com/thrns/thrn.git|git@github.com:thrns/thrn.git|ssh://git@github.com:thrns/thrn.git) ;;
+  *) echo "Unexpected origin for THRN: $origin_url" >&2; exit 1 ;;
+esac
+git config --local core.hooksPath .githooks
 command -v gh >/dev/null && gh auth status >/dev/null 2>&1 || { echo 'GitHub CLI authentication required.' >&2; exit 1; }
 mkdir -p .thrn-reports
 logfile=".thrn-reports/${branch//\//-}-local.log"
@@ -39,7 +46,7 @@ printf '\n==> create or locate pull request\n'
 if gh pr view "$branch" --json url --jq '.url' >/dev/null 2>&1; then
   pr_url="$(gh pr view "$branch" --json url --jq '.url')"
 else
-  pr_url="$(gh pr create --base main --head "$branch" --title "$message" --body-file .github/pull_request_template.md)"
+  pr_url="$(gh pr create --draft --base main --head "$branch" --title "$pr_title" --body-file .github/pull_request_template.md)"
 fi
 printf '\n=== DELIVERY REPORT ===\n'
 printf 'branch: %s\ncommit: %s\npull_request: %s\nlocal_checks: PASS\nlocal_log: %s\n' "$branch" "$sha" "$pr_url" "$logfile"

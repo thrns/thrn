@@ -1,0 +1,35 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "THRN: verify",
+      "type": "shell",
+      "command": "bash",
+      "args": ["scripts/verify.sh"],
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "THRN: test",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["test", "--locked", "--all-targets", "--all-features"],
+      "group": "test",
+      "problemMatcher": "$rustc"
+    },
+    {
+      "label": "THRN: release build",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["build", "--locked", "--release"],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": "$rustc"
+    }
+  ]
+}
