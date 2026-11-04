@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Local release gate. No --fix / --allow-dirty flags: fails closed.
 set -euo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+cd "$(dirname "$BASH_SOURCE")/.."
+printf '==> shell syntax\n'
+bash -n scripts/finish-task.sh scripts/verify.sh scripts/tests/test_finish_task.sh .githooks/pre-push
+printf '==> delivery automation tests\n'
+bash scripts/tests/test_finish_task.sh
 command -v cargo >/dev/null || { echo 'Rust/Cargo missing; see START_HERE.md' >&2; exit 1; }
 printf '==> rustfmt\n'
 cargo fmt --all -- --check
