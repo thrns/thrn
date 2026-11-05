@@ -12,7 +12,11 @@ cargo run --locked -- --version
 cargo run --locked -- doctor
 ```
 
-`thrn doctor` reports the crate version and compiled build target. It does not inspect agent installations, access a registry, write files, or make network requests.
+`thrn doctor` reports the crate version and the operating system and architecture reported by the build. That OS/architecture pair is not a full Rust target triple. The command does not inspect agent installations, access a registry, write files, or make network requests.
+
+## CLI output and exit codes
+
+Successful command output, including `--help`, `--version`, and `doctor`, goes to stdout. Clap usage errors and command diagnostics go to stderr. Successful commands exit with code `0`; invalid or missing command-line arguments exit with code `2`; output or other command I/O failures exit nonzero (currently code `1`). The CLI does not yet provide JSON output or a broader categorized failure-code scheme.
 
 Use `thrn --help` to see the commands currently available. No npm or PyPI package is provided.
 
