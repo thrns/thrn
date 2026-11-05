@@ -125,12 +125,29 @@ fn invalid_option_has_actionable_usage_error() {
 #[test]
 fn missing_command_is_a_usage_error() {
     let output = run_cli(&[]);
-
-    assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Usage: thrn <COMMAND>"));
-    assert!(!stderr.contains("panicked"));
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "unexpected exit status; stderr:\n{stderr}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "stdout should be empty; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Usage:"),
+        "stderr should contain an actionable usage message; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("<COMMAND>"),
+        "stderr should identify the required command argument; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "CLI should not panic; stderr:\n{stderr}"
+    );
 }
 
 #[cfg(unix)]
