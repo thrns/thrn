@@ -1,6 +1,7 @@
 mod cli;
 mod doctor;
 mod error;
+mod install;
 pub mod models;
 pub mod registry;
 pub mod skills;
