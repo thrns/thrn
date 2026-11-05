@@ -948,6 +948,20 @@ fn entry_kind<R: Read>(
         });
     }
 
+    // GitHub's source archive writer emits ordinary files with DOS creator metadata and no
+    // external attributes. That encoding has no Unix mode to inspect; an unmarked, non-directory
+    // entry is nevertheless an ordinary ZIP file. Keep this fallback exact so unknown systems,
+    // Unix entries without type bits, and DOS entries carrying any unrecognized attributes still
+    // fail closed.
+    if entry.system() == System::Dos
+        && entry.external_attributes() == 0
+        && !has_directory_marker
+        && entry.is_file()
+        && !entry.is_symlink()
+    {
+        return Ok(ArchiveEntryKind::File);
+    }
+
     let mode = entry
         .unix_mode()
         .ok_or(ArchiveError::InvalidEntryMetadata {
