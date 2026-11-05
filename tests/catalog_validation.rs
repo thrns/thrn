@@ -1,11 +1,11 @@
 use serde_json::{Value, json};
+#[path = "../src/registry/catalog.rs"]
+mod catalog_parser;
 #[path = "../src/models/mod.rs"]
 mod models;
-#[path = "../src/registry/mod.rs"]
-mod registry;
 
+use catalog_parser::{CatalogError, JsonProblem, MAX_ALIASES_PER_RESOURCE, parse_catalog_json};
 use models::catalog::{ResourceKind, SourceProvider};
-use registry::catalog::{CatalogError, JsonProblem, MAX_ALIASES_PER_RESOURCE, parse_catalog_json};
 
 const VALID_FIXTURE: &str = include_str!("fixtures/catalog/test-only-valid-v1.json");
 const MULTIPLE_FIXTURE: &str =

@@ -7,6 +7,8 @@ pub enum ThrnError {
     #[error(transparent)]
     Catalog(#[from] crate::registry::catalog::CatalogError),
     #[error(transparent)]
+    CatalogRefresh(#[from] crate::registry::catalog_service::CatalogRefreshError),
+    #[error(transparent)]
     Resolution(#[from] crate::registry::discovery::ResolutionError),
     #[error("skill validation failed")]
     SkillValidation {
