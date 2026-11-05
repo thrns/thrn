@@ -2,7 +2,7 @@
 
 ## Current exposure
 
-THRN is under development and has no supported installer release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, reads validated local catalog data, offers an explicit HTTPS catalog refresh, and performs read-only local `SKILL.md` validation. Default discovery never uses the network. Explicit refresh contacts one fixed THRN-operated HTTPS endpoint, validates the response, and writes only the catalog cache. It does not fetch skills, read credentials, install content, or execute subprocesses. Archive extraction, target ownership, installation staging, receipts, and rollback protections are not implemented; their absence is not a security guarantee for an installer.
+THRN is under development and has no supported installer release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, reads validated local catalog data, offers an explicit HTTPS catalog refresh, performs read-only local `SKILL.md` validation, and checks the future receipt directory for installed listing. Default discovery and both `skills list` modes never use the network. Explicit refresh contacts one fixed THRN-operated HTTPS endpoint, validates the response, and writes only the catalog cache. No command fetches skills or executes subprocesses. The installed listing reads only THRN's application-data receipt directory: it does not inspect agent skill folders, create receipt storage, or interpret a provisional receipt format. Installation, durable receipts, target ownership, archive extraction, staging, and rollback protections are not implemented; their absence is not a security guarantee for an installer.
 
 ## Boundaries required before installation
 
@@ -20,7 +20,7 @@ Before M2 installation work is accepted, source and filesystem handling must:
 
 ## Milestone status
 
-Implemented in M1-01 through M1-04:
+Implemented in M1-01 through M1-05:
 
 - **Catalog boundary:** version-1 JSON is size- and count-bounded; required fields, identifiers,
   case-insensitive ID/alias collisions, GitHub metadata, full commit hashes, and source-path
@@ -44,6 +44,23 @@ Implemented in M1-01 through M1-04:
   writes via a same-directory temporary file and atomic replacement. Failed fetches, validation,
   or commits do not replace the last valid cache. Offline discovery uses cache or bundled metadata
   and never silently refreshes stale content.
+- **Listing boundary:** M1-05's catalog list reuses the validated local catalog selection and exact
+  resolver. The installed list considers only whether the OS application-data `receipts` directory
+  is missing or empty. Existing content is an error until M2-05 defines receipt schema and
+  ownership; no installation records are inferred from catalog data or agent folders. Listing
+  creates no directories and writes no files.
+
+## Non-blocking M1-04 follow-up review
+
+The M1-04 cache implementation has two follow-up topics for a later security review; they do not
+block offline listing and are not expanded in M1-05:
+
+- **Filesystem hardening:** review path-component and concurrent-replacement races around cache
+  directory validation and atomic replacement, and decide whether parent-directory durability
+  failures should be surfaced instead of best-effort ignored.
+- **Recovery messaging:** refine the cache-fallback diagnostic so it distinguishes corrupt cache
+  data from unsafe or inaccessible cache storage, and explains what refresh can repair while
+  making clear that failed refreshes preserve the prior cache.
 
 Remaining requirements:
 

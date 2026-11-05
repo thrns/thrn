@@ -19,9 +19,21 @@ esac
 
 [[ -f "$executable" ]] || { echo "Release executable not found: $executable" >&2; exit 1; }
 
+smoke_root="$(mktemp -d)"
+trap 'rm -rf "$smoke_root"' EXIT
+
+run_isolated() {
+  THRN_CACHE_DIR="$smoke_root/cache" \
+  THRN_DATA_DIR="$smoke_root/data" \
+    "$executable" "$@"
+}
+
 "$executable" --help >/dev/null
 "$executable" --version >/dev/null
 "$executable" doctor >/dev/null
+run_isolated skills list >/dev/null
+run_isolated skills list --installed >/dev/null
+run_isolated skills list --help >/dev/null
 
 if "$executable" __thrn_invalid_command__ >/dev/null 2>&1; then
   echo 'Invalid command unexpectedly succeeded.' >&2

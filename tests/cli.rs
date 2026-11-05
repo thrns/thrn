@@ -56,7 +56,9 @@ fn command_in(directory: &TestDir, args: &[&str]) -> Command {
     command.env("XDG_CACHE_HOME", directory.root().join("xdg-cache"));
     command.env("LOCALAPPDATA", directory.root().join("local-app-data"));
     command.env("THRN_CACHE_DIR", directory.root().join("thrn-cache"));
+    command.env("THRN_DATA_DIR", directory.root().join("thrn-data"));
     command.env("ALL_PROXY", "http://127.0.0.1:0");
+    command.env("HTTPS_PROXY", "http://127.0.0.1:0");
     command.env("NO_PROXY", "");
 
     // Windows may need SystemRoot to launch a child process. This is an OS
@@ -71,6 +73,14 @@ fn command_in(directory: &TestDir, args: &[&str]) -> Command {
 
 fn cache_file(directory: &TestDir) -> PathBuf {
     directory.root().join("thrn-cache/catalog-v1.cache")
+}
+
+fn data_directory(directory: &TestDir) -> PathBuf {
+    directory.root().join("thrn-data")
+}
+
+fn receipt_directory(directory: &TestDir) -> PathBuf {
+    data_directory(directory).join("receipts")
 }
 
 fn write_cache(directory: &TestDir, catalog: &[u8]) {
@@ -119,6 +129,207 @@ fn empty_skill_search_lists_the_bundled_catalog_offline() {
     assert!(stdout.contains("frontend-design  Frontend Design"));
     assert!(stdout.contains("typography"));
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn skills_list_shows_the_bundled_catalog_offline_and_in_canonical_order() {
+    let directory = TestDir::new();
+    let first = command_in(&directory, &["skills", "list"])
+        .output()
+        .expect("CLI process starts");
+    let second = command_in(&directory, &["skills", "list"])
+        .output()
+        .expect("CLI process starts");
+
+    assert_eq!(first.status.code(), Some(0));
+    assert_eq!(first.stdout, second.stdout);
+    let stdout = String::from_utf8_lossy(&first.stdout);
+    assert!(stdout.contains("Catalog source: bundled metadata; freshness: unknown"));
+    assert!(stdout.contains("Curated skill catalog (schema v1)"));
+    assert!(stdout.contains("frontend-design  Frontend Design"));
+    assert!(stdout.contains("Guidance for distinctive visual design"));
+    assert!(first.stderr.is_empty());
+    assert!(!directory.root().join("thrn-cache").exists());
+    assert!(!data_directory(&directory).exists());
+}
+
+#[test]
+fn skills_list_uses_valid_cached_catalog_without_writing_it() {
+    let directory = TestDir::new();
+    let fixture = include_bytes!("fixtures/catalog/test-only-valid-v1.json");
+    write_cache(&directory, fixture);
+    let cache_before = fs::read(cache_file(&directory)).expect("cache exists");
+
+    let output = command_in(&directory, &["skills", "list"])
+        .output()
+        .expect("CLI process starts");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Catalog source: local cache; freshness: fresh"));
+    assert!(stdout.contains("uncharted  Uncharted Ideation"));
+    assert!(!stdout.contains("frontend-design"));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        fs::read(cache_file(&directory)).expect("cache remains present"),
+        cache_before
+    );
+    assert!(!data_directory(&directory).exists());
+}
+
+#[test]
+fn skills_list_uses_stale_cache_offline_and_reports_its_freshness() {
+    let directory = TestDir::new();
+    let fixture = include_bytes!("fixtures/catalog/test-only-valid-v1.json");
+    let cache = cache_file(&directory);
+    fs::create_dir_all(cache.parent().expect("cache has a parent"))
+        .expect("cache directory should be created");
+    let envelope = "THRN-CATALOG-CACHE 1\nsource=https://raw.githubusercontent.com/thrns/thrn/main/src/registry/builtin-v1.json\nrefreshed_at_unix_seconds=1\n\n";
+    let mut contents = envelope.as_bytes().to_vec();
+    contents.extend_from_slice(fixture);
+    fs::write(cache, contents).expect("stale cache should be written");
+
+    let output = command_in(&directory, &["skills", "list"])
+        .output()
+        .expect("CLI process starts");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Catalog source: local cache; freshness: stale"));
+    assert!(stdout.contains("uncharted  Uncharted Ideation"));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn skills_list_ignores_corrupt_cache_with_a_bundled_fallback_diagnostic() {
+    let directory = TestDir::new();
+    let cache = cache_file(&directory);
+    fs::create_dir_all(cache.parent().expect("cache has a parent"))
+        .expect("cache directory should be created");
+    fs::write(cache, b"not a catalog cache").expect("corrupt cache should be written");
+
+    let output = command_in(&directory, &["skills", "list"])
+        .output()
+        .expect("CLI process starts");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Catalog source: bundled metadata; freshness: unknown"));
+    assert!(stdout.contains("frontend-design  Frontend Design"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cached catalog could not be read and was ignored"));
+    assert!(stderr.contains("using bundled metadata"));
+}
+
+#[test]
+fn skills_list_sorts_cached_catalog_by_canonical_id_and_handles_empty_catalog() {
+    let directory = TestDir::new();
+    write_cache(
+        &directory,
+        include_bytes!("fixtures/catalog/test-only-multiple-resources-v1.json"),
+    );
+
+    let ordered = command_in(&directory, &["skills", "list"])
+        .output()
+        .expect("CLI process starts");
+    assert_eq!(ordered.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&ordered.stdout);
+    let refactor = stdout
+        .find("refactor-helper")
+        .expect("refactor entry is listed");
+    let research = stdout
+        .find("research-helper")
+        .expect("research entry is listed");
+    assert!(
+        refactor < research,
+        "catalog listing is not ID-sorted: {stdout}"
+    );
+    assert!(ordered.stderr.is_empty());
+
+    let empty = TestDir::new();
+    write_cache(
+        &empty,
+        include_bytes!("fixtures/catalog/test-only-empty-v1.json"),
+    );
+    let output = command_in(&empty, &["skills", "list"])
+        .output()
+        .expect("CLI process starts");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("No catalog skills are available in the selected catalog.")
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn installed_listing_treats_missing_or_empty_receipt_storage_as_no_managed_installs() {
+    let missing = TestDir::new();
+    let catalog = command_in(&missing, &["skills", "list"])
+        .output()
+        .expect("catalog listing process starts");
+    assert_eq!(catalog.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&catalog.stdout).contains("frontend-design"));
+
+    let output = command_in(&missing, &["skills", "list", "--installed"])
+        .output()
+        .expect("CLI process starts");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("No THRN-managed installations are recorded."));
+    assert!(stdout.contains("Skills installed outside THRN are not included."));
+    assert!(!stdout.contains("frontend-design"));
+    assert!(output.stderr.is_empty());
+    assert!(!data_directory(&missing).exists());
+
+    let empty = TestDir::new();
+    fs::create_dir_all(receipt_directory(&empty)).expect("empty receipt storage should be created");
+    let output = command_in(&empty, &["skills", "list", "--installed"])
+        .output()
+        .expect("CLI process starts");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("No THRN-managed installations are recorded.")
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(fs::read_dir(receipt_directory(&empty)).unwrap().count(), 0);
+}
+
+#[test]
+fn installed_listing_fails_on_unrecognized_receipt_content_without_changing_it() {
+    let directory = TestDir::new();
+    let receipts = receipt_directory(&directory);
+    fs::create_dir_all(&receipts).expect("receipt directory should be created");
+    let file = receipts.join("unrecognized.json");
+    fs::write(&file, b"not an M2 receipt").expect("unsupported content should be written");
+
+    let output = command_in(&directory, &["skills", "list", "--installed"])
+        .output()
+        .expect("CLI process starts");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("THRN receipt storage contains unrecognized content"));
+    assert!(stderr.contains("receipts are not implemented yet"));
+    assert_eq!(
+        fs::read(file).expect("unrecognized content remains"),
+        b"not an M2 receipt"
+    );
+}
+
+#[test]
+fn skills_list_help_and_unknown_options_follow_clap_usage_semantics() {
+    let help = run_cli(&["skills", "list", "--help"]);
+    assert_eq!(help.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("--installed"));
+    assert!(help.stderr.is_empty());
+
+    let invalid = run_cli(&["skills", "list", "--not-a-real-option"]);
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(invalid.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("Usage:"));
 }
 
 #[test]

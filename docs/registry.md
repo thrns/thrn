@@ -88,9 +88,10 @@ aliases only; the actual `skillName` does not become an implicit install identit
 THRN embeds `src/registry/builtin-v1.json` in the executable as its offline fallback. The only
 runtime catalog endpoint is the fixed, THRN-operated URL
 `https://raw.githubusercontent.com/thrns/thrn/main/src/registry/builtin-v1.json`. Public CLI
-arguments cannot select another URL. `thrn skills search [query]` and `thrn skills info <id>` never
-make network requests. They select the newest locally available validated catalog: a valid cache
-first, then the embedded catalog. Neither command downloads or installs skill content.
+arguments cannot select another URL. `thrn skills list`, `thrn skills search [query]`, and
+`thrn skills info <id>` never make network requests. They select the newest locally available
+validated catalog: a valid cache first, then the embedded catalog. These commands do not download
+or install skill content.
 
 Only `thrn skills search --refresh [query]` contacts the endpoint. The client requires HTTPS and
 certificate verification, follows no redirects, sets a 5-second connect timeout, a 15-second
@@ -172,6 +173,33 @@ Searches with no matches exit successfully and suggest listing the catalog. Cata
 write no search results to stdout, report a diagnostic on stderr, and preserve the previous cache.
 Test-only data and fixed lexical SHA strings under `tests/fixtures/catalog/` are synthetic and are
 not production resources.
+
+## Catalog availability and managed installations
+
+`thrn skills list` is the dedicated catalog listing. It uses the same `CatalogService` selection
+and `CatalogResolver` as discovery, displays canonical catalog ID, display name, and description,
+and orders entries by canonical ID. Its output identifies the selected source and cache freshness.
+An empty catalog is reported as an empty catalog; it does not trigger a refresh. The no-query form
+of `thrn skills search` remains supported and displays every catalog entry.
+
+`thrn skills list --installed` has a separate meaning: it checks for THRN-managed installations
+only. Receipt storage is planned under the OS application-data directory returned by
+`directories::ProjectDirs::from("im", "thrn", "thrn")`, in a `receipts` subdirectory:
+
+| Platform | Application-data directory |
+|---|---|
+| Linux | `$XDG_DATA_HOME/thrn`, or `~/.local/share/thrn` when unset |
+| macOS | `~/Library/Application Support/im.thrn.thrn` |
+| Windows | `%APPDATA%/thrn/thrn/data` |
+
+`THRN_DATA_DIR` may select an alternate absolute application-data directory; receipt storage is
+then its `receipts` child. This is separate from the catalog cache. A missing or empty receipt
+directory prints `No THRN-managed installations are recorded.` and does not inspect Codex, Claude,
+Cursor, Gemini, or any other agent directory. It also does not create the application-data or
+receipt directories. If receipt storage already contains any content, this milestone reports an
+error because its format is not yet recognized. Durable receipt schema and ownership are deferred
+to M2-05; catalog entries are never presented as installed records. Installation support has not
+been implemented.
 
 ## Local Agent Skills validation
 

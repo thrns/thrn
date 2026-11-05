@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use crate::{
     doctor,
     error::Result,
+    install::receipt_store::ReceiptStore,
     registry::{
         catalog_service::{CatalogSelection, CatalogService, Freshness},
         discovery::CatalogResolver,
@@ -39,6 +40,12 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum SkillsCommand {
+    /// List all skills available through the local curated catalog.
+    List {
+        /// List only installations recorded by THRN.
+        #[arg(long)]
+        installed: bool,
+    },
     /// Search locally available curated Agent Skills metadata.
     Search {
         query: Option<String>,
@@ -59,11 +66,48 @@ pub fn run() -> Result<()> {
     {
         Command::Doctor => doctor::run(),
         Command::Skills { command } => match command {
+            SkillsCommand::List { installed } => list_skills(installed),
             SkillsCommand::Search { query, refresh } => search_skills(query.as_deref(), refresh),
             SkillsCommand::Info { id } => show_skill_info(&id),
             SkillsCommand::Validate { path } => validate_skill(&path),
         },
     }
+}
+
+fn list_skills(installed: bool) -> Result<()> {
+    if installed {
+        ReceiptStore::for_system()?.require_empty()?;
+        return write_stdout(
+            "THRN-managed installations\nNo THRN-managed installations are recorded.\nSkills installed outside THRN are not included.\n",
+        );
+    }
+
+    let selection = CatalogService::for_system().discover()?;
+    report_cache_warning(selection.cache_warning.as_deref())?;
+    let resolver = CatalogResolver::new(&selection.catalog);
+    let resources = resolver.search(None);
+    if resources.is_empty() {
+        return write_stdout(&format!(
+            "{}No catalog skills are available in the selected catalog.\n",
+            catalog_heading(&selection)
+        ));
+    }
+
+    let mut output = format!(
+        "{}Curated skill catalog (schema v{})\n",
+        catalog_heading(&selection),
+        selection.catalog.schema_version()
+    );
+    for resource in resources {
+        output.push_str(resource.id().as_str());
+        output.push_str("  ");
+        output.push_str(resource.display_name());
+        output.push('\n');
+        output.push_str("  ");
+        output.push_str(resource.description());
+        output.push('\n');
+    }
+    write_stdout(&output)
 }
 
 fn search_skills(query: Option<&str>, refresh: bool) -> Result<()> {

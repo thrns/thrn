@@ -9,6 +9,8 @@ pub enum ThrnError {
     #[error(transparent)]
     CatalogRefresh(#[from] crate::registry::catalog_service::CatalogRefreshError),
     #[error(transparent)]
+    InstalledListing(#[from] crate::install::receipt_store::ReceiptDiscoveryError),
+    #[error(transparent)]
     Resolution(#[from] crate::registry::discovery::ResolutionError),
     #[error("skill validation failed")]
     SkillValidation {
