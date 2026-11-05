@@ -17,6 +17,7 @@ serde-saphyr = { version = "2.1.1", default-features = false, features = ["deser
 tempfile = "3.27"
 thiserror = "2"
 ureq = { version = "3.4.3", default-features = false, features = ["rustls"] }
+zip = { version = "9.4.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
