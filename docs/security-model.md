@@ -20,9 +20,16 @@ Before M2 installation work is accepted, source and filesystem handling must:
 
 ## Milestone status
 
-These are requirements, not implemented safeguards:
+Implemented in M1-01:
 
-- **M1:** versioned catalog validation, explicit ID/alias resolution, full-commit validation, and standards-aware skill metadata validation.
+- **Catalog boundary:** version-1 JSON is size- and count-bounded; required fields, identifiers,
+  case-insensitive ID/alias collisions, GitHub metadata, full commit hashes, and source-path
+  lexical rules are validated before typed data is returned. The parser performs no network or
+  filesystem operations. See [the catalog schema](registry.md).
+
+Remaining requirements:
+
+- **M1:** exact catalog ID/alias resolution and Agent Skills metadata validation.
 - **M2:** constrained GitHub fetching, hostile archive/path validation, destination checks, ownership receipts, staged installation, and rollback/recovery.
 - **M3:** safe user-scope support and receipt-backed update/remove behavior that detects modified content and reports partial failure.
 
