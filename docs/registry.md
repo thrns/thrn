@@ -27,7 +27,7 @@ THRN's catalog parser accepts a bounded JSON document with this top-level shape:
 ```
 
 The example is schema documentation, not a verified catalog entry. Its commit value is an
-intentionally rejected placeholder. No production catalog is added by M1-01.
+intentionally rejected placeholder.
 
 ## Fields and identity
 
@@ -78,6 +78,54 @@ fail explicitly.
 
 The reusable parser is `registry::catalog::parse_catalog_json` within the `thrn` binary crate; it
 returns validated typed values or `CatalogError`. It performs no network access, source inspection,
-file writes, alias resolution, or installation. M1-02 owns catalog lookup and alias resolution.
-Test-only data and fixed lexical SHA strings live under `tests/fixtures/catalog/` and are not
-production resources.
+or file writes. The bundled catalog is parsed through this validator before its records are used.
+`CatalogResolver` builds an in-memory exact lookup index from the validated model and searches
+catalog text in stable canonical-ID order. Lookup accepts canonical IDs and explicitly declared
+aliases only; the actual `skillName` does not become an implicit install identity.
+
+## Built-in catalog and discovery
+
+M1-02 embeds `src/registry/builtin-v1.json` at compile time. `thrn skills search [query]` searches
+that static data, and `thrn skills info <id>` resolves a canonical ID or explicit alias. Discovery
+does not contact GitHub. Catalog updates require shipping updated metadata; runtime fetching and
+caching are planned for M1-04. Neither command downloads or installs skill content.
+
+The current `frontend-design` entry uses the explicit alias `frontend`. The upstream
+[`SKILL.md` at the pinned revision](https://github.com/anthropics/skills/blob/ca45fc496a3436251f191354091d557da31c15b5/skills/frontend-design/SKILL.md)
+declares the name `frontend-design` and describes distinctive visual design, aesthetic direction,
+typography, and avoiding templated defaults. Its metadata does not declare a skill version, so the
+catalog uses the explicit convention `unversioned` to mean that no upstream skill version is present
+in the curated metadata. This is a catalog convention, not an upstream release number. No license
+rights are inferred from catalog inclusion.
+
+The full commit SHA pins the source revision for repeatable identification. It does not guarantee
+publisher authenticity or constitute a security endorsement. THRN does not execute instructions
+from the referenced `SKILL.md`.
+
+Example commands and output:
+
+```text
+$ thrn skills search frontend
+Curated skill catalog (schema v1; bundled static metadata, no network access)
+frontend-design  Frontend Design
+  Guidance for distinctive visual design in new or existing interfaces, including aesthetic direction, typography, and avoiding templated defaults.
+
+$ thrn skills info frontend
+Curated catalog information (schema v1)
+Canonical catalog ID: frontend-design
+Display name: Frontend Design
+Description: Guidance for distinctive visual design in new or existing interfaces, including aesthetic direction, typography, and avoiding templated defaults.
+Skill directory name: frontend-design
+Catalog version: unversioned
+Explicit aliases: frontend
+GitHub owner: anthropics
+GitHub repository: skills
+Source directory: skills/frontend-design
+Pinned commit: ca45fc496a3436251f191354091d557da31c15b5
+Publisher authenticity: not guaranteed by this commit pin.
+```
+
+Malformed lookup identifiers and unknown catalog IDs fail with actionable stderr diagnostics.
+Searches with no matches exit successfully and suggest listing the catalog. Test-only data and
+fixed lexical SHA strings under `tests/fixtures/catalog/` are synthetic and are not production
+resources.

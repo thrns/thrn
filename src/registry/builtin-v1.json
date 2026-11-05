@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "resources": [
+    {
+      "id": "frontend-design",
+      "kind": "skill",
+      "displayName": "Frontend Design",
+      "skillName": "frontend-design",
+      "description": "Guidance for distinctive visual design in new or existing interfaces, including aesthetic direction, typography, and avoiding templated defaults.",
+      "version": "unversioned",
+      "aliases": ["frontend"],
+      "source": {
+        "provider": "github",
+        "owner": "anthropics",
+        "repository": "skills",
+        "path": "skills/frontend-design",
+        "commit": "ca45fc496a3436251f191354091d557da31c15b5"
+      }
+    }
+  ]
+}

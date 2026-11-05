@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "resources": [
+    {
+      "id": "creative-lab",
+      "kind": "skill",
+      "displayName": "Creative Lab",
+      "skillName": "uncharted-ideation",
+      "description": "Synthetic metadata for imaginative product exploration.",
+      "version": "unversioned",
+      "aliases": ["uncharted", "idea-workshop"],
+      "source": {
+        "provider": "github",
+        "owner": "example-org",
+        "repository": "catalog-test-fixtures",
+        "path": "skills/uncharted-ideation",
+        "commit": "2f68bee292a8c68346b4294fb31d9563eefe1ade"
+      }
+    }
+  ]
+}
