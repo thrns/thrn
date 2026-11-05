@@ -267,14 +267,41 @@ mod tests {
         )
         .expect("offline fixture orchestration builds plan");
         let output = format_dry_run(&plan).expect("plan formats");
-        let project_root = fs::canonicalize(&project)
-            .expect("resolve project root")
-            .display()
-            .to_string();
+        let project_root_path = fs::canonicalize(&project).expect("resolve project root");
+        let project_root = project_root_path.display().to_string();
+        let destination_path = project_root_path
+            .join(".agents")
+            .join("skills")
+            .join("uncharted-ideation");
+        let destination = destination_path.display();
+        let agents_directory = project_root_path.join(".agents");
+        let skills_directory = agents_directory.join("skills");
+        let asset_directory = destination_path.join("assets");
+        let references_directory = destination_path.join("references");
+        let scripts_directory = destination_path.join("scripts");
+        let asset_file = asset_directory.join("blob.bin");
+        let reference_file = references_directory.join("guide.md");
+        let script_file = scripts_directory.join("run.sh");
+        let asset_relative = PathBuf::from("assets").join("blob.bin");
+        let reference_relative = PathBuf::from("references").join("guide.md");
+        let script_relative = PathBuf::from("scripts").join("run.sh");
         let skill_md_bytes = VALID_SKILL_MD.len();
         let total_bytes = skill_md_bytes + b"reference".len() + b"echo inert".len() + 4;
         let expected = format!(
-            "DRY RUN — no project files were modified\nResource: uncharted\nSkill name: uncharted-ideation\nGitHub source: Example-Org/catalog-test-fixtures\nPinned commit: 2f68bee292a8c68346b4294fb31d9563eefe1ade\nSource directory: skills/uncharted-ideation\nAgent: codex\nScope: project\nProject root: {project_root}\nDestination: {project_root}/.agents/skills/uncharted-ideation\nDirectories that would be created (6):\n  + {project_root}/.agents\n  + {project_root}/.agents/skills\n  + {project_root}/.agents/skills/uncharted-ideation\n  + {project_root}/.agents/skills/uncharted-ideation/assets\n  + {project_root}/.agents/skills/uncharted-ideation/references\n  + {project_root}/.agents/skills/uncharted-ideation/scripts\nRegular files that would be copied (4; {total_bytes} bytes):\n  SKILL.md ({skill_md_bytes} bytes) -> {project_root}/.agents/skills/uncharted-ideation/SKILL.md\n  assets/blob.bin (4 bytes) -> {project_root}/.agents/skills/uncharted-ideation/assets/blob.bin\n  references/guide.md (9 bytes) -> {project_root}/.agents/skills/uncharted-ideation/references/guide.md\n  scripts/run.sh (10 bytes) -> {project_root}/.agents/skills/uncharted-ideation/scripts/run.sh\nTotal: 4 files, {total_bytes} bytes\nNo project files were modified.\n"
+            "DRY RUN — no project files were modified\nResource: uncharted\nSkill name: uncharted-ideation\nGitHub source: Example-Org/catalog-test-fixtures\nPinned commit: 2f68bee292a8c68346b4294fb31d9563eefe1ade\nSource directory: skills/uncharted-ideation\nAgent: codex\nScope: project\nProject root: {project_root}\nDestination: {destination}\nDirectories that would be created (6):\n  + {}\n  + {}\n  + {}\n  + {}\n  + {}\n  + {}\nRegular files that would be copied (4; {total_bytes} bytes):\n  SKILL.md ({skill_md_bytes} bytes) -> {}\n  {} (4 bytes) -> {}\n  {} (9 bytes) -> {}\n  {} (10 bytes) -> {}\nTotal: 4 files, {total_bytes} bytes\nNo project files were modified.\n",
+            agents_directory.display(),
+            skills_directory.display(),
+            destination_path.display(),
+            asset_directory.display(),
+            references_directory.display(),
+            scripts_directory.display(),
+            destination_path.join("SKILL.md").display(),
+            asset_relative.display(),
+            asset_file.display(),
+            reference_relative.display(),
+            reference_file.display(),
+            script_relative.display(),
+            script_file.display(),
         );
         assert_eq!(output, expected);
         assert!(!project.join(".agents").exists());
