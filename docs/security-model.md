@@ -2,7 +2,7 @@
 
 ## Current exposure
 
-THRN is under development and has no supported installer release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, reads validated local catalog data, offers an explicit HTTPS catalog refresh, performs read-only local `SKILL.md` validation, and checks the future receipt directory for installed listing. Default discovery and both `skills list` modes never use the network. Explicit refresh contacts one fixed THRN-operated HTTPS endpoint, validates the response, and writes only the catalog cache. No command fetches skills or executes subprocesses. A library API can inspect a caller-supplied ZIP byte slice without writing its contents. The installed listing reads only THRN's application-data receipt directory: it does not inspect agent skill folders, create receipt storage, or interpret a provisional receipt format. Installation, durable receipts, target ownership, archive extraction, staging, and rollback protections are not implemented; their absence is not a security guarantee for an installer.
+THRN is under development and has no supported installer release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, reads validated local catalog data, offers an explicit HTTPS catalog refresh, performs read-only local `SKILL.md` validation, and checks the future receipt directory for installed listing. Default discovery and both `skills list` modes never use the network. Explicit refresh contacts one fixed THRN-operated HTTPS endpoint, validates the response, and writes only the catalog cache. No CLI command fetches skills or executes subprocesses. A source library API fetches pinned public GitHub archives, validates and stages one selected skill in a private temporary directory, but does not execute or install it. The installed listing reads only THRN's application-data receipt directory: it does not inspect agent skill folders, create receipt storage, or interpret a provisional receipt format. Installation, durable receipts, target ownership, and rollback protections are not implemented; their absence is not a security guarantee for an installer.
 
 ## Boundaries required before installation
 
@@ -41,13 +41,86 @@ Callers may supply stricter or different `ArchiveLimits`; all byte totals use ch
 
 Archive names use a platform-independent portable policy. Paths must be ASCII and slash-separated. The validator rejects absolute and leading-separator paths; `.` and `..`; empty components; backslashes; drive and UNC forms; NUL and control characters; colons/alternate data streams; Windows-invalid filename punctuation; reserved Windows device names (including names with extensions); trailing spaces or dots; and paths, components, or nesting beyond the limits above. It validates the exact input spelling and never strips or resolves path components. Exact duplicates, ASCII case-fold collisions, and file/directory conflicts with explicit or implied parent directories are rejected. ASCII-only names are a v1 portability constraint, so valid Unicode archive names are currently rejected.
 
-Only ordinary regular files and directories are accepted. ZIP entries must have identifiable, consistent file/directory types and must not declare data in a directory. Symlinks, special Unix file types, ASi Unix link-capable extra fields, encrypted entries (including encryption-related extra fields), unsupported compression methods, and malformed extra-field metadata are rejected. Stored and Deflate compression are supported. A legitimate `scripts/` directory is treated as ordinary file content and is never executed. The ZIP format does not define a portable hardlink entry type; known ASi Unix link metadata is rejected, but opaque vendor-specific metadata cannot be assigned link semantics without understanding that vendor format.
+Only ordinary regular files and directories are accepted. ZIP entries must have identifiable, consistent file/directory types and must not declare data in a directory. The single compatibility exception is an entry whose creator system is DOS, external attributes are exactly zero, no directory marker is present, and `ZipFile::is_file()` is true; it is classified as an ordinary regular file. This matches the pinned GitHub archive's encoding for ordinary DOS-created files, which carries no Unix type bits. Staging writes accepted files as regular files with executable permissions discarded. Unix entries without type bits, symlinks, special Unix file types, DOS directory-bit/name mismatches, ASi Unix link-capable extra fields, encrypted entries (including encryption-related extra fields), unsupported compression methods, and malformed extra-field metadata remain rejected. Stored and Deflate compression are supported. A legitimate `scripts/` directory is treated as ordinary file content and is never executed. The ZIP format does not define a portable hardlink entry type; known ASi Unix link metadata is rejected, but opaque vendor-specific metadata cannot be assigned link semantics without understanding that vendor format.
 
 The returned manifest lists explicit regular files and directories plus implied parent directories. Paths remain relative to the ZIP archive root. A GitHub-style generated top-level repository directory remains visible in the manifest; the validator neither strips prefixes nor guesses which nested directory matches a catalog source path. The manifest is evidence that this byte slice passed these parsing, path, type, resource, and CRC checks. It does not authenticate a GitHub publisher, verify a pinned repository commit, establish that content is benign, or guarantee that a later installation is safe.
 
-Network response bounds and immutable GitHub commit/origin verification belong to M2-02. Exact catalog `source.path` selection, safe extraction, destination validation, filesystem race protection, staging, ownership, and recovery belong to M2-02 and later implementation slices. Since this API receives an already materialized byte slice, its compressed-size check does not bound the caller's allocation; a future fetcher must enforce the archive limit while receiving bytes as well. CRC-32 detects common corruption but is not a cryptographic digest or publisher-authentication mechanism.
+Since this API receives an already materialized byte slice, its compressed-size check does not bound the caller's allocation; M2-02 therefore enforces the same 32 MiB cap while receiving the response. CRC-32 detects common corruption but is not a cryptographic digest or publisher-authentication mechanism.
 
-Implemented in M1-01 through M2-01:
+### M2-02 pinned GitHub fetch and staging boundary
+
+The source API accepts only a validated catalog `Resource`. It constructs the archive URL from
+that resource's typed GitHub owner, repository, and full commit SHA; callers cannot supply a URL.
+The initial request is `https://github.com/{owner}/{repository}/archive/{full-sha}.zip`. Redirects
+are disabled in the HTTP client. The fetcher accepts only one HTTP 302 whose `Location` is exactly
+`https://codeload.github.com/{owner}/{repository}/zip/{full-sha}`; every other redirect, host,
+scheme, path, query, or second redirect fails. The codeload destination was observed when checking
+the pinned `frontend-design` catalog archive. GitHub documents commit-addressed archive URLs and
+recommends its archives API for stable commit content: [GitHub source code archive documentation](https://docs.github.com/en/repositories/working-with-files/using-files/downloading-source-code-archives).
+
+The Rustls-backed `ureq` transport verifies TLS certificates, permits HTTPS only, requests no
+GitHub credentials, and applies 5-second connect, 15-second response-body, and 30-second overall
+timeouts. It accepts only HTTP 200 with `application/zip`, no content encoding (or `identity`),
+and a single valid `Content-Length` when present. It streams into memory with a hard 32 MiB cap,
+including when the response is chunked or omits its length, and requires the received byte count to
+match the declared length. Private repositories are unsupported and no authentication fallback is
+attempted. Request errors do not include URLs, headers, proxy configuration, or environment values.
+
+The exact downloaded byte vector is passed to M2-01's `validate_zip_archive` before any extraction
+write. Selection uses only its validated manifest: there must be one explicit top-level directory
+named exactly `{repository}-{full-sha}`, that root must match the requested source, and there must
+be no entries under another top-level name. The catalog `source.path` is matched exactly beneath
+that root, with capitalization differences rejected. A regular `SKILL.md` must exist directly in
+the selected directory. No other directory is searched.
+
+Only manifest-authorized regular files and directories below the selected path are copied into an
+unpredictable, exclusive `tempfile` directory owned by the operation. Paths are rebuilt from
+validated components; directory creation does not reuse existing paths, file creation is exclusive,
+copies are bounded by manifest sizes, and file contents are re-read from the same immutable archive
+bytes with size and ZIP integrity checks. On Unix, staged directories use mode `0700` and files use
+`0600`; archive executable bits are discarded. A failed operation closes and cleans the temporary
+directory. The returned `StagedSkill` owns the `TempDir`; its content path is valid only while that
+value stays alive and the content is removed when it is dropped. The staged result is returned only
+after the existing M1-03 validator accepts its `SKILL.md` and the metadata name equals catalog
+`skillName`. The returned `StagedSkill` owns a `TempDir` guard; callers must keep the value alive
+while using its content path, and the guard attempts cleanup when dropped. Supporting files remain
+opaque and are never executed.
+
+These are separate evidence layers:
+
+- **Trusted THRN catalog metadata** supplies the owner, repository, source path, expected skill
+  name, and full commit SHA used by this operation.
+- **Pinned GitHub repository revision** identifies the requested source state; it does not prove
+  who authored that revision.
+- **Validated archive structure** means the downloaded bytes passed M2-01 path, type, size,
+  collision, decompression, and CRC checks.
+- **Validated local skill metadata** means M1-03 accepted the staged `SKILL.md` and the name
+  matches the catalog record.
+- **Untrusted skill content** includes the instructions, scripts, assets, and references. They are
+  not executed or treated as higher-priority instructions.
+
+TLS protects the connection to GitHub. A pinned SHA and TLS do not cryptographically prove publisher
+identity or content safety. No install command, agent-directory write, receipt, update, removal, or
+rollback is part of M2-02.
+
+#### GitHub DOS archive compatibility
+
+The manually downloaded pinned `frontend-design` archive has 543 entries. GitHub encodes 420
+ordinary files with ZIP creator system `DOS`, `external_attr=0`, and no directory marker; 97
+directories use the DOS directory bit `0x10`; 26 entries carry Unix regular-file metadata. The
+initial M2-01 implementation rejected entry 2,
+`skills-ca45fc496a3436251f191354091d557da31c15b5/.claude-plugin/marketplace.json`, because its DOS
+entry has no Unix mode. The architect approved the narrow fallback documented above as ADR-009. The
+complete pinned archive now passes M2-01 validation, exact `frontend-design` source selection,
+staging, and M1-03 metadata validation. Regression tests exercise the accepted DOS case and reject
+Unix entries without type bits, ambiguous DOS directories, Unix symlinks, and special files.
+
+### M1-04 cache hardening follow-up
+
+M1-04's deferred cache path-component/concurrent-replacement review and recovery-message refinement
+remain tracked below. M2-02 does not change the cache and does not expand that follow-up.
+
+Implemented in M1-01 through M2-02:
 
 - **Catalog boundary:** version-1 JSON is size- and count-bounded; required fields, identifiers,
   case-insensitive ID/alias collisions, GitHub metadata, full commit hashes, and source-path
@@ -76,14 +149,18 @@ Implemented in M1-01 through M2-01:
   is missing or empty. Existing content is an error until M2-05 defines receipt schema and
   ownership; no installation records are inferred from catalog data or agent folders. Listing
   creates no directories and writes no files.
-- **Archive boundary:** M2-01 applies the ZIP-only, metadata-only validation described above. The
-  validator preserves GitHub archive root prefixes and has no network, extraction, install, or
+- **Archive boundary:** M2-01 applies the ZIP-only validation described above. The validator
+  preserves GitHub archive root prefixes and has no network, extraction, install, or
   publisher-authentication behavior.
+- **Pinned-source boundary:** M2-02 fetches only a validated resource at its full GitHub commit,
+  applies the exact redirect and byte limits above, validates before extraction, selects one exact
+  source directory, and returns a validated temporary stage. It does not authenticate publishers,
+  execute content, or install into agent folders.
 
 ## Non-blocking M1-04 follow-up review
 
 The M1-04 cache implementation has two follow-up topics for a later security review; they do not
-block offline listing and are not expanded in M1-05:
+block offline listing or M2-02 and are not expanded by this milestone:
 
 - **Filesystem hardening:** review path-component and concurrent-replacement races around cache
   directory validation and atomic replacement, and decide whether parent-directory durability
@@ -94,8 +171,8 @@ block offline listing and are not expanded in M1-05:
 
 Remaining requirements:
 
-- **M2-02 and later:** constrained GitHub fetching, exact source-directory selection, safe extraction,
-  destination checks, ownership receipts, staged installation, and rollback/recovery.
+- **M2-03 and later:** deterministic install plans, agent destination checks, ownership receipts,
+  committed installation, and rollback/recovery.
 - **M3:** safe user-scope support and receipt-backed update/remove behavior that detects modified content and reports partial failure.
 
 Security-sensitive parsing and writes require negative tests with hostile fixtures, isolated temporary directories, and deterministic network mocks. See the [roadmap](ROADMAP.md) and [repository security policy](../SECURITY.md) for project status.

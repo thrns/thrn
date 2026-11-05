@@ -2,10 +2,10 @@ use std::io::{Cursor, Write};
 
 use zip::{CompressionMethod, System, ZipWriter, write::SimpleFileOptions};
 
-#[path = "../src/sources/mod.rs"]
-mod sources;
+#[path = "../src/sources/archive.rs"]
+mod archive;
 
-use sources::archive::{
+use archive::{
     ArchiveEntryKind, ArchiveError, ArchiveLimits, ArchivePathError, EntryMetadataProblem,
     validate_zip_archive, validate_zip_archive_with_limits,
 };
@@ -279,6 +279,88 @@ fn accepts_empty_directories_and_binary_assets() {
     assert_eq!(empty.kind(), ArchiveEntryKind::Directory);
     assert!(empty.is_explicit());
     assert_eq!(empty.uncompressed_bytes(), 0);
+}
+
+#[test]
+fn accepts_only_metadata_empty_dos_regular_files_as_the_github_compatibility_case() {
+    let dos_file = archive_with_file_options(
+        "repository/ordinary.txt",
+        b"ordinary data",
+        SimpleFileOptions::default()
+            .compression_method(CompressionMethod::STORE)
+            .system(System::Dos)
+            .external_attributes(0),
+    );
+    let manifest = validate_zip_archive(&dos_file).expect("plain DOS regular file is supported");
+    assert!(manifest.entries().iter().any(|entry| {
+        entry.path().as_str() == "repository/ordinary.txt"
+            && entry.kind() == ArchiveEntryKind::File
+            && entry.is_explicit()
+    }));
+
+    let unix_without_type = archive_with_file_options(
+        "repository/unknown.txt",
+        b"unknown type",
+        SimpleFileOptions::default()
+            .compression_method(CompressionMethod::STORE)
+            .system(System::Unix)
+            .external_attributes(0),
+    );
+    assert!(matches!(
+        assert_rejected(&unix_without_type),
+        ArchiveError::InvalidEntryMetadata {
+            problem: EntryMetadataProblem::UnknownType,
+            ..
+        }
+    ));
+
+    let dos_directory_without_marker = archive_with_file_options(
+        "repository/directory/",
+        b"",
+        SimpleFileOptions::default()
+            .compression_method(CompressionMethod::STORE)
+            .system(System::Dos)
+            .external_attributes(0),
+    );
+    assert!(matches!(
+        assert_rejected(&dos_directory_without_marker),
+        ArchiveError::InvalidEntryMetadata {
+            problem: EntryMetadataProblem::UnknownType,
+            ..
+        }
+    ));
+
+    let directory_without_name_marker = archive_with_file_options(
+        "repository/looks-like-a-file",
+        b"",
+        SimpleFileOptions::default()
+            .compression_method(CompressionMethod::STORE)
+            .system(System::Dos)
+            .external_attributes(0x10),
+    );
+    assert!(matches!(
+        assert_rejected(&directory_without_name_marker),
+        ArchiveError::InvalidEntryMetadata {
+            problem: EntryMetadataProblem::NameTypeMismatch,
+            ..
+        }
+    ));
+
+    let unknown_system = archive_with_file_options(
+        "repository/unknown-system.txt",
+        b"data",
+        SimpleFileOptions::default()
+            .compression_method(CompressionMethod::STORE)
+            .system(System::Unknown)
+            .external_attributes(0),
+    );
+    assert!(matches!(
+        assert_rejected(&unknown_system),
+        ArchiveError::InvalidEntryMetadata {
+            problem: EntryMetadataProblem::UnknownType,
+            ..
+        }
+    ));
 }
 
 #[test]
