@@ -1,8 +1,56 @@
-use std::process::{Command, Output};
+use std::{
+    fs,
+    path::PathBuf,
+    process::{Command, Output},
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
+
+struct TestDir(PathBuf);
+
+impl TestDir {
+    fn new() -> Self {
+        let parent = std::env::temp_dir();
+        loop {
+            let sequence = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!("thrn-cli-test-{}-{sequence}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => return Self(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("could not create isolated test directory: {error}"),
+            }
+        }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn command_in(directory: &TestDir, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_thrn"));
+    command.args(args).current_dir(directory.path()).env_clear();
+
+    // Windows may need SystemRoot to launch a child process. This is an OS
+    // setting, not a credential or user-specific application configuration.
+    #[cfg(windows)]
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", system_root);
+    }
+
+    command
+}
 
 fn run_cli(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_thrn"))
-        .args(args)
+    let directory = TestDir::new();
+    command_in(&directory, args)
         .output()
         .expect("the compiled thrn binary should start")
 }
@@ -39,7 +87,12 @@ fn doctor_reports_only_read_only_build_diagnostics() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("THRN doctor"));
     assert!(stdout.contains(&format!("Version: {}", env!("CARGO_PKG_VERSION"))));
-    assert!(stdout.contains("Build target: "));
+    assert!(stdout.contains(&format!(
+        "Platform: OS={}, architecture={}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )));
+    assert!(stdout.contains("not a full target triple"));
     assert!(stdout.contains("build metadata only"));
     assert!(stdout.contains("no filesystem or network checks"));
     assert!(output.stderr.is_empty());
@@ -66,5 +119,64 @@ fn invalid_option_has_actionable_usage_error() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unexpected argument"));
     assert!(stderr.contains("Usage:"));
+    assert!(!stderr.contains("panicked"));
+}
+
+#[test]
+fn missing_command_is_a_usage_error() {
+    let output = run_cli(&[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "unexpected exit status; stderr:\n{stderr}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "stdout should be empty; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Usage:"),
+        "stderr should contain an actionable usage message; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("<COMMAND>"),
+        "stderr should identify the required command argument; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "CLI should not panic; stderr:\n{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn stdout_io_failure_is_reported_on_stderr_with_nonzero_status() {
+    use std::{os::fd::OwnedFd, os::unix::net::UnixStream, process::Stdio};
+
+    let directory = TestDir::new();
+    let (reader, writer) = UnixStream::pair().expect("socket pair should be created");
+    drop(reader);
+
+    let child = command_in(&directory, &["doctor"])
+        .stdout(Stdio::from(OwnedFd::from(writer)))
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the compiled thrn binary should start");
+    let output = child
+        .wait_with_output()
+        .expect("the compiled thrn process should finish");
+
+    assert!(
+        !output.status.success(),
+        "stdout write unexpectedly succeeded: {output:?}"
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("could not write command output"),
+        "{stderr}"
+    );
     assert!(!stderr.contains("panicked"));
 }

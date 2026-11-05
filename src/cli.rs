@@ -20,7 +20,10 @@ enum Command {
 }
 
 pub fn run() -> Result<()> {
-    match Cli::parse().command {
+    match Cli::try_parse()
+        .map_err(crate::error::ThrnError::from)?
+        .command
+    {
         Command::Doctor => doctor::run(),
     }
 }
