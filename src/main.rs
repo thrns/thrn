@@ -5,6 +5,7 @@ mod install;
 pub mod models;
 pub mod registry;
 pub mod skills;
+pub mod sources;
 
 use std::process::ExitCode;
 
