@@ -4,6 +4,10 @@ use std::{io, io::Write, process::ExitCode};
 pub enum ThrnError {
     #[error(transparent)]
     Cli(#[from] clap::Error),
+    #[error(transparent)]
+    Catalog(#[from] crate::registry::catalog::CatalogError),
+    #[error(transparent)]
+    Resolution(#[from] crate::registry::discovery::ResolutionError),
     #[error("could not write command output: {0}")]
     Output(#[from] io::Error),
 }

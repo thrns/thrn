@@ -2,7 +2,7 @@
 
 ## Current implementation
 
-THRN is one Rust binary crate (`thrn`). The executable starts in `src/main.rs`, which calls the CLI and converts its result to a process exit code. `src/cli.rs` defines the Clap parser and dispatches the only implemented subcommand, `doctor`, to `src/doctor.rs`. The doctor reports the crate version and Rust OS/architecture constants. `src/error.rs` carries Clap and output-I/O errors to the process boundary, prints the appropriate CLI response or diagnostic, and selects the exit code.
+THRN is one Rust binary crate (`thrn`). The executable starts in `src/main.rs`, which calls the CLI and converts its result to a process exit code. `src/cli.rs` defines the Clap parser and dispatches `doctor` and offline skill discovery. `src/doctor.rs` reports the crate version and Rust OS/architecture constants. `src/registry/discovery.rs` parses the compile-time bundled catalog through the catalog validator, builds an exact ID/alias index, and performs stable text search. `src/error.rs` carries CLI, catalog, resolution, and output-I/O errors to the process boundary.
 
 The runtime dependencies are intentionally small:
 
@@ -18,17 +18,17 @@ The standard library supplies process handling, environment constants, output, a
 
 ## Current boundaries
 
-`--help`, `--version`, and `doctor` work offline. The CLI reads its arguments and writes to stdout or stderr; `doctor` does not inspect the filesystem, read configuration or credentials, use the network, or invoke subprocesses. `main` is the only process exit boundary. The integration tests execute the compiled test binary from isolated temporary working directories; they do not contact live services.
+`--help`, `--version`, `doctor`, `skills search`, and `skills info` work offline. The CLI reads its arguments and writes to stdout or stderr; it does not inspect configuration or credentials, use the network, or invoke subprocesses. `main` is the only process exit boundary. The integration tests execute the compiled test binary from isolated temporary working directories; they do not contact live services.
 
 ## Current and planned boundaries
 
 Implemented boundaries:
 
 - **M1-01:** `src/models/catalog.rs` contains validated catalog identity types; `src/registry/catalog.rs` parses bounded schema-v1 JSON without network or filesystem access. `docs/registry.md` documents the accepted schema and limits.
+- **M1-02:** `src/registry/discovery.rs` builds exact canonical-ID and explicit-alias lookup indexes from validated records, and performs stable text search over the compile-time bundled catalog. The CLI exposes `skills search` and `skills info` without network access or skill downloads.
 
 Future design boundaries, not current modules or capabilities:
 
-- **M1-02:** catalog lookup/search and exact alias resolution.
 - **M1-03:** Agent Skills `SKILL.md` metadata validation.
 - **M1-04:** trusted catalog fetching and caching.
 - **M2:** bounded source fetching, hostile archive/path validation, agent destinations, deterministic install plans, same-filesystem staging, receipts, and recovery.

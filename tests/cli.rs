@@ -63,8 +63,105 @@ fn help_shows_the_implemented_command_surface() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("local-first developer CLI"));
     assert!(stdout.contains("doctor"));
-    assert!(!stdout.contains("skills"));
+    assert!(stdout.contains("skills"));
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn empty_skill_search_lists_the_bundled_catalog_offline() {
+    let output = run_cli(&["skills", "search"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Curated skill catalog (schema v1; bundled static metadata"));
+    assert!(stdout.contains("frontend-design  Frontend Design"));
+    assert!(stdout.contains("typography"));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn skill_search_matches_aliases_and_descriptions_case_insensitively() {
+    for query in ["FRONTEND", "TYPOGRAPHY"] {
+        let output = run_cli(&["skills", "search", query]);
+
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("frontend-design  Frontend Design"));
+        assert!(output.stderr.is_empty());
+    }
+}
+
+#[test]
+fn skill_info_resolves_alias_and_canonical_id_to_the_same_curated_record() {
+    let alias = run_cli(&["skills", "info", "frontend"]);
+    let canonical = run_cli(&["skills", "info", "frontend-design"]);
+
+    assert_eq!(alias.status.code(), Some(0));
+    assert_eq!(canonical.status.code(), Some(0));
+    assert_eq!(alias.stdout, canonical.stdout);
+    let stdout = String::from_utf8_lossy(&alias.stdout);
+    for expected in [
+        "Curated catalog information (schema v1)",
+        "Canonical catalog ID: frontend-design",
+        "Display name: Frontend Design",
+        "Skill directory name: frontend-design",
+        "Catalog version: unversioned",
+        "Explicit aliases: frontend",
+        "GitHub owner: anthropics",
+        "GitHub repository: skills",
+        "Source directory: skills/frontend-design",
+        "Pinned commit: ca45fc496a3436251f191354091d557da31c15b5",
+        "Publisher authenticity: not guaranteed by this commit pin.",
+    ] {
+        assert!(stdout.contains(expected), "missing {expected:?}: {stdout}");
+    }
+    assert!(alias.stderr.is_empty());
+    assert!(canonical.stderr.is_empty());
+}
+
+#[test]
+fn unknown_and_malformed_skill_ids_fail_with_actionable_diagnostics() {
+    let unknown = run_cli(&["skills", "info", "no-such-skill"]);
+    assert_eq!(unknown.status.code(), Some(1));
+    assert!(unknown.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&unknown.stderr);
+    assert!(stderr.contains("no catalog entry matches"));
+    assert!(stderr.contains("thrn skills search"));
+    assert!(!stderr.contains("panicked"));
+
+    let malformed = run_cli(&["skills", "info", "bad--identifier"]);
+    assert_eq!(malformed.status.code(), Some(1));
+    assert!(malformed.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&malformed.stderr);
+    assert!(stderr.contains("invalid skill identifier"));
+    assert!(stderr.contains("single hyphens"));
+    assert!(!stderr.contains("panicked"));
+}
+
+#[test]
+fn zero_search_matches_are_informative_and_successful() {
+    let output = run_cli(&["skills", "search", "no-such-skill"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("No skills matched query \"no-such-skill\"."));
+    assert!(stdout.contains("thrn skills search"));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn skill_search_results_have_stable_order_and_missing_info_id_is_usage_error() {
+    let first = run_cli(&["skills", "search"]);
+    let second = run_cli(&["skills", "search"]);
+    assert_eq!(first.status.code(), Some(0));
+    assert_eq!(first.stdout, second.stdout);
+
+    let missing = run_cli(&["skills", "info"]);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(missing.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(stderr.contains("Usage:"));
+    assert!(stderr.contains("<ID>"));
 }
 
 #[test]

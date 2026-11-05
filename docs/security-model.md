@@ -2,7 +2,7 @@
 
 ## Current exposure
 
-THRN is under development and has no supported installer release. The current binary parses arguments, prints help/version, and reports static build metadata through `doctor`. It does not fetch registry data or skills, read credentials, write installation files, or execute subprocesses. Therefore, archive extraction, target ownership, installation staging, receipts, and rollback protections do not exist yet; their absence is not a security guarantee for an installer.
+THRN is under development and has no supported installer release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, and reads curated metadata from its compile-time bundled catalog. It does not fetch catalog data or skills, read credentials, write installation files, or execute subprocesses. Therefore, archive extraction, target ownership, installation staging, receipts, and rollback protections do not exist yet; their absence is not a security guarantee for an installer.
 
 ## Boundaries required before installation
 
@@ -20,16 +20,20 @@ Before M2 installation work is accepted, source and filesystem handling must:
 
 ## Milestone status
 
-Implemented in M1-01:
+Implemented in M1-01 and M1-02:
 
 - **Catalog boundary:** version-1 JSON is size- and count-bounded; required fields, identifiers,
   case-insensitive ID/alias collisions, GitHub metadata, full commit hashes, and source-path
   lexical rules are validated before typed data is returned. The parser performs no network or
   filesystem operations. See [the catalog schema](registry.md).
+- **Discovery boundary:** exact lookup accepts canonical IDs and explicit aliases from validated
+  records; the skill directory name is not an implicit identifier. Search and info read only the
+  bundled static catalog. A pinned commit identifies a revision but does not guarantee publisher
+  authenticity.
 
 Remaining requirements:
 
-- **M1:** exact catalog ID/alias resolution and Agent Skills metadata validation.
+- **M1-03/M1-04:** Agent Skills metadata validation and trusted catalog fetching/caching.
 - **M2:** constrained GitHub fetching, hostile archive/path validation, destination checks, ownership receipts, staged installation, and rollback/recovery.
 - **M3:** safe user-scope support and receipt-backed update/remove behavior that detects modified content and reports partial failure.
 
