@@ -2,7 +2,7 @@
 
 ## Current exposure
 
-THRN is under development and has no supported installer release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, and reads curated metadata from its compile-time bundled catalog. It does not fetch catalog data or skills, read credentials, write installation files, or execute subprocesses. Therefore, archive extraction, target ownership, installation staging, receipts, and rollback protections do not exist yet; their absence is not a security guarantee for an installer.
+THRN is under development and has no supported installer release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, reads curated metadata from its compile-time bundled catalog, and offers read-only local `SKILL.md` validation. It does not fetch catalog data or skills, read credentials, write installation files, or execute subprocesses. Archive extraction, target ownership, installation staging, receipts, and rollback protections are not implemented; their absence is not a security guarantee for an installer.
 
 ## Boundaries required before installation
 
@@ -20,7 +20,7 @@ Before M2 installation work is accepted, source and filesystem handling must:
 
 ## Milestone status
 
-Implemented in M1-01 and M1-02:
+Implemented in M1-01, M1-02, and M1-03:
 
 - **Catalog boundary:** version-1 JSON is size- and count-bounded; required fields, identifiers,
   case-insensitive ID/alias collisions, GitHub metadata, full commit hashes, and source-path
@@ -30,10 +30,16 @@ Implemented in M1-01 and M1-02:
   records; the skill directory name is not an implicit identifier. Search and info read only the
   bundled static catalog. A pinned commit identifies a revision but does not guarantee publisher
   authenticity.
+- **Local metadata boundary:** M1-03 opens one regular `SKILL.md`, caps it at 256 KiB, rejects file
+  symlinks and special files, and parses the YAML frontmatter with bounded depth, nodes, events,
+  one-document, duplicate-key, tag, merge-key, anchor, and alias controls. It does not read
+  supporting files or validate scripts, and it never writes or executes skill content. Metadata
+  validation does not establish publisher authenticity or the safety of a skill's instructions or
+  scripts. See [local validation limits](registry.md#local-agent-skills-validation).
 
 Remaining requirements:
 
-- **M1-03/M1-04:** Agent Skills metadata validation and trusted catalog fetching/caching.
+- **M1-04:** trusted catalog fetching and caching.
 - **M2:** constrained GitHub fetching, hostile archive/path validation, destination checks, ownership receipts, staged installation, and rollback/recovery.
 - **M3:** safe user-scope support and receipt-backed update/remove behavior that detects modified content and reports partial failure.
 

@@ -8,6 +8,10 @@ pub enum ThrnError {
     Catalog(#[from] crate::registry::catalog::CatalogError),
     #[error(transparent)]
     Resolution(#[from] crate::registry::discovery::ResolutionError),
+    #[error("skill validation failed")]
+    SkillValidation {
+        errors: Vec<crate::skills::validator::ValidationError>,
+    },
     #[error("could not write command output: {0}")]
     Output(#[from] io::Error),
 }
@@ -27,6 +31,14 @@ pub fn report(error: ThrnError) -> ExitCode {
                     "thrn: could not write command-line response: {print_error}"
                 )),
             }
+        }
+        ThrnError::SkillValidation { errors } => {
+            let diagnostics = errors
+                .iter()
+                .map(|error| format!("  - {error}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            write_diagnostic(&format!("thrn: skill validation failed\n{diagnostics}"))
         }
         error => write_diagnostic(&format!("thrn: {error}")),
     }

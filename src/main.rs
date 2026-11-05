@@ -3,6 +3,7 @@ mod doctor;
 mod error;
 pub mod models;
 pub mod registry;
+pub mod skills;
 
 use std::process::ExitCode;
 

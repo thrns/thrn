@@ -2,7 +2,7 @@
 
 THRN is a local-first Rust command-line tool for developer resources.
 
-**Current status:** the CLI provides help, version information, a read-only `doctor` command, and offline search and info for a small bundled skill catalog. Skill content is not downloaded or installed; updates, runtime catalog fetching, and package distribution are not implemented or released.
+**Current status:** the CLI provides help, version information, a read-only `doctor` command, offline catalog search and info, and read-only local Agent Skills metadata validation. Skill content is not downloaded or installed; updates, runtime catalog fetching, and package distribution are not implemented or released.
 
 ## Build and run
 
@@ -14,6 +14,7 @@ cargo run --locked -- skills search
 cargo run --locked -- skills search frontend
 cargo run --locked -- skills info frontend
 cargo run --locked -- skills info frontend-design
+cargo run --locked -- skills validate ./tests/fixtures/skills/valid-skill
 ```
 
 `thrn doctor` reports the crate version and the operating system and architecture reported by the build. That OS/architecture pair is not a full Rust target triple. The command does not inspect agent installations, access a registry, write files, or make network requests.
@@ -21,6 +22,8 @@ cargo run --locked -- skills info frontend-design
 `thrn skills search` and `thrn skills info` read curated metadata from a static catalog embedded in the executable. The current catalog includes `frontend-design`, with the explicit alias `frontend`. Search without a query lists all bundled entries; text queries match IDs, aliases, skill directory names, display names, and descriptions without case sensitivity. Info accepts only a canonical catalog ID or an explicit alias and displays the curated source path and pinned commit. It does not fetch the source or download or install skill content. A pinned commit identifies a source revision; it does not guarantee publisher authenticity.
 
 Catalog changes require shipping updated metadata in a new executable. Runtime fetching and caching are planned for M1-04. A catalog version of `unversioned` means the curated record has no upstream skill version metadata; it is not an invented upstream release number. See [the registry documentation](docs/registry.md) for the verified source revision and sample output.
+
+`thrn skills validate <path>` reads only the regular, UTF-8 `SKILL.md` in the supplied directory. It checks the official frontmatter fields, YAML structure, name grammar and directory match, and documented size and parser limits. It does not inspect supporting files, modify content, make network requests, or execute scripts. A passing metadata check does not establish source authenticity or make any included scripts safe. See [the validation rules and limits](docs/registry.md#local-agent-skills-validation).
 
 ## CLI output and exit codes
 

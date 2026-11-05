@@ -129,3 +129,47 @@ Malformed lookup identifiers and unknown catalog IDs fail with actionable stderr
 Searches with no matches exit successfully and suggest listing the catalog. Test-only data and
 fixed lexical SHA strings under `tests/fixtures/catalog/` are synthetic and are not production
 resources.
+
+## Local Agent Skills validation
+
+`thrn skills validate <path>` checks the local directory's exact `SKILL.md`; it is separate from
+catalog validation. The command performs no network access and does not modify the directory. Its
+metadata rules follow the [official Agent Skills specification](https://agentskills.io/specification)
+and were compared with the [skills-ref reference validator](https://github.com/agentskills/agentskills/tree/main/skills-ref).
+
+The validator requires a regular UTF-8 `SKILL.md` with opening and closing `---` lines and one YAML
+mapping. It accepts the standard fields `name` and `description`, plus optional `license`,
+`compatibility`, `metadata`, and `allowed-tools`. Unknown top-level fields, duplicate mapping keys,
+wrong field types, unsupported tags, YAML anchors/aliases, merge keys, and extra YAML documents are
+rejected. `metadata` must be a string-to-string mapping with at most 64 entries. The skill name
+must be 1–64 Unicode lowercase alphanumeric characters with single hyphens between parts, and must
+exactly match the directory's final name. `description` must be nonempty and at most 1,024 Unicode
+characters. A supplied `compatibility` string must contain 1–500 Unicode characters. `license` and
+`allowed-tools` must be strings when present; the standard sets no additional length rule for
+those fields.
+
+The name is checked as written: THRN does not trim or Unicode-normalize it, and the UTF-8 name
+must exactly equal the directory's final name. The reference `skills-ref` implementation applies
+NFKC normalization and trimming; the explicit exact-match contract for this command does not.
+
+Resource limits are a 256 KiB total `SKILL.md` size, 16 nested YAML collections, 512 YAML nodes,
+2,048 parser events, one YAML document, and zero anchors or aliases. The YAML parser rejects
+unsupported tags and merge keys. The Markdown body is preserved and is not format-checked. The
+validator does not open scripts, references, assets, or other supporting content.
+
+The existing catalog `SkillName` type remains lowercase ASCII and is not broadened by local
+validation. A local skill may therefore pass this command with a Unicode name that the catalog
+cannot currently represent. See proposed [ADR-008](DECISIONS.md#architectural-decision-log); no
+catalog contract change is implied.
+
+Example failure output:
+
+```text
+thrn: skill validation failed
+  - frontmatter field `description` must be no more than 1024 characters (found 1025)
+```
+
+A successful validation establishes only that the inspected metadata follows these checks. It does
+not verify publisher identity, source authenticity, supporting-file safety, or the behavior of
+arbitrary scripts. This local metadata validator is not M2 archive extraction or installation
+security.
