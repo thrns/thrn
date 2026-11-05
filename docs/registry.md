@@ -83,12 +83,51 @@ or file writes. The bundled catalog is parsed through this validator before its 
 catalog text in stable canonical-ID order. Lookup accepts canonical IDs and explicitly declared
 aliases only; the actual `skillName` does not become an implicit install identity.
 
-## Built-in catalog and discovery
+## Trusted endpoint, offline cache, and discovery
 
-M1-02 embeds `src/registry/builtin-v1.json` at compile time. `thrn skills search [query]` searches
-that static data, and `thrn skills info <id>` resolves a canonical ID or explicit alias. Discovery
-does not contact GitHub. Catalog updates require shipping updated metadata; runtime fetching and
-caching are planned for M1-04. Neither command downloads or installs skill content.
+THRN embeds `src/registry/builtin-v1.json` in the executable as its offline fallback. The only
+runtime catalog endpoint is the fixed, THRN-operated URL
+`https://raw.githubusercontent.com/thrns/thrn/main/src/registry/builtin-v1.json`. Public CLI
+arguments cannot select another URL. `thrn skills search [query]` and `thrn skills info <id>` never
+make network requests. They select the newest locally available validated catalog: a valid cache
+first, then the embedded catalog. Neither command downloads or installs skill content.
+
+Only `thrn skills search --refresh [query]` contacts the endpoint. The client requires HTTPS and
+certificate verification, follows no redirects, sets a 5-second connect timeout, a 15-second
+response-body timeout, and a 30-second overall timeout. It rejects unsuccessful status codes and
+redirects, reads at most 1 MiB plus one detection byte even without `Content-Length`, checks a
+declared length against the received body, rejects invalid UTF-8, then passes the JSON bytes through
+`parse_catalog_json`. Only a response that passes that parser can be selected or cached. Refresh
+reports success only after the cache replacement succeeds.
+
+The cache is a single file named `catalog-v1.cache` in the directory returned by
+`directories::ProjectDirs::from("im", "thrn", "thrn")`, unless `THRN_CACHE_DIR` is set to an
+alternate absolute path. This variable changes only the local cache location, not the endpoint:
+
+| Platform | Cache directory |
+|---|---|
+| Linux | `$XDG_CACHE_HOME/thrn`, or `~/.cache/thrn` when unset |
+| macOS | `~/Library/Caches/im.thrn.thrn` |
+| Windows | `%LOCALAPPDATA%/thrn/thrn/cache` |
+
+The file contains a versioned THRN header, the exact endpoint, the Unix timestamp of the last
+successful refresh, and the catalog JSON that was validated before writing. Cache loads verify the
+header and source, bound the file size, reject symlinks and nonregular files, and revalidate the
+catalog through `parse_catalog_json`. Missing cache is normal. Corrupt, truncated, incompatible,
+wrong-source, or schema-invalid cache data is ignored with a stderr diagnostic and bundled fallback.
+A refresh can replace such invalid data only after a new response validates successfully.
+
+The cache refresh threshold is 24 hours. A cache refreshed no more than 24 hours ago is labeled
+`fresh`; an older cache is labeled `stale` but remains usable offline. Future-dated or unavailable
+cache freshness is `unknown`. Stale data never triggers an automatic request. If fetch, response
+validation, or cache replacement fails, refresh exits nonzero and leaves the previous cache
+untouched. The cache writer creates a temporary file in the same directory, writes and syncs it,
+then atomically replaces the destination where the OS supports it.
+
+The endpoint is curated and operated by THRN. HTTPS authenticates the endpoint connection, while
+the catalog identifies a source revision using its commit hash. Neither HTTPS, THRN's inclusion of
+a catalog record, nor the commit hash proves the identity or safety of the individual skill
+publisher. Skill content remains untrusted and is not fetched or executed by catalog commands.
 
 The current `frontend-design` entry uses the explicit alias `frontend`. The upstream
 [`SKILL.md` at the pinned revision](https://github.com/anthropics/skills/blob/ca45fc496a3436251f191354091d557da31c15b5/skills/frontend-design/SKILL.md)
@@ -106,12 +145,15 @@ Example commands and output:
 
 ```text
 $ thrn skills search frontend
-Curated skill catalog (schema v1; bundled static metadata, no network access)
+Catalog source: bundled metadata; freshness: unknown (no validated cache is available).
+Curated skill catalog (schema v1)
 frontend-design  Frontend Design
   Guidance for distinctive visual design in new or existing interfaces, including aesthetic direction, typography, and avoiding templated defaults.
 
 $ thrn skills info frontend
 Curated catalog information (schema v1)
+Catalog source: bundled metadata
+Catalog freshness: unknown (no validated cache is available)
 Canonical catalog ID: frontend-design
 Display name: Frontend Design
 Description: Guidance for distinctive visual design in new or existing interfaces, including aesthetic direction, typography, and avoiding templated defaults.
@@ -126,9 +168,10 @@ Publisher authenticity: not guaranteed by this commit pin.
 ```
 
 Malformed lookup identifiers and unknown catalog IDs fail with actionable stderr diagnostics.
-Searches with no matches exit successfully and suggest listing the catalog. Test-only data and
-fixed lexical SHA strings under `tests/fixtures/catalog/` are synthetic and are not production
-resources.
+Searches with no matches exit successfully and suggest listing the catalog. Catalog refresh errors
+write no search results to stdout, report a diagnostic on stderr, and preserve the previous cache.
+Test-only data and fixed lexical SHA strings under `tests/fixtures/catalog/` are synthetic and are
+not production resources.
 
 ## Local Agent Skills validation
 

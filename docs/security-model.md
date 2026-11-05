@@ -2,7 +2,7 @@
 
 ## Current exposure
 
-THRN is under development and has no supported installer release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, reads curated metadata from its compile-time bundled catalog, and offers read-only local `SKILL.md` validation. It does not fetch catalog data or skills, read credentials, write installation files, or execute subprocesses. Archive extraction, target ownership, installation staging, receipts, and rollback protections are not implemented; their absence is not a security guarantee for an installer.
+THRN is under development and has no supported installer release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, reads validated local catalog data, offers an explicit HTTPS catalog refresh, and performs read-only local `SKILL.md` validation. Default discovery never uses the network. Explicit refresh contacts one fixed THRN-operated HTTPS endpoint, validates the response, and writes only the catalog cache. It does not fetch skills, read credentials, install content, or execute subprocesses. Archive extraction, target ownership, installation staging, receipts, and rollback protections are not implemented; their absence is not a security guarantee for an installer.
 
 ## Boundaries required before installation
 
@@ -10,7 +10,7 @@ Registry metadata, GitHub responses, archives, skill files, and instructions ins
 
 Before M2 installation work is accepted, source and filesystem handling must:
 
-- Use the curated HTTPS registry and public GitHub sources at exact, full commit hashes. Validate the source origin and immutable revision; do not follow untrusted redirects. A checksum from the same registry can detect accidental changes but does not prove publisher identity if that registry is compromised.
+- Catalog refresh is limited to `https://raw.githubusercontent.com/thrns/thrn/main/src/registry/builtin-v1.json`; require HTTPS certificate verification, reject redirects, use explicit timeouts, and enforce the 1 MiB limit while streaming. Validate UTF-8 and the full catalog schema before caching. This endpoint is curated by THRN, but HTTPS and catalog inclusion do not authenticate or establish the safety of individual skill publishers. For later skill fetching, use public GitHub sources at exact, full commit hashes and independently validate source origin and immutable revision. A checksum from the same registry can detect accidental changes but does not prove publisher identity if that registry is compromised.
 - Bound network time, response size, archive size, expanded bytes, file count, per-file size, and path depth. Reject malformed metadata, absolute or traversal paths, drive/UNC prefixes, unsupported file types, case-fold collisions, and symlinks or hardlinks that escape the staging or target root.
 - Validate Agent Skills frontmatter and the skill directory/name relationship before installation, while preserving legitimate supporting files.
 - Treat an existing unreceipted target as externally managed. Never overwrite or recursively remove unrelated or user-modified paths. Require explicit scope and conflict choices; project scope is the default, user scope must be selected, and ambiguous noninteractive agent selection must fail.
@@ -20,7 +20,7 @@ Before M2 installation work is accepted, source and filesystem handling must:
 
 ## Milestone status
 
-Implemented in M1-01, M1-02, and M1-03:
+Implemented in M1-01 through M1-04:
 
 - **Catalog boundary:** version-1 JSON is size- and count-bounded; required fields, identifiers,
   case-insensitive ID/alias collisions, GitHub metadata, full commit hashes, and source-path
@@ -36,10 +36,17 @@ Implemented in M1-01, M1-02, and M1-03:
   supporting files or validate scripts, and it never writes or executes skill content. Metadata
   validation does not establish publisher authenticity or the safety of a skill's instructions or
   scripts. See [local validation limits](registry.md#local-agent-skills-validation).
+- **Catalog network/cache boundary:** M1-04 uses a Rustls-backed HTTPS client for the fixed URL,
+  verifies certificates, follows no redirects, and applies connect, response-body, and overall
+  timeouts. It bounds response reads independently of `Content-Length` and passes bytes through the
+  existing catalog parser before persistence. One source-tagged cache file is loaded only after
+  envelope and catalog revalidation; symlinks and nonregular cache files are rejected. Refresh
+  writes via a same-directory temporary file and atomic replacement. Failed fetches, validation,
+  or commits do not replace the last valid cache. Offline discovery uses cache or bundled metadata
+  and never silently refreshes stale content.
 
 Remaining requirements:
 
-- **M1-04:** trusted catalog fetching and caching.
 - **M2:** constrained GitHub fetching, hostile archive/path validation, destination checks, ownership receipts, staged installation, and rollback/recovery.
 - **M3:** safe user-scope support and receipt-backed update/remove behavior that detects modified content and reports partial failure.
 

@@ -8,7 +8,10 @@ use clap::{Parser, Subcommand};
 use crate::{
     doctor,
     error::Result,
-    registry::discovery::{CatalogResolver, builtin_catalog},
+    registry::{
+        catalog_service::{CatalogSelection, CatalogService, Freshness},
+        discovery::CatalogResolver,
+    },
     skills::validator::validate_skill_directory,
 };
 
@@ -27,7 +30,7 @@ struct Cli {
 enum Command {
     /// Report the CLI build metadata without changing files or using the network.
     Doctor,
-    /// Search and inspect curated Agent Skills catalog metadata offline.
+    /// Search and inspect curated Agent Skills catalog metadata.
     Skills {
         #[command(subcommand)]
         command: SkillsCommand,
@@ -36,8 +39,13 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum SkillsCommand {
-    /// Search the locally bundled catalog.
-    Search { query: Option<String> },
+    /// Search locally available curated Agent Skills metadata.
+    Search {
+        query: Option<String>,
+        /// Fetch the fixed trusted HTTPS catalog and replace the offline cache.
+        #[arg(long)]
+        refresh: bool,
+    },
     /// Show curated catalog metadata for an exact ID or explicit alias.
     Info { id: String },
     /// Validate a local skill directory without modifying or executing its contents.
@@ -51,31 +59,45 @@ pub fn run() -> Result<()> {
     {
         Command::Doctor => doctor::run(),
         Command::Skills { command } => match command {
-            SkillsCommand::Search { query } => search_skills(query.as_deref()),
+            SkillsCommand::Search { query, refresh } => search_skills(query.as_deref(), refresh),
             SkillsCommand::Info { id } => show_skill_info(&id),
             SkillsCommand::Validate { path } => validate_skill(&path),
         },
     }
 }
 
-fn search_skills(query: Option<&str>) -> Result<()> {
-    let catalog = builtin_catalog()?;
-    let resolver = CatalogResolver::new(&catalog);
+fn search_skills(query: Option<&str>, refresh: bool) -> Result<()> {
+    let service = CatalogService::for_system();
+    let selection = if refresh {
+        service.refresh()?
+    } else {
+        service.discover()?
+    };
+    report_cache_warning(selection.cache_warning.as_deref())?;
+    let resolver = CatalogResolver::new(&selection.catalog);
     let resources = resolver.search(query);
 
     let output = if resources.is_empty() {
-        if catalog.resources().is_empty() {
-            "No skills are available in the bundled catalog.\n".to_owned()
+        if selection.catalog.resources().is_empty() {
+            format!(
+                "{}No skills are available in the selected catalog.\n",
+                catalog_heading(&selection)
+            )
         } else if let Some(query) = query {
             format!(
-                "No skills matched query {query:?}.\nTry `thrn skills search` to list available skills.\n"
+                "{}No skills matched query {query:?}.\nTry `thrn skills search` to list available skills.\n",
+                catalog_heading(&selection)
             )
         } else {
-            "No skills are available in the bundled catalog.\n".to_owned()
+            format!(
+                "{}No skills are available in the selected catalog.\n",
+                catalog_heading(&selection)
+            )
         }
     } else {
-        let mut output = String::from(
-            "Curated skill catalog (schema v1; bundled static metadata, no network access)\n",
+        let mut output = format!(
+            "{}Curated skill catalog (schema v1)\n",
+            catalog_heading(&selection)
         );
         for resource in resources {
             output.push_str(resource.id().as_str());
@@ -92,8 +114,9 @@ fn search_skills(query: Option<&str>) -> Result<()> {
 }
 
 fn show_skill_info(identifier: &str) -> Result<()> {
-    let catalog = builtin_catalog()?;
-    let resolver = CatalogResolver::new(&catalog);
+    let selection = CatalogService::for_system().discover()?;
+    report_cache_warning(selection.cache_warning.as_deref())?;
+    let resolver = CatalogResolver::new(&selection.catalog);
     let resource = resolver.resolve(identifier)?;
     let aliases = if resource.aliases().is_empty() {
         "(none)".to_owned()
@@ -107,8 +130,10 @@ fn show_skill_info(identifier: &str) -> Result<()> {
     };
     let source = resource.source();
     let output = format!(
-        "Curated catalog information (schema v{})\nCanonical catalog ID: {}\nDisplay name: {}\nDescription: {}\nSkill directory name: {}\nCatalog version: {}\nExplicit aliases: {}\nGitHub owner: {}\nGitHub repository: {}\nSource directory: {}\nPinned commit: {}\nPublisher authenticity: not guaranteed by this commit pin.\n",
-        catalog.schema_version(),
+        "Curated catalog information (schema v{})\nCatalog source: {}\nCatalog freshness: {}\nCanonical catalog ID: {}\nDisplay name: {}\nDescription: {}\nSkill directory name: {}\nCatalog version: {}\nExplicit aliases: {}\nGitHub owner: {}\nGitHub repository: {}\nSource directory: {}\nPinned commit: {}\nPublisher authenticity: not guaranteed by this commit pin.\n",
+        selection.catalog.schema_version(),
+        selection.source_label(),
+        freshness_label(selection.freshness),
         resource.id().as_str(),
         resource.display_name(),
         resource.description(),
@@ -121,6 +146,34 @@ fn show_skill_info(identifier: &str) -> Result<()> {
         source.commit().as_str(),
     );
     write_stdout(&output)
+}
+
+fn catalog_heading(selection: &CatalogSelection) -> String {
+    format!(
+        "Catalog source: {}; freshness: {}.\n",
+        selection.source_label(),
+        freshness_label(selection.freshness)
+    )
+}
+
+fn freshness_label(freshness: Freshness) -> &'static str {
+    match freshness {
+        Freshness::Fresh => "fresh (last successful refresh was within 24 hours)",
+        Freshness::Stale => "stale (last successful refresh was more than 24 hours ago)",
+        Freshness::Unknown => "unknown (no validated cache is available)",
+    }
+}
+
+fn report_cache_warning(warning: Option<&str>) -> Result<()> {
+    if let Some(warning) = warning {
+        let mut stderr = io::stderr().lock();
+        writeln!(
+            stderr,
+            "thrn: {warning}; using bundled metadata. Run `thrn skills search --refresh` to recover the cache."
+        )?;
+        stderr.flush()?;
+    }
+    Ok(())
 }
 
 fn validate_skill(path: &Path) -> Result<()> {

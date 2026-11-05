@@ -3,11 +3,15 @@ use std::{
     path::PathBuf,
     process::{Command, Output},
     sync::atomic::{AtomicUsize, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
 
-struct TestDir(PathBuf);
+struct TestDir {
+    root: PathBuf,
+    project: PathBuf,
+}
 
 impl TestDir {
     fn new() -> Self {
@@ -16,7 +20,14 @@ impl TestDir {
             let sequence = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
             let path = parent.join(format!("thrn-cli-test-{}-{sequence}", std::process::id()));
             match fs::create_dir(&path) {
-                Ok(()) => return Self(path),
+                Ok(()) => {
+                    let project = path.join("project");
+                    fs::create_dir(&project).expect("test project directory should be created");
+                    return Self {
+                        root: path,
+                        project,
+                    };
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => panic!("could not create isolated test directory: {error}"),
             }
@@ -24,19 +35,29 @@ impl TestDir {
     }
 
     fn path(&self) -> &std::path::Path {
-        &self.0
+        &self.project
+    }
+
+    fn root(&self) -> &std::path::Path {
+        &self.root
     }
 }
 
 impl Drop for TestDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let _ = fs::remove_dir_all(&self.root);
     }
 }
 
 fn command_in(directory: &TestDir, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_thrn"));
     command.args(args).current_dir(directory.path()).env_clear();
+    command.env("HOME", directory.root());
+    command.env("XDG_CACHE_HOME", directory.root().join("xdg-cache"));
+    command.env("LOCALAPPDATA", directory.root().join("local-app-data"));
+    command.env("THRN_CACHE_DIR", directory.root().join("thrn-cache"));
+    command.env("ALL_PROXY", "http://127.0.0.1:0");
+    command.env("NO_PROXY", "");
 
     // Windows may need SystemRoot to launch a child process. This is an OS
     // setting, not a credential or user-specific application configuration.
@@ -46,6 +67,26 @@ fn command_in(directory: &TestDir, args: &[&str]) -> Command {
     }
 
     command
+}
+
+fn cache_file(directory: &TestDir) -> PathBuf {
+    directory.root().join("thrn-cache/catalog-v1.cache")
+}
+
+fn write_cache(directory: &TestDir, catalog: &[u8]) {
+    let refreshed_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("test clock is after UNIX epoch")
+        .as_secs();
+    let cache_file = cache_file(directory);
+    fs::create_dir_all(cache_file.parent().expect("cache file has a parent"))
+        .expect("test cache directory should be created");
+    let envelope = format!(
+        "THRN-CATALOG-CACHE 1\nsource=https://raw.githubusercontent.com/thrns/thrn/main/src/registry/builtin-v1.json\nrefreshed_at_unix_seconds={refreshed_at}\n\n"
+    );
+    let mut contents = envelope.into_bytes();
+    contents.extend_from_slice(catalog);
+    fs::write(cache_file, contents).expect("test cache should be written");
 }
 
 fn run_cli(args: &[&str]) -> Output {
@@ -73,10 +114,102 @@ fn empty_skill_search_lists_the_bundled_catalog_offline() {
 
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Curated skill catalog (schema v1; bundled static metadata"));
+    assert!(stdout.contains("Catalog source: bundled metadata; freshness: unknown"));
+    assert!(stdout.contains("Curated skill catalog (schema v1)"));
     assert!(stdout.contains("frontend-design  Frontend Design"));
     assert!(stdout.contains("typography"));
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn process_uses_persisted_cache_for_search_and_info() {
+    let directory = TestDir::new();
+    let mut catalog: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/catalog/test-only-valid-v1.json"))
+            .expect("test fixture is valid JSON");
+    catalog["resources"][0]["id"] = serde_json::Value::String("remote-only".to_owned());
+    let bytes = serde_json::to_vec(&catalog).expect("test catalog serializes");
+    write_cache(&directory, &bytes);
+
+    let search = command_in(&directory, &["skills", "search"])
+        .output()
+        .expect("CLI process starts");
+    assert_eq!(search.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&search.stdout);
+    assert!(stdout.contains("Catalog source: local cache; freshness: fresh"));
+    assert!(stdout.contains("remote-only"));
+    assert!(!stdout.contains("frontend-design"));
+    assert!(search.stderr.is_empty());
+
+    let info = command_in(&directory, &["skills", "info", "remote-only"])
+        .output()
+        .expect("CLI process starts");
+    assert_eq!(info.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&info.stdout);
+    assert!(stdout.contains("Catalog source: local cache"));
+    assert!(stdout.contains("Catalog freshness: fresh"));
+    assert!(stdout.contains("Canonical catalog ID: remote-only"));
+    assert!(info.stderr.is_empty());
+}
+
+#[test]
+fn process_uses_stale_cache_offline_and_labels_it_stale() {
+    let directory = TestDir::new();
+    let mut catalog: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/catalog/test-only-valid-v1.json"))
+            .expect("test fixture is valid JSON");
+    catalog["resources"][0]["id"] = serde_json::Value::String("stale-entry".to_owned());
+    let bytes = serde_json::to_vec(&catalog).expect("test catalog serializes");
+    let cache_file = cache_file(&directory);
+    fs::create_dir_all(cache_file.parent().expect("cache file has a parent"))
+        .expect("test cache directory should be created");
+    let envelope = "THRN-CATALOG-CACHE 1\nsource=https://raw.githubusercontent.com/thrns/thrn/main/src/registry/builtin-v1.json\nrefreshed_at_unix_seconds=1\n\n";
+    let mut contents = envelope.as_bytes().to_vec();
+    contents.extend_from_slice(&bytes);
+    fs::write(cache_file, contents).expect("stale test cache should be written");
+
+    let output = command_in(&directory, &["skills", "search", "stale-entry"])
+        .output()
+        .expect("CLI process starts");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Catalog source: local cache; freshness: stale"));
+    assert!(stdout.contains("stale-entry"));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn process_refresh_failure_uses_only_the_local_proxy_and_preserves_cache() {
+    let directory = TestDir::new();
+    let mut catalog: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/catalog/test-only-valid-v1.json"))
+            .expect("test fixture is valid JSON");
+    catalog["resources"][0]["id"] = serde_json::Value::String("persisted-entry".to_owned());
+    let bytes = serde_json::to_vec(&catalog).expect("test catalog serializes");
+    write_cache(&directory, &bytes);
+    let cache_path = cache_file(&directory);
+    let old_cache = fs::read(&cache_path).expect("cache fixture is present");
+
+    let output = command_in(&directory, &["skills", "search", "--refresh"])
+        .output()
+        .expect("CLI process starts");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("thrn:"));
+    assert!(stderr.contains("HTTPS catalog"));
+    assert_eq!(
+        fs::read(cache_path).expect("cache remains readable"),
+        old_cache
+    );
+
+    let offline = command_in(&directory, &["skills", "search"])
+        .output()
+        .expect("offline CLI process starts");
+    assert_eq!(offline.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&offline.stdout).contains("persisted-entry"));
+    assert!(offline.stderr.is_empty());
 }
 
 #[test]
