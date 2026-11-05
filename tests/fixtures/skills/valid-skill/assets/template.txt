@@ -1,0 +1,1 @@
+Synthetic support asset; the validator does not open this file.

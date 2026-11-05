@@ -1,4 +1,7 @@
-use std::io::{self, Write};
+use std::{
+    io::{self, Write},
+    path::Path,
+};
 
 use clap::{Parser, Subcommand};
 
@@ -6,6 +9,7 @@ use crate::{
     doctor,
     error::Result,
     registry::discovery::{CatalogResolver, builtin_catalog},
+    skills::validator::validate_skill_directory,
 };
 
 #[derive(Debug, Parser)]
@@ -36,6 +40,8 @@ enum SkillsCommand {
     Search { query: Option<String> },
     /// Show curated catalog metadata for an exact ID or explicit alias.
     Info { id: String },
+    /// Validate a local skill directory without modifying or executing its contents.
+    Validate { path: std::path::PathBuf },
 }
 
 pub fn run() -> Result<()> {
@@ -47,6 +53,7 @@ pub fn run() -> Result<()> {
         Command::Skills { command } => match command {
             SkillsCommand::Search { query } => search_skills(query.as_deref()),
             SkillsCommand::Info { id } => show_skill_info(&id),
+            SkillsCommand::Validate { path } => validate_skill(&path),
         },
     }
 }
@@ -114,6 +121,50 @@ fn show_skill_info(identifier: &str) -> Result<()> {
         source.commit().as_str(),
     );
     write_stdout(&output)
+}
+
+fn validate_skill(path: &Path) -> Result<()> {
+    let metadata = validate_skill_directory(path)
+        .map_err(|errors| crate::error::ThrnError::SkillValidation { errors })?;
+    let license = metadata
+        .license
+        .as_deref()
+        .map(safe_display)
+        .unwrap_or_else(|| "(not specified)".to_owned());
+    let compatibility = metadata
+        .compatibility
+        .as_deref()
+        .map(safe_display)
+        .unwrap_or_else(|| "(not specified)".to_owned());
+    let allowed_tools = metadata
+        .allowed_tools
+        .as_deref()
+        .map(safe_display)
+        .unwrap_or_else(|| "(not specified)".to_owned());
+    let output = format!(
+        "Skill validation passed\nName: {}\nDescription: {}\nLicense: {}\nCompatibility: {}\nAllowed tools: {}\nAdditional metadata entries: {}\n",
+        safe_display(&metadata.name),
+        safe_display(&metadata.description),
+        license,
+        compatibility,
+        allowed_tools,
+        metadata.metadata.len(),
+    );
+    write_stdout(&output)
+}
+
+fn safe_display(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_control() {
+            output.extend(character.escape_default());
+        } else if character.is_whitespace() {
+            output.push(' ');
+        } else {
+            output.push(character);
+        }
+    }
+    output
 }
 
 fn write_stdout(output: &str) -> Result<()> {

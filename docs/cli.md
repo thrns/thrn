@@ -1,6 +1,6 @@
 # CLI contract
 
-This page describes the executable that exists today. The CLI supports offline catalog discovery and the read-only `doctor` command. Skill downloads and installation, configuration, completions, JSON output, and noninteractive options are not implemented.
+This page describes the executable that exists today. The CLI supports offline catalog discovery, read-only local skill validation, and the `doctor` command. Skill downloads and installation, configuration, completions, JSON output, and noninteractive options are not implemented.
 
 ## Available commands
 
@@ -12,12 +12,37 @@ This page describes the executable that exists today. The CLI supports offline c
 | `thrn doctor --help` | Print help for the `doctor` subcommand. |
 | `thrn skills search [query]` | Search the compile-time bundled catalog by ID, alias, skill name, display name, or description. Omit the query to list all entries. |
 | `thrn skills info <id>` | Show curated metadata for an exact canonical ID or explicit alias. |
+| `thrn skills validate <path>` | Read and validate the `SKILL.md` in a local skill directory. |
 
 The root parser requires a subcommand. Clap also supplies its normal short-help and short-version aliases.
 
 ## Output and exit status
 
-Successful help, version, doctor, search, and info output goes to stdout and exits `0`. A search with no matches is an informative successful result. Clap usage errors, including missing required arguments, unknown commands, and invalid options, go to stderr and exit `2`. Invalid lookup identifiers, unknown IDs, and output I/O failures go to stderr and exit `1`. No JSON document or future categorized error code is part of the present contract.
+Successful help, version, doctor, search, info, and skill validation output goes to stdout and exits `0`. A search with no matches is an informative successful result. Clap usage errors, including missing required arguments, unknown commands, and invalid options, go to stderr and exit `2`. Invalid lookup identifiers, unknown IDs, skill validation errors, filesystem errors, and output I/O failures go to stderr and exit `1`. Failed validation writes no success or partial metadata to stdout.
+
+## Local skill validation
+
+```sh
+thrn skills validate ./path/to/my-skill
+```
+
+On success, THRN reports the validated name, description, optional license, compatibility and
+allowed-tools values, and the number of additional metadata entries. For example:
+
+```text
+Skill validation passed
+Name: valid-skill
+Description: A minimal synthetic skill used to verify local metadata validation.
+License: (not specified)
+Compatibility: (not specified)
+Allowed tools: (not specified)
+Additional metadata entries: 0
+```
+
+Failures list actionable frontmatter or file errors on stderr. The validator reads only the regular
+`SKILL.md`, has a 256 KiB file ceiling, and applies YAML complexity budgets documented in the
+[registry and validation notes](registry.md#local-agent-skills-validation). It does not traverse,
+modify, or execute supporting files.
 
 ## Platform considerations
 
