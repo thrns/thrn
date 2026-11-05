@@ -333,6 +333,93 @@ fn skills_list_help_and_unknown_options_follow_clap_usage_semantics() {
 }
 
 #[test]
+fn install_requires_agent_and_identifier_arguments() {
+    let missing_agent = run_cli(&["skills", "install", "frontend", "--dry-run"]);
+    assert_eq!(missing_agent.status.code(), Some(2));
+    assert!(missing_agent.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&missing_agent.stderr).contains("--agent <AGENT>"));
+
+    let missing_identifier = run_cli(&["skills", "install", "--agent", "codex", "--dry-run"]);
+    assert_eq!(missing_identifier.status.code(), Some(2));
+    assert!(missing_identifier.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&missing_identifier.stderr).contains("<ID>"));
+}
+
+#[test]
+fn install_without_dry_run_fails_before_network_or_filesystem_changes() {
+    let directory = TestDir::new();
+    let output = command_in(
+        &directory,
+        &["skills", "install", "frontend", "--agent", "codex"],
+    )
+    .output()
+    .expect("CLI process starts");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("actual installation is not implemented yet")
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("include --dry-run"));
+    assert!(!directory.path().join(".agents").exists());
+    assert!(!receipt_directory(&directory).exists());
+}
+
+#[test]
+fn unsupported_agent_and_invalid_id_fail_without_success_output_or_project_writes() {
+    let unsupported = TestDir::new();
+    let output = command_in(
+        &unsupported,
+        &[
+            "skills",
+            "install",
+            "frontend",
+            "--agent",
+            "cursor",
+            "--dry-run",
+        ],
+    )
+    .output()
+    .expect("CLI process starts");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("only --agent codex"));
+    assert!(!unsupported.path().join(".agents").exists());
+
+    let invalid = TestDir::new();
+    let output = command_in(
+        &invalid,
+        &[
+            "skills",
+            "install",
+            "bad--id",
+            "--agent",
+            "codex",
+            "--dry-run",
+        ],
+    )
+    .output()
+    .expect("CLI process starts");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid skill identifier"));
+    assert!(!invalid.path().join(".agents").exists());
+    assert!(!receipt_directory(&invalid).exists());
+}
+
+#[test]
+fn install_help_explains_required_read_only_mode_and_project_option() {
+    let output = run_cli(&["skills", "install", "--help"]);
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--agent <AGENT>"));
+    assert!(stdout.contains("--project <PATH>"));
+    assert!(stdout.contains("--dry-run"));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn process_uses_persisted_cache_for_search_and_info() {
     let directory = TestDir::new();
     let mut catalog: serde_json::Value =

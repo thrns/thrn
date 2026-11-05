@@ -47,8 +47,42 @@ pub struct StagedSkill {
     revision: CommitSha,
     source: SourceIdentity,
     metadata: SkillMetadata,
+    expected_entries: Vec<StagedEntry>,
     content_directory: PathBuf,
     _temporary_directory: TempDir,
+}
+
+/// A selected path and kind from the already validated archive manifest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StagedEntry {
+    relative_path: PathBuf,
+    kind: StagedEntryKind,
+    expected_bytes: u64,
+    expected_crc32: u32,
+}
+
+impl StagedEntry {
+    pub fn relative_path(&self) -> &Path {
+        &self.relative_path
+    }
+
+    pub fn kind(&self) -> StagedEntryKind {
+        self.kind
+    }
+
+    pub fn expected_bytes(&self) -> u64 {
+        self.expected_bytes
+    }
+
+    pub fn expected_crc32(&self) -> u32 {
+        self.expected_crc32
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StagedEntryKind {
+    File,
+    Directory,
 }
 
 impl StagedSkill {
@@ -74,6 +108,11 @@ impl StagedSkill {
 
     pub fn content_directory(&self) -> &Path {
         &self.content_directory
+    }
+
+    /// Exact selected file and directory inventory from the validated archive manifest.
+    pub fn expected_entries(&self) -> &[StagedEntry] {
+        &self.expected_entries
     }
 }
 
@@ -137,6 +176,7 @@ fn stage_selected_skill_with_file_system(
         .create_private()
         .map_err(|error| StageError::CreateTemporaryDirectory { kind: error.kind() })?;
     let root = temporary_directory.path().to_path_buf();
+    let expected_entries = selected_manifest_entries(manifest, selection)?;
     let result = stage_contents(
         resource,
         archive_bytes,
@@ -152,6 +192,7 @@ fn stage_selected_skill_with_file_system(
             revision: resource.source().commit().clone(),
             source: resource.source().clone(),
             metadata,
+            expected_entries,
             content_directory,
             _temporary_directory: temporary_directory,
         }),
@@ -163,6 +204,30 @@ fn stage_selected_skill_with_file_system(
             }),
         },
     }
+}
+
+fn selected_manifest_entries(
+    manifest: &ValidatedArchive,
+    selection: &SelectedSkill,
+) -> Result<Vec<StagedEntry>, StageError> {
+    let prefix = format!("{}/", selection.source_directory());
+    let mut entries = Vec::new();
+    for entry in manifest.entries() {
+        let Some(relative) = entry.path().as_str().strip_prefix(&prefix) else {
+            continue;
+        };
+        let relative_path = checked_relative_path(relative)?;
+        entries.push(StagedEntry {
+            relative_path,
+            kind: match entry.kind() {
+                ArchiveEntryKind::File => StagedEntryKind::File,
+                ArchiveEntryKind::Directory => StagedEntryKind::Directory,
+            },
+            expected_bytes: entry.uncompressed_bytes(),
+            expected_crc32: entry.crc32(),
+        });
+    }
+    Ok(entries)
 }
 
 trait StageFileSystem {

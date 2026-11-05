@@ -9,6 +9,8 @@ pub enum ThrnError {
     #[error(transparent)]
     CatalogRefresh(#[from] crate::registry::catalog_service::CatalogRefreshError),
     #[error(transparent)]
+    Install(#[from] crate::install::command::InstallCommandError),
+    #[error(transparent)]
     InstalledListing(#[from] crate::install::receipt_store::ReceiptDiscoveryError),
     #[error(transparent)]
     Resolution(#[from] crate::registry::discovery::ResolutionError),
@@ -44,6 +46,9 @@ pub fn report(error: ThrnError) -> ExitCode {
                 .join("\n");
             write_diagnostic(&format!("thrn: skill validation failed\n{diagnostics}"))
         }
+        ThrnError::Install(crate::install::command::InstallCommandError::Conflicts {
+            conflicts,
+        }) => write_diagnostic(&crate::install::command::format_conflicts(&conflicts)),
         error => write_diagnostic(&format!("thrn: {error}")),
     }
 }

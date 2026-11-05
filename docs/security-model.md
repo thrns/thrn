@@ -2,13 +2,13 @@
 
 ## Current exposure
 
-THRN is under development and has no supported installer release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, reads validated local catalog data, offers an explicit HTTPS catalog refresh, performs read-only local `SKILL.md` validation, and checks the future receipt directory for installed listing. Default discovery and both `skills list` modes never use the network. Explicit refresh contacts one fixed THRN-operated HTTPS endpoint, validates the response, and writes only the catalog cache. No CLI command fetches skills or executes subprocesses. A source library API fetches pinned public GitHub archives, validates and stages one selected skill in a private temporary directory, but does not execute or install it. The installed listing reads only THRN's application-data receipt directory: it does not inspect agent skill folders, create receipt storage, or interpret a provisional receipt format. Installation, durable receipts, target ownership, and rollback protections are not implemented; their absence is not a security guarantee for an installer.
+THRN is under development and has no supported installer release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, reads validated local catalog data, offers an explicit HTTPS catalog refresh, performs read-only local `SKILL.md` validation, checks the future receipt directory for installed listing, and provides a read-only Codex project install dry-run. Default discovery and both `skills list` modes never use the network. Explicit refresh contacts one fixed THRN-operated HTTPS endpoint, validates the response, and writes only the catalog cache. An install dry-run reads the local catalog without refreshing it, fetches the selected skill at its pinned public GitHub commit, validates and stages it privately, then prints a plan without changing the project. No retrieved content or subprocess is executed. The installed listing reads only THRN's application-data receipt directory: it does not inspect agent skill folders, create receipt storage, or interpret a provisional receipt format. Actual installation, durable receipts, target ownership, and rollback protections are not implemented; the dry-run does not provide those protections.
 
 ## Boundaries required before installation
 
 Registry metadata, GitHub responses, archives, skill files, and instructions inside `SKILL.md` must be treated as untrusted input. A skill is content for a compatible agent, not an instruction source for THRN. Installing or inspecting one must never implicitly invoke scripts, hooks, shells, package managers, or other retrieved code.
 
-Before M2 installation work is accepted, source and filesystem handling must:
+Before an actual installation is implemented, source and filesystem handling must:
 
 - Catalog refresh is limited to `https://raw.githubusercontent.com/thrns/thrn/main/src/registry/builtin-v1.json`; require HTTPS certificate verification, reject redirects, use explicit timeouts, and enforce the 1 MiB limit while streaming. Validate UTF-8 and the full catalog schema before caching. This endpoint is curated by THRN, but HTTPS and catalog inclusion do not authenticate or establish the safety of individual skill publishers. For later skill fetching, use public GitHub sources at exact, full commit hashes and independently validate source origin and immutable revision. A checksum from the same registry can detect accidental changes but does not prove publisher identity if that registry is compromised.
 - Bound network time, response size, archive size, expanded bytes, file count, per-file size, and path depth. Reject malformed metadata, absolute or traversal paths, drive/UNC prefixes, unsupported file types, case-fold collisions, and symlinks or hardlinks that escape the staging or target root.
@@ -17,6 +17,8 @@ Before M2 installation work is accepted, source and filesystem handling must:
 - Stage complete content near each destination and use atomic rename where the filesystem supports it. Multiple destinations are a recoverable sequence, not one cross-target atomic transaction. Write durable ownership receipts only after successful commits; preserve recovery state and report incomplete rollback.
 - Avoid logging credentials, tokens, environment secrets, private skill content, or unnecessary personal paths. The v1 public-source workflow should not require a GitHub token. Any future credential support needs an explicit design and redaction tests.
 - Make supply-chain claims proportionate to evidence. Pinned commits identify source revisions, not author identity. Stronger publisher authenticity requires a separately reviewed signing or attestation design; do not imply that TLS or a same-origin digest provides it.
+
+M2-03 implements read-only destination checks and a proposal; it does not satisfy the write, ownership, receipt, atomicity, or recovery requirements above. `--dry-run` must remain mandatory until a separately reviewed task implements actual installation.
 
 ## Milestone status
 
@@ -120,7 +122,7 @@ Unix entries without type bits, ambiguous DOS directories, Unix symlinks, and sp
 M1-04's deferred cache path-component/concurrent-replacement review and recovery-message refinement
 remain tracked below. M2-02 does not change the cache and does not expand that follow-up.
 
-Implemented in M1-01 through M2-02:
+Current implementation boundaries through M2-03:
 
 - **Catalog boundary:** version-1 JSON is size- and count-bounded; required fields, identifiers,
   case-insensitive ID/alias collisions, GitHub metadata, full commit hashes, and source-path
@@ -156,6 +158,38 @@ Implemented in M1-01 through M2-02:
   applies the exact redirect and byte limits above, validates before extraction, selects one exact
   source directory, and returns a validated temporary stage. It does not authenticate publishers,
   execute content, or install into agent folders.
+- **Install-plan boundary:** M2-03's `skills install <id> --agent codex --dry-run` uses the existing
+  offline `CatalogService::discover()` path, so it does not refresh the catalog. It then fetches
+  only the selected resource's exact pinned GitHub archive through M2-02. The validated source
+  directory is staged in a private temporary directory, and the planner walks only that selected
+  skill. It compares every staged file and directory with the validated archive manifest, enforces
+  the archive's count, depth and byte budgets, rechecks each file's size and CRC-32, and rejects
+  changed, missing, extra, linked or unsupported objects. CRC-32 here detects accidental or
+  post-stage changes; it is not cryptographic authentication.
+- **Codex destination boundary:** M2-03 supports only explicit `--agent codex` and project scope.
+  The default root is the current directory; `--project` selects another existing directory. THRN
+  resolves and prints the canonical project root. It inspects `.agents`, `.agents/skills`, and the
+  selected skill entry without creating them or following destination symlinks. Inspected project,
+  `.agents`, and `.agents/skills` directory listings are bounded to 16,384 entries each. Non-directory
+  components, symlinks, exact target paths, and case-insensitive collisions for the `.agents`,
+  `skills`, and skill-name components become conflicts. Existing content is always treated as
+  externally managed. The selected destination
+  uses validated `skillName`, not the catalog ID or alias, at
+  `<project-root>/.agents/skills/<skillName>` as documented in the
+  [Codex build-skills guide](https://learn.chatgpt.com/docs/build-skills).
+- **Immutable-plan boundary:** `src/install/plan.rs` is a pure builder over a validated staged
+  inventory and a read-only destination snapshot. The plan retains canonical resource identity,
+  actual skill name, pinned source identity, target selection, directories, files, expected sizes,
+  CRC values, conflicts, and destination assumptions. Its data is immutable through the public
+  API. A successful plan does not authorize a later write; M2-04 must repeat the inspection and
+  compare assumptions immediately before any filesystem change.
+- **Dry-run boundary:** successful output is assembled completely before writing to stdout and
+  includes the source revision, resolved root, destination, directory list, complete regular-file
+  list, sizes and totals, and a no-project-modification statement. Any conflict or failure exits
+  nonzero without partial plan output. The stage is dropped and cleaned when planning returns.
+  Destination and stage inspection are separate operations, so concurrent same-user changes can
+  still race the snapshot; M2-04 must revalidate, and residual time-of-check/time-of-use limits
+  require review. The M2-03 command creates no `.agents/skills`, receipt, or project file.
 
 ## Non-blocking M1-04 follow-up review
 
@@ -169,10 +203,17 @@ block offline listing or M2-02 and are not expanded by this milestone:
   data from unsafe or inaccessible cache storage, and explains what refresh can repair while
   making clear that failed refreshes preserve the prior cache.
 
+## Non-blocking M2-02 transport review
+
+The source fetcher currently accepts only an initial HTTPS request to `github.com` and one exact
+redirect to `codeload.github.com` for the same owner, repository, and full commit. Carry forward an
+independent review of the transport host allowlist and proxy-environment behavior, including checks
+that diagnostics do not expose credentials or private paths. M2-03 does not broaden or replace this
+M2-02 network boundary.
+
 Remaining requirements:
 
-- **M2-03 and later:** deterministic install plans, agent destination checks, ownership receipts,
-  committed installation, and rollback/recovery.
+- **M2-04 and later:** committed installation, ownership receipts, and rollback/recovery.
 - **M3:** safe user-scope support and receipt-backed update/remove behavior that detects modified content and reports partial failure.
 
 Security-sensitive parsing and writes require negative tests with hostile fixtures, isolated temporary directories, and deterministic network mocks. See the [roadmap](ROADMAP.md) and [repository security policy](../SECURITY.md) for project status.

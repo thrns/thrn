@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use crate::{
     doctor,
     error::Result,
+    install::command::{InstallCommandError, format_dry_run, prepare_install_plan},
     install::receipt_store::ReceiptStore,
     registry::{
         catalog_service::{CatalogSelection, CatalogService, Freshness},
@@ -57,6 +58,20 @@ enum SkillsCommand {
     Info { id: String },
     /// Validate a local skill directory without modifying or executing its contents.
     Validate { path: std::path::PathBuf },
+    /// Show a read-only plan for a pinned Codex project skill install.
+    Install {
+        /// Exact catalog resource ID or explicit alias.
+        id: String,
+        /// Select the only supported M2-03 agent.
+        #[arg(long, required = true, value_name = "AGENT")]
+        agent: String,
+        /// Select an existing project directory (defaults to the current directory).
+        #[arg(long, value_name = "PATH")]
+        project: Option<std::path::PathBuf>,
+        /// Required until actual installation is implemented.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -70,8 +85,44 @@ pub fn run() -> Result<()> {
             SkillsCommand::Search { query, refresh } => search_skills(query.as_deref(), refresh),
             SkillsCommand::Info { id } => show_skill_info(&id),
             SkillsCommand::Validate { path } => validate_skill(&path),
+            SkillsCommand::Install {
+                id,
+                agent,
+                project,
+                dry_run,
+            } => install_skill(&id, &agent, project.as_deref(), dry_run),
         },
     }
+}
+
+fn install_skill(
+    identifier: &str,
+    agent: &str,
+    project: Option<&Path>,
+    dry_run: bool,
+) -> Result<()> {
+    if !dry_run {
+        return Err(InstallCommandError::DryRunRequired.into());
+    }
+    if agent != "codex" {
+        return Err(InstallCommandError::UnsupportedAgent.into());
+    }
+
+    let current_directory = std::env::current_dir()
+        .map_err(|error| InstallCommandError::CurrentDirectory { kind: error.kind() })?;
+    let selection = CatalogService::for_system().discover()?;
+    let plan = prepare_install_plan(
+        &selection.catalog,
+        identifier,
+        agent,
+        project,
+        &current_directory,
+        &crate::sources::github::UreqGithubTransport::new(),
+        &crate::sources::staging::SystemTempDirFactory,
+    )?;
+    let output = format_dry_run(&plan)?;
+    report_cache_warning(selection.cache_warning.as_deref())?;
+    write_stdout(&output)
 }
 
 fn list_skills(installed: bool) -> Result<()> {
