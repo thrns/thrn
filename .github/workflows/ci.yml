@@ -24,6 +24,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Check shell syntax
+        run: bash -n scripts/*.sh scripts/tests/*.sh .githooks/pre-push
+
+      - name: Run delivery automation tests
+        run: bash scripts/tests/test_finish_task.sh
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 

@@ -89,9 +89,30 @@ changed_files="$(git diff-tree --no-commit-id --name-only -r "$sha")"
 } > "$body_file"
 
 # Query all states so retries or reruns never create a duplicate PR.
-pr_url="$(gh pr list --state all --head "$branch" --json url --jq '.[0].url // empty')"
-if [[ -n "$pr_url" ]]; then
-  printf 'Reusing existing pull request: %s\n' "$pr_url"
+pr_record="$(gh pr list --state all --head "$branch" --json url,state,mergedAt,isDraft --jq '.[0] | if . == null then empty else [.url, .state, (.mergedAt // ""), (.isDraft | tostring)] | join("|") end')" || {
+  echo 'Unable to inspect existing pull requests; refusing to create a possibly duplicate pull request.' >&2
+  exit 1
+}
+if [[ -n "$pr_record" ]]; then
+  IFS='|' read -r pr_url pr_state pr_merged_at pr_is_draft <<< "$pr_record"
+  if [[ "$pr_state" != "OPEN" ]]; then
+    if [[ "$pr_state" == "CLOSED" && -z "$pr_merged_at" ]]; then
+      echo "Existing pull request is closed and unmerged: $pr_url" >&2
+      echo 'Reopen it manually or start a new task branch; no duplicate pull request was created.' >&2
+    elif [[ "$pr_state" == "CLOSED" ]]; then
+      echo "Existing pull request is already merged: $pr_url" >&2
+      echo 'Start a new task branch for additional changes; no duplicate pull request was created.' >&2
+    else
+      echo "Existing pull request has an unexpected state ('$pr_state'): $pr_url" >&2
+      echo 'Resolve the pull request state manually; no duplicate pull request was created.' >&2
+    fi
+    exit 1
+  fi
+  if [[ "$pr_is_draft" == "true" ]]; then
+    printf 'Reusing existing draft pull request: %s\n' "$pr_url"
+  else
+    printf 'Reusing existing pull request: %s\n' "$pr_url"
+  fi
 else
   pr_url="$(gh pr create --draft --base main --head "$branch" --title "$pr_title" --body-file "$body_file")"
 fi

@@ -80,11 +80,17 @@ set -euo pipefail
 if [[ "$1" == "auth" && "$2" == "status" ]]; then exit 0; fi
 if [[ "$1" == "pr" && "$2" == "list" ]]; then
   printf 'gh-list\n' >> "$THRN_TEST_EVENTS"
-  if [[ -f "$THRN_TEST_PR_FILE" ]]; then printf 'https://github.com/thrns/thrn/pull/4242\n'; fi
+  [[ "$*" == *'--state all'* ]] || { echo 'PR lookup omitted all states' >&2; exit 95; }
+  [[ "$*" == *'--json url,state,mergedAt,isDraft'* ]] || { echo 'PR lookup omitted state fields' >&2; exit 96; }
+  if [[ -f "$THRN_TEST_PR_FILE" ]]; then
+    printf 'https://github.com/thrns/thrn/pull/4242|%s|%s|%s\n' \
+      "$THRN_TEST_PR_STATE" "$THRN_TEST_PR_MERGED_AT" "$THRN_TEST_PR_IS_DRAFT"
+  fi
   exit 0
 fi
 if [[ "$1" == "pr" && "$2" == "create" ]]; then
   printf 'gh-create\n' >> "$THRN_TEST_EVENTS"
+  [[ "$*" == *'--draft'* ]] || { echo 'new pull request was not created as draft' >&2; exit 97; }
   body_file=''
   while (($#)); do
     if [[ "$1" == "--body-file" ]]; then
@@ -112,17 +118,18 @@ GH
   "$real_git" -C "$fixture" config user.email 'thrn-test@example.invalid'
   "$real_git" -C "$fixture" config commit.gpgsign false
   printf 'baseline\n' > "$fixture/README.md"
-  "$real_git" -C "$fixture" add README.md
+  "$real_git" -C "$fixture" add .gitignore README.md scripts .githooks .github test-bin
   "$real_git" -C "$fixture" commit -qm 'test: baseline'
   "$real_git" init -q --bare --initial-branch=main "$remote_dir"
   "$real_git" -C "$fixture" remote add origin https://github.com/thrns/thrn.git
   "$real_git" -C "$fixture" push "$remote_dir" main >/dev/null
   "$real_git" -C "$fixture" checkout -qb chore/recovery-test
+  "$real_git" -C "$fixture" push "$remote_dir" chore/recovery-test >/dev/null
   base_sha="$("$real_git" -C "$fixture" rev-parse HEAD)"
 }
 
 run_finish() {
-  local verify_fail="$1" create_fail="$2"
+  local verify_fail="$1" create_fail="$2" pr_state="${3:-OPEN}" pr_is_draft="${4:-true}" pr_merged_at="${5:-}"
   (
     cd "$fixture"
     PATH="$bin_dir:$PATH" \
@@ -130,6 +137,9 @@ run_finish() {
     THRN_TEST_REMOTE="$remote_dir" \
     THRN_TEST_EVENTS="$events_file" \
     THRN_TEST_PR_FILE="$pr_file" \
+    THRN_TEST_PR_STATE="$pr_state" \
+    THRN_TEST_PR_IS_DRAFT="$pr_is_draft" \
+    THRN_TEST_PR_MERGED_AT="$pr_merged_at" \
     THRN_TEST_FAIL_VERIFY="$verify_fail" \
     GH_CREATE_FAIL="$create_fail" \
       bash scripts/finish-task.sh 'fix: make pull request delivery recoverable' 'chore: establish THRN development infrastructure'
@@ -181,8 +191,18 @@ run_finish 0 0 > "$tmp_root/create-failure-repeat.out" 2>&1 || fail 'repeat exec
 assert_eq "$(count_events push)" '1' 'repeat execution did not push'
 assert_eq "$(count_events gh-create)" '2' 'repeat execution did not create duplicate PR'
 assert_eq "$(count_events gh-list)" '3' 'each delivery queried for an existing PR'
-assert_contains "$(cat "$tmp_root/create-failure-repeat.out")" 'Reusing existing pull request' 'existing PR reuse is reported'
+assert_contains "$(cat "$tmp_root/create-failure-repeat.out")" 'Reusing existing draft pull request' 'open draft PR reuse is reported'
 [[ "$(count_events verify)" -ge 4 ]] || fail 'clean-tree retries must still verify'
+
+echo 'case: closed unmerged PR fails without creating a duplicate'
+new_fixture closed-pr
+: > "$pr_file"
+if run_finish 0 0 CLOSED false > "$run_out" 2>&1; then fail 'closed unmerged PR returned success'; fi
+assert_contains "$(cat "$run_out")" 'Existing pull request is closed and unmerged' 'closed PR failure is explained'
+assert_contains "$(cat "$run_out")" 'Reopen it manually or start a new task branch' 'closed PR recovery is actionable'
+assert_eq "$(count_events gh-create)" '0' 'closed PR did not create a duplicate'
+assert_eq "$(count_events push)" '0' 'closed PR retry did not push again'
+assert_eq "$(remote_branch_sha)" "$base_sha" 'closed PR failure preserved the verified remote SHA'
 
 echo 'case: refusing a direct push to main'
 new_fixture main-refusal
