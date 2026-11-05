@@ -42,6 +42,10 @@ jobs:
       - name: Build release executable
         run: cargo build --locked --release
 
+      - name: Smoke-test release executable
+        shell: bash
+        run: bash scripts/smoke-release.sh
+
   advisory:
     name: advisory
     runs-on: ubuntu-latest
@@ -80,3 +84,7 @@ jobs:
 
       - name: Build release executable
         run: cargo build --locked --release
+
+      - name: Smoke-test release executable
+        shell: bash
+        run: bash scripts/smoke-release.sh
