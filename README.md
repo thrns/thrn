@@ -20,6 +20,12 @@ Successful command output, including `--help`, `--version`, and `doctor`, goes t
 
 Use `thrn --help` to see the commands currently available. No npm or PyPI package is provided.
 
+## Implementation notes
+
+- [Architecture](docs/architecture.md)
+- [CLI contract](docs/cli.md)
+- [Security model](docs/security-model.md)
+
 ## Codex GUI delivery and recovery
 
 After implementing a task in the Codex GUI, run `bash scripts/finish-task.sh "type: description"` from the repository root. The script reruns verification before delivery, and the pre-push hook verifies the commit again.
