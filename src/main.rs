@@ -1,6 +1,8 @@
 mod cli;
 mod doctor;
 mod error;
+pub mod models;
+pub mod registry;
 
 use std::process::ExitCode;
 

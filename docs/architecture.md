@@ -9,23 +9,34 @@ The runtime dependencies are intentionally small:
 | Dependency | Current use |
 |---|---|
 | `clap` with `derive` | Typed command parsing and generated help/version/usage responses. |
+| `serde` with `derive` | Strictly decode the external catalog schema into private raw parsing records. |
+| `serde_json` | Bounded JSON decoding for the version-1 catalog parser. |
+| `serde_path_to_error` | Add a schema field path to type errors so diagnostics can identify the location without echoing rejected JSON values. |
 | `thiserror` | Typed CLI-boundary errors for Clap and standard I/O failures. |
 
-The standard library supplies process handling, environment constants, and output. `Cargo.lock` records resolved crate versions. There is no runtime HTTP client, serializer, archive reader, temporary-directory crate, or installer dependency.
+The standard library supplies process handling, environment constants, output, and validation collections. `Cargo.lock` records resolved crate versions. There is no runtime HTTP client, archive reader, temporary-directory crate, or installer dependency.
 
 ## Current boundaries
 
 `--help`, `--version`, and `doctor` work offline. The CLI reads its arguments and writes to stdout or stderr; `doctor` does not inspect the filesystem, read configuration or credentials, use the network, or invoke subprocesses. `main` is the only process exit boundary. The integration tests execute the compiled test binary from isolated temporary working directories; they do not contact live services.
 
-## Planned boundaries, not implemented
+## Current and planned boundaries
 
-The following are future design boundaries, not current modules or capabilities:
+Implemented boundaries:
 
-- **M1:** typed models, catalog parsing/cache and exact alias resolution, GitHub source identity, and Agent Skills metadata validation.
+- **M1-01:** `src/models/catalog.rs` contains validated catalog identity types; `src/registry/catalog.rs` parses bounded schema-v1 JSON without network or filesystem access. `docs/registry.md` documents the accepted schema and limits.
+
+Future design boundaries, not current modules or capabilities:
+
+- **M1-02:** catalog lookup/search and exact alias resolution.
+- **M1-03:** Agent Skills `SKILL.md` metadata validation.
+- **M1-04:** trusted catalog fetching and caching.
 - **M2:** bounded source fetching, hostile archive/path validation, agent destinations, deterministic install plans, same-filesystem staging, receipts, and recovery.
 - **M3:** user scope, agent discovery, and receipt-backed check/update/remove operations with conflict handling.
 
 The specification's long-term module map (`cli`, `models`, `registry`, `sources`, `skills`, `agents`, and `install`) is guidance for tested slices. Do not create empty modules to match that map. Command parsing and dispatch stay in the CLI layer; validation, source access, and filesystem transactions belong in their eventual domain boundaries.
+
+Catalog source paths are validated lexically only. The parser does not establish whether a source exists or whether its content can be extracted safely; those checks belong to later fetching and installation slices.
 
 ## Adding commands
 

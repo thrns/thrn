@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "resources": [
+    {
+      "id": "uncharted",
+      "kind": "skill",
+      "displayName": "Uncharted Ideation",
+      "skillName": "uncharted-ideation",
+      "description": "A test-only resource that demonstrates distinct catalog and directory names.",
+      "version": "1.0.0",
+      "aliases": ["idea-lab", "creative-session"],
+      "source": {
+        "provider": "github",
+        "owner": "Example-Org",
+        "repository": "catalog-test-fixtures",
+        "path": "skills/uncharted-ideation",
+        "commit": "2f68bee292a8c68346b4294fb31d9563eefe1ade"
+      }
+    }
+  ]
+}

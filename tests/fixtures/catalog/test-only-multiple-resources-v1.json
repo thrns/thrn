@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "resources": [
+    {
+      "id": "research-helper",
+      "kind": "skill",
+      "displayName": "Research Helper",
+      "skillName": "research-assistant",
+      "description": "Synthetic research workflow fixture.",
+      "version": "2.1.0-beta.1",
+      "source": {
+        "provider": "github",
+        "owner": "Example-Org",
+        "repository": "catalog-test-fixtures",
+        "path": "skills/research-assistant",
+        "commit": "7693098cfb35108dbb292d0bfa1abb5e5ef51a33"
+      }
+    },
+    {
+      "id": "refactor-helper",
+      "kind": "skill",
+      "displayName": "Refactor Helper",
+      "skillName": "safe-refactoring",
+      "description": "Synthetic refactoring workflow fixture.",
+      "version": "0.9.4+test",
+      "aliases": [],
+      "source": {
+        "provider": "github",
+        "owner": "example-org",
+        "repository": "another-test-repository",
+        "path": "catalog/skills/safe-refactoring",
+        "commit": "2f68bee292a8c68346b4294fb31d9563eefe1ade"
+      }
+    }
+  ]
+}
