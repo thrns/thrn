@@ -91,7 +91,7 @@ For GitHub Free, public repos support branch rulesets; private repo branch rules
 
 Do not activate status checks before the named jobs have run at least once. The first feature PR will create them; then select them as required before any merge. This is a one-time ruleset setup. Our local pre-push hook blocks ordinary direct pushes to established `main` but is not a replacement for server-side rules.
 
-## E. First implementation — ONE command
+## E. First implementation — orchestrated CLI or Codex GUI
 
 From `~/Developer/thrn`:
 
@@ -105,7 +105,7 @@ bash scripts/run-task.sh \
   "feat: establish real Rust CLI foundation"
 ```
 
-The script 1) verifies a clean worktree, 2) fetches latest main, 3) creates `feature/m0-foundation`, 4) calls `codex exec` in a workspace-write sandbox with the self-contained prompt, 5) runs Cargo format/lint/tests/release build, 6) checks sensitive-looking staged paths, 7) commits and pushes **only after local checks pass**, and 8) creates a **regular** PR. It prints the branch, head SHA, PR URL, changed files and local verification log location. The script never merges or publishes a release. `CODEX_MODEL` is optional; authorization or sandbox restrictions may still require intervention.
+The script 1) verifies a clean worktree, 2) fetches latest main, 3) creates `feature/m0-foundation`, 4) calls `codex exec` in a workspace-write sandbox with the self-contained prompt, 5) runs Cargo format/lint/tests/release build, 6) checks sensitive-looking staged paths, 7) commits and pushes **only after local checks pass**, and 8) creates a **draft** PR using the repository template. It prints the branch, head SHA, PR URL, changed files and local verification log location. The script never merges or publishes a release. `CODEX_MODEL` is optional; authorization or sandbox restrictions may still require intervention.
 
 The independent GitHub-runner checks are separate and may be pending when the script exits. After the command completes:
 
@@ -131,7 +131,13 @@ codex exec --sandbox workspace-write - < docs/prompts/correction-M0-01.md
 bash scripts/finish-task.sh "fix: address M0-01 review findings"
 ```
 
-From the VS Code Codex sidebar, you can execute a prompt interactively and then run `bash scripts/finish-task.sh "feat: ..."` from its existing task branch. This path does not automatically intercept every IDE chat: the one-command fully orchestrated path is the `run-task.sh` CLI mode.
+From the Codex GUI, create the task branch without starting a nested Codex CLI session:
+
+```bash
+bash scripts/run-task.sh --interactive feature/m0-foundation
+```
+
+Work in the current GUI task, then run `bash scripts/finish-task.sh "feat: establish real Rust CLI foundation"`. This runs the same verification and delivery steps. The `--interactive` mode does not commit or push by itself.
 
 ## G. Trust/security boundaries and troubleshooting
 

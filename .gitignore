@@ -1,0 +1,36 @@
+# Rust build output and generated compiler files
+/target/
+/dist/
+*.rs.bk
+
+# Local environment and credentials; keep safe example files
+.env
+.env.*
+!.env.example
+!**/.env.example
+**/auth.json
+**/credentials.json
+**/.npmrc
+**/.pypirc
+*.pem
+*.p12
+*.pfx
+*.key
+
+# Temporary task reports and editor logs
+/.thrn-reports/
+*.log
+*.tmp
+
+# Private editor state
+.vscode/*.code-workspace
+.vscode/*.local.json
+.vscode/.history/
+.idea/
+*.iml
+
+# macOS filesystem metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
