@@ -196,7 +196,7 @@ pub fn fetch_and_stage_skill<T: GithubTransport>(
 }
 
 /// Variant with an injectable private-tempdir factory for deterministic tests and embedding.
-pub fn fetch_and_stage_skill_with_factory<T: GithubTransport>(
+pub fn fetch_and_stage_skill_with_factory<T: GithubTransport + ?Sized>(
     resource: &Resource,
     transport: &T,
     tempdir_factory: &dyn TempDirFactory,
