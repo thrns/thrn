@@ -7,6 +7,10 @@ description = "Local-first universal developer CLI"
 license = "MIT"
 publish = false
 
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+
 [[bin]]
 name = "thrn"
 path = "src/main.rs"
