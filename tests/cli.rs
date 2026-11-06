@@ -6,6 +6,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use ring::digest::{Context, SHA256, digest};
+
 static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
 
 struct TestDir {
@@ -81,6 +83,101 @@ fn data_directory(directory: &TestDir) -> PathBuf {
 
 fn receipt_directory(directory: &TestDir) -> PathBuf {
     data_directory(directory).join("receipts")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = digest(&SHA256, bytes);
+    digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+fn receipt_filename(project_root: &str, resource_id: &str) -> String {
+    let mut context = Context::new(&SHA256);
+    context.update(b"THRN-RECEIPT-IDENTITY-V1\0");
+    for field in [project_root.as_bytes(), b"codex", resource_id.as_bytes()] {
+        context.update(&(field.len() as u64).to_be_bytes());
+        context.update(field);
+    }
+    let value = context.finish();
+    let hex = value
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("v1-{hex}.json")
+}
+
+fn receipt_json(project_root: &str, resource_id: &str, skill_name: &str, identity: u64) -> Vec<u8> {
+    let content = b"abc";
+    let file_digest = digest(&SHA256, content);
+    let mut content_context = Context::new(&SHA256);
+    content_context.update(b"THRN-CONTENT-INVENTORY-V1\0");
+    content_context.update(&0_u64.to_be_bytes());
+    content_context.update(&1_u64.to_be_bytes());
+    content_context.update(b"F");
+    content_context.update(&("SKILL.md".len() as u64).to_be_bytes());
+    content_context.update(b"SKILL.md");
+    content_context.update(&(content.len() as u64).to_be_bytes());
+    content_context.update(file_digest.as_ref());
+    let content_digest = format!("sha256:{}", {
+        let value = content_context.finish();
+        value
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    });
+
+    let destination = std::path::Path::new(project_root)
+        .join(".agents/skills")
+        .join(skill_name)
+        .to_string_lossy()
+        .into_owned();
+    serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 1,
+        "catalogResourceId": resource_id,
+        "skillName": skill_name,
+        "agent": "codex",
+        "scope": "project",
+        "canonicalProjectRoot": project_root,
+        "projectRootIdentity": { "volume": 1, "object": identity },
+        "destination": destination,
+        "installedAtUnixSeconds": 1,
+        "sourceOwner": "example-org",
+        "sourceRepository": "catalog-test-fixtures",
+        "sourceCommit": "2f68bee292a8c68346b4294fb31d9563eefe1ade",
+        "sourceDirectory": "skills/uncharted-ideation",
+        "resourceVersion": "1.0.0",
+        "directories": [],
+        "files": [{
+            "path": "SKILL.md",
+            "byteCount": content.len(),
+            "sha256": format!("sha256:{}", sha256_hex(content))
+        }],
+        "fileCount": 1,
+        "byteCount": content.len(),
+        "contentDigest": content_digest
+    }))
+    .expect("valid receipt JSON")
+}
+
+fn write_receipt(
+    directory: &TestDir,
+    project_root: &str,
+    resource_id: &str,
+    skill_name: &str,
+    identity: u64,
+) {
+    let receipts = receipt_directory(directory);
+    fs::create_dir_all(&receipts).expect("receipt storage should be created");
+    fs::write(
+        receipts.join(receipt_filename(project_root, resource_id)),
+        receipt_json(project_root, resource_id, skill_name, identity),
+    )
+    .expect("receipt should be written");
 }
 
 fn write_cache(directory: &TestDir, catalog: &[u8]) {
@@ -297,6 +394,117 @@ fn installed_listing_treats_missing_or_empty_receipt_storage_as_no_managed_insta
 }
 
 #[test]
+fn installed_listing_displays_valid_receipt_without_checking_project_content() {
+    let directory = TestDir::new();
+    let project_root = fs::canonicalize(directory.path())
+        .expect("project path is canonical")
+        .to_string_lossy()
+        .into_owned();
+    write_receipt(
+        &directory,
+        &project_root,
+        "creative-lab",
+        "uncharted-ideation",
+        42,
+    );
+
+    let first = command_in(&directory, &["skills", "list", "--installed"])
+        .output()
+        .expect("CLI starts");
+    let second = command_in(&directory, &["skills", "list", "--installed"])
+        .output()
+        .expect("CLI starts again");
+
+    assert_eq!(first.status.code(), Some(0));
+    assert_eq!(first.stdout, second.stdout);
+    assert!(first.stderr.is_empty());
+    let stdout = String::from_utf8_lossy(&first.stdout);
+    assert!(stdout.contains("creative-lab  uncharted-ideation"));
+    assert!(stdout.contains("Agent: codex"));
+    assert!(stdout.contains("Scope: project"));
+    assert!(stdout.contains(&format!(
+        "Project destination: {project_root}/.agents/skills/uncharted-ideation"
+    )));
+    assert!(stdout.contains("Pinned revision: example-org/catalog-test-fixtures@2f68bee292a8c68346b4294fb31d9563eefe1ade"));
+    assert!(
+        stdout.contains("Ownership: recorded by THRN; current content integrity: not checked.")
+    );
+    assert!(!stdout.contains("No THRN-managed installations are recorded."));
+}
+
+#[test]
+fn installed_listing_orders_projects_deterministically_and_rejects_destination_claim_conflicts() {
+    let directory = TestDir::new();
+    let canonical_data_root = fs::canonicalize(directory.root()).expect("canonical data root");
+    let first_root = canonical_data_root.join("z-project");
+    let second_root = canonical_data_root.join("a-project");
+    write_receipt(
+        &directory,
+        &first_root.to_string_lossy(),
+        "z-resource",
+        "skill-z",
+        11,
+    );
+    write_receipt(
+        &directory,
+        &second_root.to_string_lossy(),
+        "a-resource",
+        "skill-a",
+        12,
+    );
+    write_receipt(
+        &directory,
+        &second_root.to_string_lossy(),
+        "b-resource",
+        "skill-b",
+        13,
+    );
+    let output = command_in(&directory, &["skills", "list", "--installed"])
+        .output()
+        .expect("CLI starts");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.find("a-resource").expect("first record")
+            < stdout.find("b-resource").expect("second record")
+    );
+    assert!(
+        stdout.find("b-resource").expect("second record")
+            < stdout.find("z-resource").expect("third record")
+    );
+    assert!(output.stderr.is_empty());
+
+    let conflict = TestDir::new();
+    let same_root = fs::canonicalize(conflict.path())
+        .expect("project path is canonical")
+        .to_string_lossy()
+        .into_owned();
+    write_receipt(
+        &conflict,
+        &same_root,
+        "creative-lab",
+        "uncharted-ideation",
+        13,
+    );
+    write_receipt(
+        &conflict,
+        &same_root,
+        "other-resource",
+        "uncharted-ideation",
+        13,
+    );
+    let output = command_in(&conflict, &["skills", "list", "--installed"])
+        .output()
+        .expect("CLI starts");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("conflicting claims for the same Codex project destination")
+    );
+}
+
+#[test]
 fn installed_listing_fails_on_unrecognized_receipt_content_without_changing_it() {
     let directory = TestDir::new();
     let receipts = receipt_directory(&directory);
@@ -311,8 +519,10 @@ fn installed_listing_fails_on_unrecognized_receipt_content_without_changing_it()
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("THRN receipt storage contains unrecognized content"));
-    assert!(stderr.contains("receipts are not implemented yet"));
+    assert!(
+        stderr.contains("schema-v1 deterministic identity key"),
+        "unexpected listing error: {stderr}"
+    );
     assert_eq!(
         fs::read(file).expect("unrecognized content remains"),
         b"not an M2 receipt"

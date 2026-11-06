@@ -10,7 +10,7 @@ use thiserror::Error;
 use zip::{ZipArchive, read::ZipFile};
 
 use crate::{
-    models::catalog::{CommitSha, Resource, SkillId, SkillName, SourceIdentity},
+    models::catalog::{CommitSha, Resource, ResourceVersion, SkillId, SkillName, SourceIdentity},
     skills::validator::{SkillMetadata, ValidationError, validate_skill_directory},
 };
 
@@ -44,6 +44,7 @@ impl TempDirFactory for SystemTempDirFactory {
 pub struct StagedSkill {
     catalog_id: SkillId,
     skill_name: SkillName,
+    resource_version: ResourceVersion,
     revision: CommitSha,
     source: SourceIdentity,
     metadata: SkillMetadata,
@@ -92,6 +93,10 @@ impl StagedSkill {
 
     pub fn skill_name(&self) -> &SkillName {
         &self.skill_name
+    }
+
+    pub fn resource_version(&self) -> &ResourceVersion {
+        &self.resource_version
     }
 
     pub fn revision(&self) -> &CommitSha {
@@ -189,6 +194,7 @@ fn stage_selected_skill_with_file_system(
         Ok((content_directory, metadata)) => Ok(StagedSkill {
             catalog_id: resource.id().clone(),
             skill_name: resource.skill_name().clone(),
+            resource_version: resource.version().clone(),
             revision: resource.source().commit().clone(),
             source: resource.source().clone(),
             metadata,

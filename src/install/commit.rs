@@ -51,8 +51,112 @@ impl InstallationSession {
         self.plan
     }
 
-    pub(crate) fn commit(&self) -> Result<(), CommitError> {
+    pub(crate) fn commit(&self) -> Result<CommittedInstallation, CommitError> {
         commit_session(self, &NoFaults)
+    }
+
+    pub(crate) fn commit_and_record_at(
+        &self,
+        store: &super::receipt_store::ReceiptStore,
+        installed_at_unix_seconds: u64,
+        commit_faults: &dyn InstallFaultInjector,
+        receipt_faults: &dyn super::receipt_store::ReceiptFaultInjector,
+    ) -> Result<super::receipt::InstallationReceipt, InstallationCompletionError> {
+        let project_identity = self
+            .plan
+            .destination_snapshot()
+            .project_identity()
+            .ok_or(InstallationCompletionError::InvalidProjectIdentity)?;
+        let receipt = super::receipt::InstallationReceipt::from_committed_plan(
+            &self.plan,
+            &self.inventory,
+            project_identity,
+            installed_at_unix_seconds,
+        )
+        .map_err(|source| {
+            InstallationCompletionError::ReceiptPreflight(
+                super::receipt_store::ReceiptStoreError::Validation {
+                    name: "pending receipt".to_owned(),
+                    source,
+                },
+            )
+        })?;
+        let reservation = store
+            .reserve(receipt, receipt_faults)
+            .map_err(InstallationCompletionError::ReceiptPreflight)?;
+        let committed = match commit_session(self, commit_faults) {
+            Ok(committed) => committed,
+            Err(commit_error) => {
+                reservation
+                    .release()
+                    .map_err(InstallationCompletionError::ReceiptCleanup)?;
+                return Err(InstallationCompletionError::Commit(commit_error));
+            }
+        };
+        reservation
+            .publish(&committed, receipt_faults)
+            .map_err(InstallationCompletionError::ReceiptAfterCommit)
+    }
+
+    pub(crate) fn commit_and_record(
+        &self,
+        store: &super::receipt_store::ReceiptStore,
+    ) -> Result<super::receipt::InstallationReceipt, InstallationCompletionError> {
+        let installed_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| InstallationCompletionError::Clock)?
+            .as_secs();
+        self.commit_and_record_at(
+            store,
+            installed_at,
+            &NoFaults,
+            &super::receipt_store::NoReceiptFaults,
+        )
+    }
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum InstallationCompletionError {
+    #[error("could not determine the canonical project identity before commit")]
+    InvalidProjectIdentity,
+    #[error("receipt preparation failed before installation commit: {0}")]
+    ReceiptPreflight(#[source] super::receipt_store::ReceiptStoreError),
+    #[error("installation commit failed: {0}")]
+    Commit(#[source] CommitError),
+    #[error(
+        "installation directory committed, but receipt persistence failed; installed files remain and were not removed: {0}"
+    )]
+    ReceiptAfterCommit(#[source] super::receipt_store::ReceiptStoreError),
+    #[error("installation commit failed and receipt-store lock cleanup also failed: {0}")]
+    ReceiptCleanup(#[source] super::receipt_store::ReceiptStoreError),
+    #[error("system clock is before the Unix epoch")]
+    Clock,
+}
+
+/// Capability returned only after the M2-04 no-replace directory commit succeeds.
+#[derive(Debug)]
+pub(crate) struct CommittedInstallation {
+    plan: InstallPlan,
+    inventory: StagedInventory,
+    project_identity: FileIdentity,
+    destination_identity: FileIdentity,
+}
+
+impl CommittedInstallation {
+    pub(crate) fn plan(&self) -> &InstallPlan {
+        &self.plan
+    }
+
+    pub(crate) fn inventory(&self) -> &StagedInventory {
+        &self.inventory
+    }
+
+    pub(crate) fn project_identity(&self) -> FileIdentity {
+        self.project_identity
+    }
+
+    pub(crate) fn destination_identity(&self) -> FileIdentity {
+        self.destination_identity
     }
 }
 
@@ -92,6 +196,10 @@ pub(crate) enum CommitError {
     #[error("this platform does not provide the required safe no-replace directory commit")]
     UnsupportedPlatform,
     #[error(
+        "installation directory was committed but could not be reopened for receipt verification"
+    )]
+    CommittedButUnverified,
+    #[error(
         "installation failed during {operation:?} ({kind}, os_error={raw_os_error:?}); cleanup_complete={cleanup_complete}"
     )]
     Operation {
@@ -106,7 +214,7 @@ pub(crate) enum CommitError {
 fn commit_session(
     session: &InstallationSession,
     faults: &dyn InstallFaultInjector,
-) -> Result<(), CommitError> {
+) -> Result<CommittedInstallation, CommitError> {
     validate_session_identity(session)?;
     if !session.plan.conflicts().is_empty() {
         return Err(CommitError::DestinationConflict);
@@ -361,7 +469,26 @@ fn commit_session(
         ));
     }
     temp.disarm();
-    Ok(())
+    let committed_destination = skills
+        .open_directory(std::ffi::OsStr::new(session.plan.skill_name().as_str()))
+        .map_err(|_| CommitError::CommittedButUnverified)?;
+    let destination_identity = committed_destination
+        .identity()
+        .map_err(|_| CommitError::CommittedButUnverified)?;
+    if destination_identity
+        != temp
+            .root
+            .identity()
+            .map_err(|_| CommitError::CommittedButUnverified)?
+    {
+        return Err(CommitError::CommittedButUnverified);
+    }
+    Ok(CommittedInstallation {
+        plan: session.plan.clone(),
+        inventory: session.inventory.clone(),
+        project_identity: root_identity,
+        destination_identity,
+    })
 }
 
 fn validate_session_identity(session: &InstallationSession) -> Result<(), CommitError> {
@@ -374,6 +501,7 @@ fn validate_session_identity(session: &InstallationSession) -> Result<(), Commit
         .join(plan.skill_name().as_str());
     if staged.catalog_id() != plan.resource_id()
         || staged.skill_name() != plan.skill_name()
+        || staged.resource_version() != plan.resource_version()
         || staged.revision() != plan.source_commit()
         || staged.source().owner() != plan.source_owner()
         || staged.source().repository() != plan.source_repository()
@@ -1125,7 +1253,7 @@ fn verify_prepared_tree(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NodeKind {
+pub(super) enum NodeKind {
     Directory,
     RegularFile,
     Symlink,
@@ -1134,14 +1262,14 @@ enum NodeKind {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Clone)]
-struct SecureDir {
+pub(super) struct SecureDir {
     file: std::sync::Arc<fs::File>,
     path: PathBuf,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl SecureDir {
-    fn open_absolute(path: &Path) -> io::Result<Self> {
+    pub(super) fn open_absolute(path: &Path) -> io::Result<Self> {
         use rustix::fs::{Mode, OFlags, open};
         if !path.is_absolute() {
             return Err(io::Error::new(
@@ -1174,7 +1302,50 @@ impl SecureDir {
         Ok(current)
     }
 
-    fn open_directory(&self, name: &std::ffi::OsStr) -> io::Result<Self> {
+    pub(super) fn open_or_create_absolute(path: &Path) -> io::Result<Self> {
+        use rustix::fs::{Mode, OFlags, open};
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path is not absolute",
+            ));
+        }
+        let fd = open(
+            "/",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(rustix_error)?;
+        let mut current = Self {
+            file: std::sync::Arc::new(fd.into()),
+            path: PathBuf::from("/"),
+        };
+        for component in path.components() {
+            match component {
+                Component::RootDir => {}
+                Component::Normal(name) => {
+                    current = match current.open_directory(name) {
+                        Ok(directory) => directory,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            current.create_directory_os(name)?;
+                            current.sync_directory()?;
+                            current.open_directory(name)?
+                        }
+                        Err(error) => return Err(error),
+                    };
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "ambiguous absolute path",
+                    ));
+                }
+            }
+        }
+        Ok(current)
+    }
+
+    pub(super) fn open_directory(&self, name: &std::ffi::OsStr) -> io::Result<Self> {
         self.ensure_current_path()?;
         use rustix::fs::{Mode, OFlags, openat};
         let fd = openat(
@@ -1190,13 +1361,17 @@ impl SecureDir {
         })
     }
 
-    fn create_directory(&self, name: &str) -> io::Result<()> {
+    pub(super) fn create_directory(&self, name: &str) -> io::Result<()> {
+        self.create_directory_os(std::ffi::OsStr::new(name))
+    }
+
+    pub(super) fn create_directory_os(&self, name: &std::ffi::OsStr) -> io::Result<()> {
         self.ensure_current_path()?;
         use rustix::fs::{Mode, mkdirat};
         mkdirat(&self.file, name, Mode::RWXU).map_err(rustix_error)
     }
 
-    fn create_regular_file(&self, name: &str) -> io::Result<fs::File> {
+    pub(super) fn create_regular_file(&self, name: &str) -> io::Result<fs::File> {
         self.ensure_current_path()?;
         use rustix::fs::{Mode, OFlags, openat};
         let fd = openat(
@@ -1216,7 +1391,7 @@ impl SecureDir {
         Ok(file)
     }
 
-    fn open_regular_file(&self, name: &str) -> io::Result<fs::File> {
+    pub(super) fn open_regular_file(&self, name: &str) -> io::Result<fs::File> {
         self.ensure_current_path()?;
         use rustix::fs::{Mode, OFlags, openat};
         let fd = openat(
@@ -1236,7 +1411,7 @@ impl SecureDir {
         Ok(file)
     }
 
-    fn entries(&self) -> io::Result<Vec<(std::ffi::OsString, NodeKind)>> {
+    pub(super) fn entries(&self) -> io::Result<Vec<(std::ffi::OsString, NodeKind)>> {
         self.ensure_current_path()?;
         use rustix::fs::{AtFlags, Dir, FileType, statat};
         use std::os::unix::ffi::OsStringExt;
@@ -1268,13 +1443,49 @@ impl SecureDir {
         Ok(result)
     }
 
-    fn identity(&self) -> io::Result<FileIdentity> {
+    pub(super) fn identity(&self) -> io::Result<FileIdentity> {
         use rustix::fs::fstat;
         let stat = fstat(&self.file).map_err(rustix_error)?;
         Ok(FileIdentity::new(stat.st_dev as u64, stat.st_ino as u64))
     }
 
-    fn remove_file(&self, name: &str) -> io::Result<()> {
+    pub(super) fn file_identity(file: &fs::File) -> io::Result<FileIdentity> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        Ok(FileIdentity::new(metadata.dev(), metadata.ino()))
+    }
+
+    pub(super) fn rename_file_child_noreplace(
+        &self,
+        old_name: &str,
+        new_name: &str,
+        source: &fs::File,
+    ) -> io::Result<()> {
+        let named = self.open_regular_file(old_name)?;
+        if Self::file_identity(&named)? != Self::file_identity(source)? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "temporary receipt was substituted",
+            ));
+        }
+        self.ensure_current_path()?;
+        use rustix::fs::{RenameFlags, renameat_with};
+        renameat_with(
+            &self.file,
+            old_name,
+            &self.file,
+            new_name,
+            RenameFlags::NOREPLACE,
+        )
+        .map_err(rustix_error)
+    }
+
+    pub(super) fn sync_directory(&self) -> io::Result<()> {
+        self.ensure_current_path()?;
+        self.file.sync_all()
+    }
+
+    pub(super) fn remove_file(&self, name: &str) -> io::Result<()> {
         self.ensure_current_path()?;
         use rustix::fs::{AtFlags, unlinkat};
         unlinkat(&self.file, name, AtFlags::empty()).map_err(rustix_error)
@@ -1332,14 +1543,14 @@ fn rustix_error(error: rustix::io::Errno) -> io::Error {
 
 #[cfg(windows)]
 #[derive(Clone)]
-struct SecureDir {
+pub(super) struct SecureDir {
     file: std::sync::Arc<fs::File>,
     path: PathBuf,
 }
 
 #[cfg(windows)]
 impl SecureDir {
-    fn open_absolute(path: &Path) -> io::Result<Self> {
+    pub(super) fn open_absolute(path: &Path) -> io::Result<Self> {
         if !path.is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1374,7 +1585,74 @@ impl SecureDir {
         })
     }
 
-    fn open_directory(&self, name: &std::ffi::OsStr) -> io::Result<Self> {
+    pub(super) fn open_or_create_absolute(path: &Path) -> io::Result<Self> {
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path is not absolute",
+            ));
+        }
+        let mut root = PathBuf::new();
+        let mut saw_root = false;
+        for component in path.components() {
+            match component {
+                Component::Prefix(prefix) if !saw_root => root.push(prefix.as_os_str()),
+                Component::RootDir if !saw_root => {
+                    root.push(component.as_os_str());
+                    saw_root = true;
+                }
+                Component::Normal(_) => break,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "ambiguous absolute path",
+                    ));
+                }
+            }
+        }
+        if !saw_root {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path has no root directory",
+            ));
+        }
+        let root_file = open_windows_directory(&root)?;
+        let mut current = Self {
+            file: std::sync::Arc::new(root_file),
+            path: root,
+        };
+        for component in path.components() {
+            match component {
+                Component::Prefix(_) | Component::RootDir => {}
+                Component::Normal(name) => {
+                    current = match current.open_directory(name) {
+                        Ok(directory) => directory,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            let name = name.to_str().ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "directory component is not UTF-8",
+                                )
+                            })?;
+                            current.create_directory(name)?;
+                            current.sync_directory()?;
+                            current.open_directory(std::ffi::OsStr::new(name))?
+                        }
+                        Err(error) => return Err(error),
+                    };
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "ambiguous absolute path",
+                    ));
+                }
+            }
+        }
+        Ok(current)
+    }
+
+    pub(super) fn open_directory(&self, name: &std::ffi::OsStr) -> io::Result<Self> {
         self.ensure_current_path()?;
         let path = self.path.join(name);
         let file = open_windows_directory(&path)?;
@@ -1384,22 +1662,29 @@ impl SecureDir {
         })
     }
 
-    fn create_directory(&self, name: &str) -> io::Result<()> {
+    pub(super) fn create_directory(&self, name: &str) -> io::Result<()> {
         self.ensure_current_path()?;
         fs::create_dir(self.path.join(name))?;
         Ok(())
     }
 
-    fn create_regular_file(&self, name: &str) -> io::Result<fs::File> {
+    pub(super) fn create_regular_file(&self, name: &str) -> io::Result<fs::File> {
         self.ensure_current_path()?;
         use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, SYNCHRONIZE,
+        };
         let mut options = fs::OpenOptions::new();
         options
             .read(true)
             .write(true)
             .create_new(true)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .access_mode(
+                DELETE | FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_WRITE_DATA | SYNCHRONIZE,
+            )
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
         let file = options.open(self.path.join(name))?;
         if !file.metadata()?.is_file() {
             return Err(io::Error::new(
@@ -1410,7 +1695,7 @@ impl SecureDir {
         Ok(file)
     }
 
-    fn open_regular_file(&self, name: &str) -> io::Result<fs::File> {
+    pub(super) fn open_regular_file(&self, name: &str) -> io::Result<fs::File> {
         self.ensure_current_path()?;
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
@@ -1428,7 +1713,7 @@ impl SecureDir {
         Ok(file)
     }
 
-    fn entries(&self) -> io::Result<Vec<(std::ffi::OsString, NodeKind)>> {
+    pub(super) fn entries(&self) -> io::Result<Vec<(std::ffi::OsString, NodeKind)>> {
         self.ensure_current_path()?;
         let mut result = Vec::new();
         for entry in fs::read_dir(&self.path)? {
@@ -1454,11 +1739,39 @@ impl SecureDir {
         Ok(result)
     }
 
-    fn identity(&self) -> io::Result<FileIdentity> {
+    pub(super) fn identity(&self) -> io::Result<FileIdentity> {
         windows_identity(&self.file)
     }
 
-    fn remove_file(&self, name: &str) -> io::Result<()> {
+    pub(super) fn file_identity(file: &fs::File) -> io::Result<FileIdentity> {
+        windows_identity(file)
+    }
+
+    pub(super) fn rename_file_child_noreplace(
+        &self,
+        old_name: &str,
+        new_name: &str,
+        source: &fs::File,
+    ) -> io::Result<()> {
+        let named = self.open_regular_file(old_name)?;
+        if Self::file_identity(&named)? != Self::file_identity(source)? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "temporary receipt was substituted",
+            ));
+        }
+        self.ensure_current_path()?;
+        rename_handle_noreplace(source, &self.path.join(new_name))
+    }
+
+    /// Windows does not expose a portable directory-entry fsync through the handle flags used
+    /// here. Receipt file bytes are flushed before rename; directory metadata durability depends
+    /// on the filesystem and operating system.
+    pub(super) fn sync_directory(&self) -> io::Result<()> {
+        self.ensure_current_path()
+    }
+
+    pub(super) fn remove_file(&self, name: &str) -> io::Result<()> {
         self.ensure_current_path()?;
         fs::remove_file(self.path.join(name))
     }
@@ -1547,6 +1860,59 @@ impl SecureDir {
 }
 
 #[cfg(windows)]
+fn rename_handle_noreplace(source: &fs::File, destination: &Path) -> io::Result<()> {
+    use std::{
+        mem::{offset_of, size_of},
+        os::windows::{ffi::OsStrExt, io::AsRawHandle},
+        ptr,
+    };
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{FILE_RENAME_INFO, FileRenameInfoEx, SetFileInformationByHandle},
+    };
+    let wide = destination.as_os_str().encode_wide().collect::<Vec<_>>();
+    let name_bytes = u32::try_from(wide.len().saturating_mul(size_of::<u16>()))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target name too long"))?;
+    let header_size = offset_of!(FILE_RENAME_INFO, FileName);
+    let byte_len = header_size
+        .checked_add(name_bytes as usize)
+        .map(|len| len.max(size_of::<FILE_RENAME_INFO>()))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target name too long"))?;
+    let words = byte_len.div_ceil(size_of::<usize>());
+    let mut buffer = vec![0_usize; words];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: The aligned buffer contains the fixed structure and complete UTF-16 path; the
+    // source handle remains live for the duration of the documented Win32 call.
+    unsafe {
+        ptr::write(
+            info,
+            FILE_RENAME_INFO {
+                Anonymous: windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO_0 { Flags: 0 },
+                RootDirectory: ptr::null_mut::<std::ffi::c_void>() as HANDLE,
+                FileNameLength: name_bytes,
+                FileName: [0],
+            },
+        );
+        ptr::copy_nonoverlapping(
+            wide.as_ptr(),
+            info.cast::<u8>().add(header_size).cast::<u16>(),
+            wide.len(),
+        );
+        let result = SetFileInformationByHandle(
+            source.as_raw_handle() as HANDLE,
+            FileRenameInfoEx,
+            info.cast(),
+            u32::try_from(byte_len)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename data too long"))?,
+        );
+        if result == 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn open_windows_directory(path: &Path) -> io::Result<fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -1594,17 +1960,23 @@ fn windows_identity(file: &fs::File) -> io::Result<FileIdentity> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 #[derive(Clone)]
-struct SecureDir;
+pub(super) struct SecureDir;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 impl SecureDir {
-    fn open_absolute(_path: &Path) -> io::Result<Self> {
+    pub(super) fn open_absolute(_path: &Path) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "secure directory access is not supported on this platform",
         ))
     }
-    fn open_directory(&self, _name: &std::ffi::OsStr) -> io::Result<Self> {
+    pub(super) fn open_or_create_absolute(_path: &Path) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unsupported platform",
+        ))
+    }
+    pub(super) fn open_directory(&self, _name: &std::ffi::OsStr) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "unsupported platform",
@@ -1616,37 +1988,60 @@ impl SecureDir {
             "unsupported platform",
         ))
     }
-    fn create_regular_file(&self, _name: &str) -> io::Result<fs::File> {
+    pub(super) fn create_regular_file(&self, _name: &str) -> io::Result<fs::File> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "unsupported platform",
         ))
     }
-    fn open_regular_file(&self, _name: &str) -> io::Result<fs::File> {
+    pub(super) fn open_regular_file(&self, _name: &str) -> io::Result<fs::File> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "unsupported platform",
         ))
     }
-    fn entries(&self) -> io::Result<Vec<(std::ffi::OsString, NodeKind)>> {
+    pub(super) fn entries(&self) -> io::Result<Vec<(std::ffi::OsString, NodeKind)>> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "unsupported platform",
         ))
     }
-    fn identity(&self) -> io::Result<FileIdentity> {
+    pub(super) fn identity(&self) -> io::Result<FileIdentity> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "unsupported platform",
         ))
     }
-    fn remove_file(&self, _name: &str) -> io::Result<()> {
+    pub(super) fn remove_file(&self, _name: &str) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "unsupported platform",
         ))
     }
     fn remove_directory(&self, _name: &str) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unsupported platform",
+        ))
+    }
+    pub(super) fn rename_file_child_noreplace(
+        &self,
+        _old_name: &str,
+        _new_name: &str,
+        _source: &fs::File,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unsupported platform",
+        ))
+    }
+    pub(super) fn sync_directory(&self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unsupported platform",
+        ))
+    }
+    pub(super) fn file_identity(_file: &fs::File) -> io::Result<FileIdentity> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "unsupported platform",

@@ -11,7 +11,7 @@ pub enum ThrnError {
     #[error(transparent)]
     Install(#[from] crate::install::command::InstallCommandError),
     #[error(transparent)]
-    InstalledListing(#[from] crate::install::receipt_store::ReceiptDiscoveryError),
+    InstalledListing(#[from] crate::install::receipt_store::ReceiptStoreError),
     #[error(transparent)]
     Resolution(#[from] crate::registry::discovery::ResolutionError),
     #[error("skill validation failed")]

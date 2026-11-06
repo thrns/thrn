@@ -36,6 +36,16 @@ impl FileIdentity {
     pub fn new(volume: u64, object: u64) -> Self {
         Self { volume, object }
     }
+
+    /// Filesystem volume identifier where available (device ID on Unix).
+    pub fn volume(&self) -> u64 {
+        self.volume
+    }
+
+    /// Filesystem object identifier (inode on Unix, file index on Windows).
+    pub fn object(&self) -> u64 {
+        self.object
+    }
 }
 
 impl DirectoryEntrySnapshot {

@@ -2,7 +2,7 @@
 
 ## Current exposure
 
-THRN is under development and has no supported installer release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, reads validated local catalog data, offers an explicit HTTPS catalog refresh, performs read-only local `SKILL.md` validation, checks the future receipt directory for installed listing, and provides a read-only Codex project install dry-run. Default discovery and both `skills list` modes never use the network. Explicit refresh contacts one fixed THRN-operated HTTPS endpoint, validates the response, and writes only the catalog cache. An install dry-run reads the local catalog without refreshing it, fetches the selected skill at its pinned public GitHub commit, validates and stages it privately, then prints a plan without changing the project. The internal M2-04 commit API can prepare and atomically add a complete Codex project skill directory in isolated tests, but the CLI does not call it and still rejects installation without `--dry-run`. No retrieved content or subprocess is executed. The installed listing reads only THRN's application-data receipt directory: it does not inspect agent skill folders, create receipt storage, or interpret a provisional receipt format. Durable ownership receipts, public installation, rollback, and crash recovery are not implemented; the internal commit API does not provide them.
+THRN is under development and has no supported installer release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, reads validated local catalog data, offers an explicit HTTPS catalog refresh, performs read-only local `SKILL.md` validation, lists validated receipt-backed installations, and provides a read-only Codex project install dry-run. Default discovery and both `skills list` modes never use the network. Explicit refresh contacts one fixed THRN-operated HTTPS endpoint, validates the response, and writes only the catalog cache. An install dry-run reads the local catalog without refreshing it, fetches the selected skill at its pinned public GitHub commit, validates and stages it privately, then prints a plan without changing the project. The internal M2-04/M2-05 boundary can atomically add a complete Codex project skill directory and record its receipt in isolated tests, but the CLI does not call it and still rejects installation without `--dry-run`. No retrieved content or subprocess is executed. Installed listing reads only THRN's application-data receipt directory: it does not inspect agent skill folders, create receipt storage, fetch the catalog, or open receipt-referenced project paths. It labels current content integrity as unchecked. Public installation, coordinated rollback, and crash recovery are not implemented.
 
 ## Boundaries required before public installation
 
@@ -18,7 +18,7 @@ Before the CLI enables installation, source and filesystem handling must:
 - Avoid logging credentials, tokens, environment secrets, private skill content, or unnecessary personal paths. The v1 public-source workflow should not require a GitHub token. Any future credential support needs an explicit design and redaction tests.
 - Make supply-chain claims proportionate to evidence. Pinned commits identify source revisions, not author identity. Stronger publisher authenticity requires a separately reviewed signing or attestation design; do not imply that TLS or a same-origin digest provides it.
 
-M2-03 implements read-only destination checks and an immutable proposal. M2-04 adds an internal Codex project directory commit, but it does not provide receipts or recovery and is deliberately not connected to the CLI. `--dry-run` remains mandatory until the later ownership and recovery tasks are independently reviewed.
+M2-03 implements read-only destination checks and an immutable proposal. M2-04 adds an internal Codex project directory commit; M2-05 adds post-commit ownership receipts and receipt-backed listing. These APIs are deliberately not connected to the CLI. `--dry-run` remains mandatory until coordinated rollback and recovery are implemented and independently reviewed.
 
 ## Milestone status
 
@@ -147,10 +147,11 @@ Current implementation boundaries through M2-03:
   or commits do not replace the last valid cache. Offline discovery uses cache or bundled metadata
   and never silently refreshes stale content.
 - **Listing boundary:** M1-05's catalog list reuses the validated local catalog selection and exact
-  resolver. The installed list considers only whether the OS application-data `receipts` directory
-  is missing or empty. Existing content is an error until M2-05 defines receipt schema and
-  ownership; no installation records are inferred from catalog data or agent folders. Listing
-  creates no directories and writes no files.
+  resolver. M2-05's installed list parses strict schema-v1 receipts from the OS application-data
+  `receipts` directory. It treats missing or empty storage as no recorded installations and rejects
+  corrupt, unsupported, duplicated, conflicting, linked, nonregular, or unknown content. Listing
+  creates no directories, writes no files, opens no referenced project paths, and reports current
+  file integrity as unchecked. It does not infer ownership from catalog data or agent folders.
 - **Archive boundary:** M2-01 applies the ZIP-only validation described above. The validator
   preserves GitHub archive root prefixes and has no network, extraction, install, or
   publisher-authentication behavior.
@@ -229,9 +230,10 @@ private staging directory, then remove newly created parent directories only if 
 Cleanup failures are reported in the structured error; unrelated project content is never
 recursively deleted. After a successful rename, the complete skill directory is visible. The rename
 does not guarantee disk durability, recover an abrupt process or machine crash, or make future
-receipt creation atomic with the directory. M2-05 adds durable receipts; M2-06 owns rollback and
-crash recovery. There is no provisional receipt in M2-04, and the internal engine is not a complete
-production-safe installer.
+receipt creation atomic with the directory. M2-05 adds durable receipts after commit; M2-06 owns
+coordinated rollback and crash recovery. There is no provisional receipt in M2-04, and the internal
+engine is not a complete production-safe installer until M2-06 closes post-commit failure and
+interruption states.
 
 ## Non-blocking M1-04 follow-up review
 
@@ -255,7 +257,9 @@ M2-02 network boundary.
 
 Remaining requirements:
 
-- **M2-04 and later:** committed installation, ownership receipts, and rollback/recovery.
+- **M2-04/M2-05:** internal committed installation and durable ownership receipts. The API is not
+  exposed through the CLI and post-commit persistence failure is incomplete installation state.
+- **M2-06:** coordinated rollback and recovery for failed or interrupted installation sequences.
 - **M3:** safe user-scope support and receipt-backed update/remove behavior that detects modified content and reports partial failure.
 
 Security-sensitive parsing and writes require negative tests with hostile fixtures, isolated temporary directories, and deterministic network mocks. See the [roadmap](ROADMAP.md) and [repository security policy](../SECURITY.md) for project status.
