@@ -1547,9 +1547,9 @@ impl SecureDir {
 fn open_windows_directory(path: &Path) -> io::Result<fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_ADD_SUBDIRECTORY, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, SYNCHRONIZE,
+        DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
     };
     let mut options = fs::OpenOptions::new();
     options
@@ -1558,6 +1558,7 @@ fn open_windows_directory(path: &Path) -> io::Result<fs::File> {
         .access_mode(
             FILE_LIST_DIRECTORY
                 | FILE_READ_ATTRIBUTES
+                | FILE_ADD_FILE
                 | FILE_ADD_SUBDIRECTORY
                 | DELETE
                 | SYNCHRONIZE,
