@@ -1344,7 +1344,7 @@ impl SecureDir {
                 "path is not absolute",
             ));
         }
-        let mut current = path.to_path_buf();
+        let current = path.to_path_buf();
         let root = current
             .ancestors()
             .last()
@@ -1477,7 +1477,7 @@ impl SecureDir {
             ptr,
         };
         use windows_sys::Win32::{
-            Foundation::{BOOL, HANDLE},
+            Foundation::HANDLE,
             Storage::FileSystem::{
                 FILE_RENAME_INFO, FILE_RENAME_INFO_0, FileRenameInfo, SetFileInformationByHandle,
             },
@@ -1511,7 +1511,7 @@ impl SecureDir {
                 info.cast::<u8>().add(header_size).cast::<u16>(),
                 wide.len(),
             );
-            let result: BOOL = SetFileInformationByHandle(
+            let result = SetFileInformationByHandle(
                 source.file.as_raw_handle() as HANDLE,
                 FileRenameInfo,
                 info.cast(),
@@ -1579,15 +1579,7 @@ fn windows_reparse(metadata: &fs::Metadata) -> bool {
 
 #[cfg(windows)]
 fn windows_identity(file: &fs::File) -> io::Result<FileIdentity> {
-    use std::os::windows::fs::MetadataExt;
-    let metadata = file.metadata()?;
-    let volume = metadata
-        .volume_serial_number()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "volume identity unavailable"))?;
-    let object = metadata
-        .file_index()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "file identity unavailable"))?;
-    Ok(FileIdentity::new(u64::from(volume), object))
+    super::destination::windows_file_identity(file)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]

@@ -114,23 +114,57 @@ impl DestinationFileSystem for RealDestinationFileSystem {
     }
 
     fn object_identity(&self, path: &Path) -> io::Result<Option<FileIdentity>> {
-        let metadata = fs::symlink_metadata(path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
+            let metadata = fs::symlink_metadata(path)?;
             return Ok(Some(FileIdentity::new(metadata.dev(), metadata.ino())));
         }
         #[cfg(windows)]
         {
-            use std::os::windows::fs::MetadataExt;
-            return Ok(metadata
-                .volume_serial_number()
-                .zip(metadata.file_index())
-                .map(|(volume, object)| FileIdentity::new(u64::from(volume), object)));
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            };
+            let mut options = fs::OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+            let file = options.open(path)?;
+            let opened_metadata = file.metadata()?;
+            if metadata_is_link_or_reparse(&opened_metadata) || !opened_metadata.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "directory changed while reading its identity",
+                ));
+            }
+            return windows_file_identity(&file).map(Some);
         }
         #[allow(unreachable_code)]
         Ok(None)
     }
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_file_identity(file: &fs::File) -> io::Result<FileIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::{
+        Win32::{Foundation::HANDLE, Storage::FileSystem::GetFileInformationByHandle},
+        core::BOOL,
+    };
+    let mut information =
+        windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION::default();
+    let result: BOOL =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Ok(FileIdentity::new(
+        u64::from(information.dwVolumeSerialNumber),
+        index,
+    ))
 }
 
 fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
