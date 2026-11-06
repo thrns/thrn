@@ -15,8 +15,12 @@ use ring::{
 use thiserror::Error;
 
 use super::{
-    commit::{CommittedInstallation, NodeKind, SecureDir},
+    commit::{CommittedInstallation, InstallFaultInjector, InstallOperation, NodeKind, SecureDir},
     destination::FileIdentity,
+    journal::{
+        JournalDirectory, JournalError, JournalFaultInjector, JournalRecord, JournalStore,
+        OperationState,
+    },
     receipt::{
         InstallationReceipt, MAX_RECEIPT_BYTES, MAX_RECEIPTS, ReceiptFile, ReceiptValidationError,
     },
@@ -25,6 +29,9 @@ use super::{
 const IO_CHUNK_BYTES: usize = 8 * 1024;
 const WRITER_LOCK_NAME: &str = ".writer.lock";
 const TEMP_NAME_ATTEMPTS: usize = 32;
+
+struct NoRecoveryInstallFaults;
+impl InstallFaultInjector for NoRecoveryInstallFaults {}
 
 pub struct ReceiptStore {
     directory: PathBuf,
@@ -57,7 +64,8 @@ impl ReceiptStore {
         let Some(directory) = self.open_existing_directory()? else {
             return Ok(Vec::new());
         };
-        let receipts = read_receipts(&directory, false)?;
+        let allow_idle_lock = check_idle_writer_lock(&directory)?;
+        let receipts = read_receipts(&directory, allow_idle_lock)?;
         validate_unique_destinations(&receipts)?;
         let mut receipts = receipts
             .into_iter()
@@ -90,25 +98,11 @@ impl ReceiptStore {
             .map_err(|error| map_io("create receipt storage", error))?;
         let directory = SecureDir::open_or_create_absolute(&self.directory)
             .map_err(|error| map_directory_error("create or inspect", error))?;
-        faults
-            .before(ReceiptOperation::CreateWriterLock)
-            .map_err(|error| map_io("reserve receipt storage", error))?;
-        let lock_file = directory
-            .create_regular_file(WRITER_LOCK_NAME)
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::AlreadyExists {
-                    ReceiptStoreError::BusyOrInterrupted
-                } else {
-                    map_io("reserve receipt storage", error)
-                }
-            })?;
-        let lock_identity = SecureDir::file_identity(&lock_file)
-            .map_err(|error| map_io("identify receipt-store lock", error))?;
+        let lock = WriterLock::acquire(directory.clone(), faults)?;
         let reservation = ReceiptReservation {
             directory,
             receipt,
-            lock_file,
-            lock_identity,
+            lock,
             released: false,
         };
         let existing = read_receipts(&reservation.directory, true);
@@ -125,6 +119,57 @@ impl ReceiptStore {
             }
         }
         Ok(reservation)
+    }
+
+    pub(crate) fn journal_store(&self) -> Result<JournalStore, ReceiptStoreError> {
+        let data_directory = self
+            .directory
+            .parent()
+            .ok_or(ReceiptStoreError::UnsafeDirectory)?;
+        Ok(JournalStore::new(data_directory.join("operations")))
+    }
+
+    /// Internal startup/retry API. Recovery and installation share the same OS-backed writer lock.
+    pub(crate) fn recover_with_faults(
+        &self,
+        journal_faults: &dyn JournalFaultInjector,
+        receipt_faults: &dyn ReceiptFaultInjector,
+    ) -> Result<Vec<RecoveryOutcome>, RecoveryError> {
+        self.recover_with_all_faults(&NoRecoveryInstallFaults, journal_faults, receipt_faults)
+    }
+
+    pub(crate) fn recover_with_all_faults(
+        &self,
+        install_faults: &dyn InstallFaultInjector,
+        journal_faults: &dyn JournalFaultInjector,
+        receipt_faults: &dyn ReceiptFaultInjector,
+    ) -> Result<Vec<RecoveryOutcome>, RecoveryError> {
+        if !self.directory.is_absolute() {
+            return Err(RecoveryError::UnsafeStore);
+        }
+        let journal_store = self.journal_store().map_err(RecoveryError::Store)?;
+        let records = journal_store.read_all().map_err(RecoveryError::Journal)?;
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let directory = SecureDir::open_or_create_absolute(&self.directory).map_err(|error| {
+            RecoveryError::Store(map_directory_error("open recovery store", error))
+        })?;
+        let lock =
+            WriterLock::acquire(directory.clone(), receipt_faults).map_err(RecoveryError::Store)?;
+        let mut outcomes = Vec::new();
+        for record in records {
+            lock.validate().map_err(RecoveryError::Store)?;
+            outcomes.push(recover_operation(
+                &journal_store,
+                &record,
+                &directory,
+                install_faults,
+                journal_faults,
+                receipt_faults,
+            )?);
+        }
+        Ok(outcomes)
     }
 
     /// Rehash the exact current Codex project tree. Receipt paths are fully validated before
@@ -210,6 +255,10 @@ pub(crate) trait ReceiptFaultInjector: Send + Sync {
     fn before(&self, _operation: ReceiptOperation) -> io::Result<()> {
         Ok(())
     }
+
+    fn after(&self, _operation: ReceiptOperation) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 pub(crate) struct NoReceiptFaults;
@@ -218,8 +267,7 @@ impl ReceiptFaultInjector for NoReceiptFaults {}
 pub(crate) struct ReceiptReservation {
     directory: SecureDir,
     receipt: InstallationReceipt,
-    lock_file: fs::File,
-    lock_identity: FileIdentity,
+    lock: WriterLock,
     released: bool,
 }
 
@@ -229,33 +277,19 @@ impl ReceiptReservation {
     }
 
     pub(crate) fn publish(
-        mut self,
+        &mut self,
         committed: &CommittedInstallation,
         faults: &dyn ReceiptFaultInjector,
     ) -> Result<InstallationReceipt, ReceiptStoreError> {
-        let mut published = false;
-        let result = self.publish_inner(committed, faults, &mut published);
-        let released = self.release_inner();
-        match (result, released) {
-            (Ok(receipt), Ok(())) => Ok(receipt),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(_), Err(error)) => Err(ReceiptStoreError::CleanupAfterPublication {
-                cleanup: error.to_string(),
-            }),
-            (Err(error), Err(cleanup)) => Err(ReceiptStoreError::CleanupAfterFailure {
-                operation: error.to_string(),
-                cleanup: cleanup.to_string(),
-                published,
-            }),
-        }
+        self.publish_inner(committed, faults)
     }
 
     fn publish_inner(
         &mut self,
         committed: &CommittedInstallation,
         faults: &dyn ReceiptFaultInjector,
-        published: &mut bool,
     ) -> Result<InstallationReceipt, ReceiptStoreError> {
+        self.lock.validate()?;
         let expected = InstallationReceipt::from_committed_plan(
             committed.plan(),
             committed.inventory(),
@@ -317,6 +351,9 @@ impl ReceiptReservation {
             .sync_all()
             .map_err(|error| map_io("synchronize temporary receipt", error))?;
         faults
+            .after(ReceiptOperation::SyncTemporaryReceipt)
+            .map_err(|error| map_io("synchronize temporary receipt", error))?;
+        faults
             .before(ReceiptOperation::VerifyTemporaryReceipt)
             .map_err(|error| map_io("verify temporary receipt", error))?;
         let written = read_receipt_file(&self.directory, &temporary_name)?;
@@ -327,6 +364,7 @@ impl ReceiptReservation {
         faults
             .before(ReceiptOperation::PublishNoReplace)
             .map_err(|error| map_io("publish receipt without replacement", error))?;
+        self.lock.validate()?;
         self.directory
             .rename_file_child_noreplace(&temporary_name, &final_name, &temporary_file)
             .map_err(|error| {
@@ -337,8 +375,9 @@ impl ReceiptReservation {
                 }
             })?;
         temporary_guard.active = false;
-        *published = true;
-
+        faults
+            .after(ReceiptOperation::PublishNoReplace)
+            .map_err(|error| map_io("publish receipt without replacement", error))?;
         faults
             .before(ReceiptOperation::SyncReceiptDirectory)
             .map_err(|error| ReceiptStoreError::Durability {
@@ -347,6 +386,12 @@ impl ReceiptReservation {
             })?;
         self.directory
             .sync_directory()
+            .map_err(|error| ReceiptStoreError::Durability {
+                kind: error.kind(),
+                os_error: error.raw_os_error(),
+            })?;
+        faults
+            .after(ReceiptOperation::SyncReceiptDirectory)
             .map_err(|error| ReceiptStoreError::Durability {
                 kind: error.kind(),
                 os_error: error.raw_os_error(),
@@ -377,25 +422,7 @@ impl ReceiptReservation {
         if self.released {
             return Ok(());
         }
-        let current = self
-            .directory
-            .open_regular_file(WRITER_LOCK_NAME)
-            .map_err(|error| map_io("verify receipt-store lock", error))?;
-        if SecureDir::file_identity(&current)
-            .map_err(|error| map_io("identify receipt-store lock", error))?
-            != self.lock_identity
-            || SecureDir::file_identity(&self.lock_file)
-                .map_err(|error| map_io("identify receipt-store lock", error))?
-                != self.lock_identity
-        {
-            return Err(ReceiptStoreError::WriterLockChanged);
-        }
-        self.directory
-            .remove_file(WRITER_LOCK_NAME)
-            .map_err(|error| map_io("remove receipt-store lock", error))?;
-        self.directory
-            .sync_directory()
-            .map_err(|error| map_io("synchronize receipt-store lock removal", error))?;
+        self.lock.release()?;
         self.released = true;
         Ok(())
     }
@@ -403,15 +430,1633 @@ impl ReceiptReservation {
 
 impl Drop for ReceiptReservation {
     fn drop(&mut self) {
-        if self.released {
-            return;
-        }
-        if let Ok(current) = self.directory.open_regular_file(WRITER_LOCK_NAME)
-            && SecureDir::file_identity(&current).ok() == Some(self.lock_identity)
+        // WriterLock releases its OS lock when this reservation is dropped.
+    }
+}
+
+struct WriterLock {
+    directory: SecureDir,
+    file: fs::File,
+    identity: FileIdentity,
+    released: bool,
+}
+
+impl WriterLock {
+    fn acquire(
+        directory: SecureDir,
+        faults: &dyn ReceiptFaultInjector,
+    ) -> Result<Self, ReceiptStoreError> {
+        faults
+            .before(ReceiptOperation::CreateWriterLock)
+            .map_err(|error| map_io("reserve receipt storage", error))?;
+        let file = directory
+            .open_or_create_lock_file(WRITER_LOCK_NAME)
+            .map_err(|error| map_io("reserve receipt storage", error))?;
+        if file
+            .metadata()
+            .map_err(|error| map_io("inspect receipt-store lock", error))?
+            .len()
+            != 0
         {
-            let _ = self.directory.remove_file(WRITER_LOCK_NAME);
-            let _ = self.directory.sync_directory();
+            return Err(ReceiptStoreError::UnsafeObject {
+                name: WRITER_LOCK_NAME.to_owned(),
+            });
         }
+        file.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => ReceiptStoreError::BusyOrInterrupted,
+            std::fs::TryLockError::Error(error) => map_io("lock receipt storage", error),
+        })?;
+        directory
+            .sync_directory()
+            .map_err(|error| map_io("synchronize receipt-store lock", error))?;
+        let identity = SecureDir::file_identity(&file)
+            .map_err(|error| map_io("identify receipt-store lock", error))?;
+        Ok(Self {
+            directory,
+            file,
+            identity,
+            released: false,
+        })
+    }
+
+    fn validate(&self) -> Result<(), ReceiptStoreError> {
+        let current = self
+            .directory
+            .open_lock_file(WRITER_LOCK_NAME)
+            .map_err(|error| map_io("verify receipt-store lock", error))?;
+        if SecureDir::file_identity(&current)
+            .map_err(|error| map_io("identify receipt-store lock", error))?
+            != self.identity
+            || SecureDir::file_identity(&self.file)
+                .map_err(|error| map_io("identify receipt-store lock", error))?
+                != self.identity
+        {
+            return Err(ReceiptStoreError::WriterLockChanged);
+        }
+        Ok(())
+    }
+
+    fn release(&mut self) -> Result<(), ReceiptStoreError> {
+        if self.released {
+            return Ok(());
+        }
+        self.validate()?;
+        self.file
+            .unlock()
+            .map_err(|error| map_io("release receipt-store lock", error))?;
+        self.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for WriterLock {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = self.file.unlock();
+        }
+    }
+}
+
+fn recover_operation(
+    journal_store: &JournalStore,
+    initial: &JournalRecord,
+    receipt_directory: &SecureDir,
+    install_faults: &dyn InstallFaultInjector,
+    journal_faults: &dyn JournalFaultInjector,
+    receipt_faults: &dyn ReceiptFaultInjector,
+) -> Result<RecoveryOutcome, RecoveryError> {
+    let operation_id = initial.operation_id().to_owned();
+    let mut journal = journal_store
+        .resume(initial.clone())
+        .map_err(RecoveryError::Journal)?;
+    match initial.state() {
+        OperationState::Prepared => {
+            journal
+                .transition(OperationState::RolledBack, journal_faults)
+                .map_err(RecoveryError::Journal)?;
+            journal_store
+                .cleanup_completed(&operation_id, journal_faults)
+                .map_err(RecoveryError::Journal)?;
+            return Ok(RecoveryOutcome::RolledBack);
+        }
+        OperationState::FilesystemCommitInProgress => {
+            let (project, agents, skills) = recovery_parent_directories(initial)?;
+            let Some(skills) = skills else {
+                validate_and_remove_recovery_parents(
+                    &mut journal,
+                    &project,
+                    agents,
+                    None,
+                    install_faults,
+                    journal_faults,
+                )?;
+                journal
+                    .transition(OperationState::RolledBack, journal_faults)
+                    .map_err(RecoveryError::Journal)?;
+                journal_store
+                    .cleanup_completed(&operation_id, journal_faults)
+                    .map_err(RecoveryError::Journal)?;
+                return Ok(RecoveryOutcome::RolledBack);
+            };
+            let target = open_recovery_directory(initial, &skills, initial.receipt().skill_name())?;
+            if let Some(target) = target {
+                let identity = target.identity().map_err(|error| {
+                    recovery_conflict(initial, format!("cannot identify destination: {error}"))
+                })?;
+                if initial.staging_identity() != Some(identity)
+                    || verify_receipt_inventory_at(initial.receipt(), target)?
+                        != ReceiptContentState::Verified
+                {
+                    return Err(recovery_conflict(
+                        initial,
+                        "destination identity or complete file inventory differs",
+                    ));
+                }
+                skills.sync_directory().map_err(|error| {
+                    recovery_conflict(
+                        initial,
+                        format!("cannot synchronize committed directory entry: {error}"),
+                    )
+                })?;
+                journal
+                    .set_destination_identity(identity, journal_faults)
+                    .map_err(RecoveryError::Journal)?;
+                journal
+                    .transition(OperationState::DirectoryCommitVerified, journal_faults)
+                    .map_err(RecoveryError::Journal)?;
+            } else {
+                let stage = open_recovery_directory(initial, &skills, initial.staging_name())?;
+                if let Some(stage) = stage {
+                    let identity = stage.identity().map_err(|error| {
+                        recovery_conflict(
+                            initial,
+                            format!("cannot identify staging directory: {error}"),
+                        )
+                    })?;
+                    if initial.staging_identity() != Some(identity) {
+                        return Err(recovery_conflict(
+                            initial,
+                            "staging directory identity differs",
+                        ));
+                    }
+                    verify_partial_operation_tree(journal.record(), &stage)?;
+                    remove_operation_stage(
+                        &mut journal,
+                        &skills,
+                        &stage,
+                        install_faults,
+                        journal_faults,
+                    )?;
+                } else if initial.staging_identity().is_some()
+                    && !initial.has_cleanup_intent("staging-root")
+                {
+                    return Err(recovery_conflict(
+                        initial,
+                        "recorded staging directory is missing without a durable cleanup intent",
+                    ));
+                }
+                validate_and_remove_recovery_parents(
+                    &mut journal,
+                    &project,
+                    agents,
+                    Some(&skills),
+                    install_faults,
+                    journal_faults,
+                )?;
+                journal
+                    .transition(OperationState::RolledBack, journal_faults)
+                    .map_err(RecoveryError::Journal)?;
+                journal_store
+                    .cleanup_completed(&operation_id, journal_faults)
+                    .map_err(RecoveryError::Journal)?;
+                return Ok(RecoveryOutcome::RolledBack);
+            }
+        }
+        OperationState::DirectoryCommitVerified
+        | OperationState::ReceiptPublicationPending
+        | OperationState::ReceiptPublished => {}
+        OperationState::Complete => {
+            verify_completed_operation(initial, receipt_directory)?;
+            journal_store
+                .cleanup_completed(&operation_id, journal_faults)
+                .map_err(RecoveryError::Journal)?;
+            return Ok(RecoveryOutcome::CleanedCompletedRecord);
+        }
+        OperationState::RolledBack => {
+            verify_rolled_back_operation(initial)?;
+            journal_store
+                .cleanup_completed(&operation_id, journal_faults)
+                .map_err(RecoveryError::Journal)?;
+            return Ok(RecoveryOutcome::RolledBack);
+        }
+    }
+
+    let current = journal.record().clone();
+    let expected_identity = current.destination_identity().ok_or_else(|| {
+        recovery_conflict(&current, "committed destination identity was not recorded")
+    })?;
+    if verify_receipt_tree(current.receipt(), Some(expected_identity)).map_err(|error| {
+        recovery_conflict(
+            &current,
+            format!("cannot verify committed destination: {error}"),
+        )
+    })? != ReceiptContentState::Verified
+    {
+        return Err(recovery_conflict(
+            &current,
+            "committed destination is missing or does not match the recorded hashes",
+        ));
+    }
+    sync_committed_parent(&current)?;
+    if current.state() == OperationState::DirectoryCommitVerified {
+        journal
+            .transition(OperationState::ReceiptPublicationPending, journal_faults)
+            .map_err(RecoveryError::Journal)?;
+    }
+    finalize_recovered_receipt(
+        journal.record(),
+        receipt_directory,
+        expected_identity,
+        receipt_faults,
+    )?;
+    if journal.record().state() == OperationState::ReceiptPublicationPending {
+        journal
+            .transition(OperationState::ReceiptPublished, journal_faults)
+            .map_err(RecoveryError::Journal)?;
+    }
+    if journal.record().state() == OperationState::ReceiptPublished {
+        journal
+            .transition(OperationState::Complete, journal_faults)
+            .map_err(RecoveryError::Journal)?;
+    }
+    journal_store
+        .cleanup_completed(&operation_id, journal_faults)
+        .map_err(RecoveryError::Journal)?;
+    Ok(RecoveryOutcome::FinalizedReceipt)
+}
+
+fn sync_committed_parent(record: &JournalRecord) -> Result<(), RecoveryError> {
+    let (_, _, skills) = recovery_parent_directories(record)?;
+    let skills =
+        skills.ok_or_else(|| recovery_conflict(record, "committed skills parent is missing"))?;
+    skills.sync_directory().map_err(|error| {
+        recovery_conflict(
+            record,
+            format!("cannot synchronize committed parent directory: {error}"),
+        )
+    })
+}
+
+fn verify_completed_operation(
+    record: &JournalRecord,
+    directory: &SecureDir,
+) -> Result<(), RecoveryError> {
+    let receipts = read_receipts(directory, true).map_err(|error| {
+        recovery_conflict(
+            record,
+            format!("completed receipt store is invalid: {error}"),
+        )
+    })?;
+    let expected_name = record.receipt().receipt_filename().map_err(|error| {
+        recovery_conflict(record, format!("receipt identity is invalid: {error}"))
+    })?;
+    if !receipts
+        .iter()
+        .any(|(name, receipt)| name == &expected_name && receipt == record.receipt())
+    {
+        return Err(recovery_conflict(
+            record,
+            "completed operation has no matching durable receipt",
+        ));
+    }
+    let expected_identity = record
+        .destination_identity()
+        .ok_or_else(|| recovery_conflict(record, "completed destination identity is missing"))?;
+    if verify_receipt_tree(record.receipt(), Some(expected_identity)).map_err(|error| {
+        recovery_conflict(
+            record,
+            format!("cannot verify completed destination: {error}"),
+        )
+    })? != ReceiptContentState::Verified
+    {
+        return Err(recovery_conflict(
+            record,
+            "completed destination identity or file hashes differ",
+        ));
+    }
+    sync_committed_parent(record)?;
+    directory.sync_directory().map_err(|error| {
+        recovery_conflict(
+            record,
+            format!("cannot synchronize completed receipt storage: {error}"),
+        )
+    })?;
+    Ok(())
+}
+
+fn verify_rolled_back_operation(record: &JournalRecord) -> Result<(), RecoveryError> {
+    let (project, agents, skills) = recovery_parent_directories(record)?;
+    if record.staging_identity().is_some()
+        && (record
+            .created_files()
+            .iter()
+            .any(|file| !record.has_cleanup_intent(&format!("file:{}", file.path())))
+            || record.created_directories().iter().any(|directory| {
+                !record.has_cleanup_intent(&format!("directory:{}", directory.path()))
+            }))
+    {
+        return Err(recovery_conflict(
+            record,
+            "rolled-back staging inventory is missing durable per-object cleanup intents",
+        ));
+    }
+    if let Some(skills) = &skills {
+        if open_recovery_directory(record, skills, record.receipt().skill_name())?.is_some() {
+            return Err(recovery_conflict(
+                record,
+                "rolled-back operation still has a destination directory",
+            ));
+        }
+        if open_recovery_directory(record, skills, record.staging_name())?.is_some() {
+            return Err(recovery_conflict(
+                record,
+                "rolled-back operation still has a staging directory",
+            ));
+        }
+        if record.create_skills_directory() {
+            return Err(recovery_conflict(
+                record,
+                "rolled-back operation-created skills parent remains",
+            ));
+        }
+    }
+    if record.staging_identity().is_some() && !record.has_cleanup_intent("staging-root") {
+        return Err(recovery_conflict(
+            record,
+            "rolled-back staging directory is missing without a cleanup intent",
+        ));
+    }
+    if record.create_skills_directory()
+        && record.project_skills_identity().is_some()
+        && skills.is_none()
+        && !record.has_cleanup_intent("skills-parent")
+    {
+        return Err(recovery_conflict(
+            record,
+            "rolled-back skills parent is missing without a cleanup intent",
+        ));
+    }
+    if record.create_agents_directory() {
+        if agents.is_some() {
+            return Err(recovery_conflict(
+                record,
+                "rolled-back operation-created .agents parent remains",
+            ));
+        }
+        if record.project_agents_identity().is_some() && !record.has_cleanup_intent("agents-parent")
+        {
+            return Err(recovery_conflict(
+                record,
+                "rolled-back .agents parent is missing without a cleanup intent",
+            ));
+        }
+    }
+    let _ = project;
+    Ok(())
+}
+
+fn recovery_parent_directories(
+    record: &JournalRecord,
+) -> Result<(SecureDir, Option<SecureDir>, Option<SecureDir>), RecoveryError> {
+    let receipt = record.receipt();
+    let project = SecureDir::open_absolute(&receipt.root_path()).map_err(|error| {
+        recovery_conflict(record, format!("project root is unavailable: {error}"))
+    })?;
+    if project.identity().ok() != Some(receipt.project_identity()) {
+        return Err(recovery_conflict(
+            record,
+            "project filesystem identity changed",
+        ));
+    }
+    let agents = open_recovery_directory(record, &project, ".agents")?;
+    if let Some(agents) = &agents {
+        if record.project_agents_identity() != agents.identity().ok() {
+            return Err(recovery_conflict(
+                record,
+                "project .agents identity changed",
+            ));
+        }
+    } else if record.project_agents_identity().is_some() && !record.create_agents_directory() {
+        return Err(recovery_conflict(
+            record,
+            "pre-existing project .agents directory is missing",
+        ));
+    }
+    let skills = match &agents {
+        Some(agents) => open_recovery_directory(record, agents, "skills")?,
+        None => None,
+    };
+    if let Some(skills) = &skills {
+        if record.project_skills_identity() != skills.identity().ok() {
+            return Err(recovery_conflict(
+                record,
+                "project skills directory identity changed",
+            ));
+        }
+    } else if record.project_skills_identity().is_some() && !record.create_skills_directory() {
+        return Err(recovery_conflict(
+            record,
+            "pre-existing project skills directory is missing",
+        ));
+    }
+    Ok((project, agents, skills))
+}
+
+fn open_recovery_directory(
+    record: &JournalRecord,
+    parent: &SecureDir,
+    name: &str,
+) -> Result<Option<SecureDir>, RecoveryError> {
+    match parent.open_directory(std::ffi::OsStr::new(name)) {
+        Ok(directory) => Ok(Some(directory)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(recovery_conflict(
+            record,
+            format!(
+                "path component {name:?} is unsafe or unavailable ({})",
+                error.kind()
+            ),
+        )),
+    }
+}
+
+fn validate_and_remove_recovery_parents(
+    journal: &mut super::journal::OperationJournal,
+    project: &SecureDir,
+    agents: Option<SecureDir>,
+    skills: Option<&SecureDir>,
+    install_faults: &dyn InstallFaultInjector,
+    journal_faults: &dyn JournalFaultInjector,
+) -> Result<(), RecoveryError> {
+    let record = journal.record().clone();
+    if record.create_skills_directory() {
+        if let Some(skills) = skills {
+            if record.project_skills_identity() != skills.identity().ok()
+                || !skills
+                    .entries()
+                    .map_err(|error| {
+                        recovery_conflict(
+                            &record,
+                            format!("cannot inspect skills directory: {error}"),
+                        )
+                    })?
+                    .is_empty()
+            {
+                return Err(recovery_conflict(
+                    &record,
+                    "operation-created skills directory changed or is not empty",
+                ));
+            }
+            if let Some(agents) = &agents {
+                journal
+                    .record_cleanup_intent("skills-parent".to_owned(), journal_faults)
+                    .map_err(RecoveryError::Journal)?;
+                let current = agents
+                    .open_directory(std::ffi::OsStr::new("skills"))
+                    .map_err(|error| {
+                        recovery_conflict(
+                            &record,
+                            format!("cannot recheck skills directory before cleanup: {error}"),
+                        )
+                    })?;
+                if current.identity().ok() != record.project_skills_identity()
+                    || !current
+                        .entries()
+                        .map_err(|error| {
+                            recovery_conflict(
+                                &record,
+                                format!("cannot recheck skills directory before cleanup: {error}"),
+                            )
+                        })?
+                        .is_empty()
+                {
+                    return Err(recovery_conflict(
+                        &record,
+                        "operation-created skills directory changed before cleanup",
+                    ));
+                }
+                install_faults
+                    .before(InstallOperation::RemoveDirectory)
+                    .map_err(|error| {
+                        recovery_conflict(
+                            &record,
+                            format!("injected or failed skills-parent cleanup: {error}"),
+                        )
+                    })?;
+                agents.remove_directory("skills").map_err(|error| {
+                    recovery_conflict(
+                        &record,
+                        format!("cannot remove empty operation-created skills directory: {error}"),
+                    )
+                })?;
+                install_faults
+                    .after(InstallOperation::RemoveDirectory)
+                    .map_err(|error| {
+                        recovery_conflict(
+                            &record,
+                            format!(
+                                "skills-parent cleanup completed but reported failure: {error}"
+                            ),
+                        )
+                    })?;
+                install_faults
+                    .before(InstallOperation::SyncParentDirectory)
+                    .map_err(|error| {
+                        recovery_conflict(&record, format!("skills-parent sync failed: {error}"))
+                    })?;
+                agents.sync_directory().map_err(|error| {
+                    recovery_conflict(
+                        &record,
+                        format!("cannot synchronize skills-parent cleanup: {error}"),
+                    )
+                })?;
+                install_faults
+                    .after(InstallOperation::SyncParentDirectory)
+                    .map_err(|error| {
+                        recovery_conflict(
+                            &record,
+                            format!("skills-parent sync completed but reported failure: {error}"),
+                        )
+                    })?;
+            }
+        } else if record.project_skills_identity().is_some()
+            && !record.has_cleanup_intent("skills-parent")
+        {
+            return Err(recovery_conflict(
+                &record,
+                "recorded skills parent is missing without a durable cleanup intent",
+            ));
+        }
+    }
+    if record.create_agents_directory()
+        && let Some(agents) = agents
+    {
+        if record.project_agents_identity() != agents.identity().ok()
+            || !agents
+                .entries()
+                .map_err(|error| {
+                    recovery_conflict(
+                        &record,
+                        format!("cannot inspect .agents directory: {error}"),
+                    )
+                })?
+                .is_empty()
+        {
+            return Err(recovery_conflict(
+                &record,
+                "operation-created .agents directory changed or is not empty",
+            ));
+        }
+        journal
+            .record_cleanup_intent("agents-parent".to_owned(), journal_faults)
+            .map_err(RecoveryError::Journal)?;
+        let current = project
+            .open_directory(std::ffi::OsStr::new(".agents"))
+            .map_err(|error| {
+                recovery_conflict(
+                    &record,
+                    format!("cannot recheck .agents directory before cleanup: {error}"),
+                )
+            })?;
+        if current.identity().ok() != record.project_agents_identity()
+            || !current
+                .entries()
+                .map_err(|error| {
+                    recovery_conflict(
+                        &record,
+                        format!("cannot recheck .agents directory before cleanup: {error}"),
+                    )
+                })?
+                .is_empty()
+        {
+            return Err(recovery_conflict(
+                &record,
+                "operation-created .agents directory changed before cleanup",
+            ));
+        }
+        install_faults
+            .before(InstallOperation::RemoveDirectory)
+            .map_err(|error| {
+                recovery_conflict(
+                    &record,
+                    format!("injected or failed .agents cleanup: {error}"),
+                )
+            })?;
+        project.remove_directory(".agents").map_err(|error| {
+            recovery_conflict(
+                &record,
+                format!("cannot remove empty operation-created .agents directory: {error}"),
+            )
+        })?;
+        install_faults
+            .after(InstallOperation::RemoveDirectory)
+            .map_err(|error| {
+                recovery_conflict(
+                    &record,
+                    format!(".agents cleanup completed but reported failure: {error}"),
+                )
+            })?;
+        install_faults
+            .before(InstallOperation::SyncParentDirectory)
+            .map_err(|error| {
+                recovery_conflict(&record, format!("project-parent sync failed: {error}"))
+            })?;
+        project.sync_directory().map_err(|error| {
+            recovery_conflict(
+                &record,
+                format!("cannot synchronize project-parent cleanup: {error}"),
+            )
+        })?;
+        install_faults
+            .after(InstallOperation::SyncParentDirectory)
+            .map_err(|error| {
+                recovery_conflict(
+                    &record,
+                    format!("project-parent sync completed but reported failure: {error}"),
+                )
+            })?;
+    } else if record.create_agents_directory()
+        && record.project_agents_identity().is_some()
+        && !record.has_cleanup_intent("agents-parent")
+    {
+        return Err(recovery_conflict(
+            &record,
+            "recorded .agents parent is missing without a durable cleanup intent",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_partial_operation_tree(
+    record: &JournalRecord,
+    root: &SecureDir,
+) -> Result<(), RecoveryError> {
+    let expected_files = record
+        .receipt()
+        .files()
+        .iter()
+        .map(|file| file.path().to_owned())
+        .collect::<BTreeSet<_>>();
+    let expected_dirs = record
+        .receipt()
+        .directories()
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let recorded_files = record
+        .created_files()
+        .iter()
+        .map(|file| file.path().to_owned())
+        .collect::<BTreeSet<_>>();
+    let mut observed_files = BTreeSet::new();
+    let mut observed_directories = BTreeSet::new();
+    let mut stack = vec![(root.clone(), String::new())];
+    while let Some((directory, prefix)) = stack.pop() {
+        for (name, kind) in directory.entries().map_err(|error| {
+            recovery_conflict(record, format!("cannot inspect staging inventory: {error}"))
+        })? {
+            let Some(name) = name.to_str() else {
+                return Err(recovery_conflict(
+                    record,
+                    "staging contains a non-UTF-8 path",
+                ));
+            };
+            let path = if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            match kind {
+                NodeKind::Directory => {
+                    let expected = record
+                        .created_directories()
+                        .iter()
+                        .find(|entry| entry.path() == path);
+                    if !expected_dirs.contains(&path) || expected.is_none() {
+                        return Err(recovery_conflict(
+                            record,
+                            "staging contains an unrecorded directory",
+                        ));
+                    }
+                    let child = directory
+                        .open_directory(std::ffi::OsStr::new(name))
+                        .map_err(|error| {
+                            recovery_conflict(
+                                record,
+                                format!("cannot open staged directory: {error}"),
+                            )
+                        })?;
+                    if Some(child.identity().map_err(|error| {
+                        recovery_conflict(
+                            record,
+                            format!("cannot identify staged directory: {error}"),
+                        )
+                    })?) != expected.map(JournalDirectory::identity)
+                    {
+                        return Err(recovery_conflict(
+                            record,
+                            "staged directory identity changed",
+                        ));
+                    }
+                    observed_directories.insert(path.clone());
+                    stack.push((child, path));
+                }
+                NodeKind::RegularFile => {
+                    if !expected_files.contains(&path) || !recorded_files.contains(&path) {
+                        return Err(recovery_conflict(
+                            record,
+                            "staging contains an unrecorded file",
+                        ));
+                    }
+                    let expected = record
+                        .created_files()
+                        .iter()
+                        .find(|entry| entry.path() == path)
+                        .ok_or_else(|| {
+                            recovery_conflict(record, "staging file record is missing")
+                        })?;
+                    let mut file = directory.open_regular_file(name).map_err(|error| {
+                        recovery_conflict(record, format!("cannot open staged file: {error}"))
+                    })?;
+                    if SecureDir::file_identity(&file).ok() != Some(expected.identity()) {
+                        return Err(recovery_conflict(record, "staged file identity changed"));
+                    }
+                    observed_files.insert(path.clone());
+                    let expected_receipt = record
+                        .receipt()
+                        .files()
+                        .iter()
+                        .find(|entry| entry.path() == path)
+                        .ok_or_else(|| {
+                            recovery_conflict(record, "expected staged file is not in the receipt")
+                        })?;
+                    if !receipt_file_matches(&mut file, expected_receipt).map_err(|error| {
+                        recovery_conflict(record, format!("cannot hash staged file: {error}"))
+                    })? {
+                        let detail = if expected.verified() {
+                            "a previously verified staged file no longer matches its SHA-256"
+                        } else {
+                            "staged file is incomplete or its SHA-256 differs"
+                        };
+                        return Err(recovery_conflict(record, detail));
+                    }
+                }
+                NodeKind::Symlink | NodeKind::Other => {
+                    return Err(recovery_conflict(
+                        record,
+                        "staging contains a symlink, reparse point, or unsupported object",
+                    ));
+                }
+            }
+        }
+    }
+    for entry in record.created_files() {
+        if !observed_files.contains(entry.path())
+            && !record.has_cleanup_intent(&format!("file:{}", entry.path()))
+        {
+            return Err(recovery_conflict(
+                record,
+                "a recorded staged file is missing without a durable cleanup intent",
+            ));
+        }
+    }
+    for entry in record.created_directories() {
+        if !observed_directories.contains(entry.path())
+            && !record.has_cleanup_intent(&format!("directory:{}", entry.path()))
+        {
+            return Err(recovery_conflict(
+                record,
+                "a recorded staged directory is missing without a durable cleanup intent",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn remove_operation_stage(
+    journal: &mut super::journal::OperationJournal,
+    skills: &SecureDir,
+    root: &SecureDir,
+    install_faults: &dyn InstallFaultInjector,
+    journal_faults: &dyn JournalFaultInjector,
+) -> Result<(), RecoveryError> {
+    let files = journal.record().created_files().to_vec();
+    for entry in files.iter().rev() {
+        let intent = format!("file:{}", entry.path());
+        let parent_and_name = open_relative_parent(root, entry.path()).map_err(|error| {
+            recovery_conflict(
+                journal.record(),
+                format!("cannot open staged file parent: {error}"),
+            )
+        })?;
+        let Some((parent, name)) = parent_and_name else {
+            if journal.record().has_cleanup_intent(&intent) {
+                continue;
+            }
+            return Err(recovery_conflict(
+                journal.record(),
+                "staged file parent is missing without a durable cleanup intent",
+            ));
+        };
+        match parent.open_regular_file(&name) {
+            Ok(mut file) => {
+                if SecureDir::file_identity(&file).ok() != Some(entry.identity()) {
+                    return Err(recovery_conflict(
+                        journal.record(),
+                        "staged file identity changed before cleanup",
+                    ));
+                }
+                let expected = journal
+                    .record()
+                    .receipt()
+                    .files()
+                    .iter()
+                    .find(|file| file.path() == entry.path())
+                    .cloned()
+                    .ok_or_else(|| {
+                        recovery_conflict(journal.record(), "staged file is not expected")
+                    })?;
+                if !receipt_file_matches(&mut file, &expected).map_err(|error| {
+                    recovery_conflict(
+                        journal.record(),
+                        format!("cannot recheck staged file: {error}"),
+                    )
+                })? {
+                    return Err(recovery_conflict(
+                        journal.record(),
+                        "staged file hash changed before cleanup",
+                    ));
+                }
+                journal
+                    .record_cleanup_intent(intent, journal_faults)
+                    .map_err(RecoveryError::Journal)?;
+                let mut current = parent.open_regular_file(&name).map_err(|error| {
+                    recovery_conflict(
+                        journal.record(),
+                        format!("cannot recheck staged file before cleanup: {error}"),
+                    )
+                })?;
+                if SecureDir::file_identity(&current).ok() != Some(entry.identity())
+                    || !receipt_file_matches(&mut current, &expected).map_err(|error| {
+                        recovery_conflict(
+                            journal.record(),
+                            format!("cannot rehash staged file before cleanup: {error}"),
+                        )
+                    })?
+                {
+                    return Err(recovery_conflict(
+                        journal.record(),
+                        "staged file changed after its cleanup intent was recorded",
+                    ));
+                }
+                install_faults
+                    .before(InstallOperation::RemoveFile)
+                    .map_err(|error| {
+                        recovery_conflict(
+                            journal.record(),
+                            format!("injected or failed staged-file cleanup: {error}"),
+                        )
+                    })?;
+                parent.remove_file(&name).map_err(|error| {
+                    recovery_conflict(
+                        journal.record(),
+                        format!("cannot remove operation-owned staged file: {error}"),
+                    )
+                })?;
+                install_faults
+                    .after(InstallOperation::RemoveFile)
+                    .map_err(|error| {
+                        recovery_conflict(
+                            journal.record(),
+                            format!("staged-file cleanup completed but reported failure: {error}"),
+                        )
+                    })?;
+                install_faults
+                    .before(InstallOperation::SyncParentDirectory)
+                    .map_err(|error| {
+                        recovery_conflict(
+                            journal.record(),
+                            format!("staged-file parent sync failed: {error}"),
+                        )
+                    })?;
+                parent.sync_directory().map_err(|error| {
+                    recovery_conflict(
+                        journal.record(),
+                        format!("cannot synchronize staged file cleanup: {error}"),
+                    )
+                })?;
+                install_faults
+                    .after(InstallOperation::SyncParentDirectory)
+                    .map_err(|error| {
+                        recovery_conflict(
+                            journal.record(),
+                            format!(
+                                "staged-file parent sync completed but reported failure: {error}"
+                            ),
+                        )
+                    })?;
+            }
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    && journal.record().has_cleanup_intent(&intent) => {}
+            Err(error) => {
+                return Err(recovery_conflict(
+                    journal.record(),
+                    format!("cannot inspect staged file before cleanup: {error}"),
+                ));
+            }
+        }
+    }
+    let mut directories = journal.record().created_directories().to_vec();
+    directories.sort_by_key(|directory| std::cmp::Reverse(directory.path().matches('/').count()));
+    for entry in directories {
+        let intent = format!("directory:{}", entry.path());
+        let Some((parent, name)) = open_relative_parent(root, entry.path()).map_err(|error| {
+            recovery_conflict(
+                journal.record(),
+                format!("cannot open staged directory parent: {error}"),
+            )
+        })?
+        else {
+            if journal.record().has_cleanup_intent(&intent) {
+                continue;
+            }
+            return Err(recovery_conflict(
+                journal.record(),
+                "staged directory parent is missing without a durable cleanup intent",
+            ));
+        };
+        match parent.open_directory(std::ffi::OsStr::new(&name)) {
+            Ok(directory) => {
+                if directory.identity().ok() != Some(entry.identity())
+                    || !directory
+                        .entries()
+                        .map_err(|error| {
+                            recovery_conflict(
+                                journal.record(),
+                                format!("cannot inspect staged directory: {error}"),
+                            )
+                        })?
+                        .is_empty()
+                {
+                    return Err(recovery_conflict(
+                        journal.record(),
+                        "staged directory identity changed or it is not empty",
+                    ));
+                }
+                journal
+                    .record_cleanup_intent(intent, journal_faults)
+                    .map_err(RecoveryError::Journal)?;
+                let current =
+                    parent
+                        .open_directory(std::ffi::OsStr::new(&name))
+                        .map_err(|error| {
+                            recovery_conflict(
+                                journal.record(),
+                                format!("cannot recheck staged directory before cleanup: {error}"),
+                            )
+                        })?;
+                if current.identity().ok() != Some(entry.identity())
+                    || !current
+                        .entries()
+                        .map_err(|error| {
+                            recovery_conflict(
+                                journal.record(),
+                                format!("cannot recheck staged directory before cleanup: {error}"),
+                            )
+                        })?
+                        .is_empty()
+                {
+                    return Err(recovery_conflict(
+                        journal.record(),
+                        "staged directory changed after its cleanup intent was recorded",
+                    ));
+                }
+                install_faults
+                    .before(InstallOperation::RemoveDirectory)
+                    .map_err(|error| {
+                        recovery_conflict(
+                            journal.record(),
+                            format!("injected or failed staged-directory cleanup: {error}"),
+                        )
+                    })?;
+                parent.remove_directory(&name).map_err(|error| {
+                    recovery_conflict(
+                        journal.record(),
+                        format!("cannot remove staged directory: {error}"),
+                    )
+                })?;
+                install_faults
+                    .after(InstallOperation::RemoveDirectory)
+                    .map_err(|error| {
+                        recovery_conflict(
+                            journal.record(),
+                            format!(
+                                "staged-directory cleanup completed but reported failure: {error}"
+                            ),
+                        )
+                    })?;
+                install_faults
+                    .before(InstallOperation::SyncParentDirectory)
+                    .map_err(|error| {
+                        recovery_conflict(
+                            journal.record(),
+                            format!("staged-directory parent sync failed: {error}"),
+                        )
+                    })?;
+                parent.sync_directory().map_err(|error| {
+                    recovery_conflict(
+                        journal.record(),
+                        format!("cannot synchronize staged directory cleanup: {error}"),
+                    )
+                })?;
+                install_faults
+                    .after(InstallOperation::SyncParentDirectory)
+                    .map_err(|error| {
+                        recovery_conflict(
+                            journal.record(),
+                            format!("staged-directory parent sync completed but reported failure: {error}"),
+                        )
+                    })?;
+            }
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    && journal.record().has_cleanup_intent(&intent) => {}
+            Err(error) => {
+                return Err(recovery_conflict(
+                    journal.record(),
+                    format!("cannot inspect staged directory before cleanup: {error}"),
+                ));
+            }
+        }
+    }
+    let stage_name = journal.record().staging_name().to_owned();
+    let stage_intent = "staging-root";
+    let stage_identity = journal
+        .record()
+        .staging_identity()
+        .ok_or_else(|| recovery_conflict(journal.record(), "staging identity was not recorded"))?;
+    match skills.open_directory(std::ffi::OsStr::new(&stage_name)) {
+        Ok(current) => {
+            if current.identity().ok() != Some(stage_identity)
+                || !current
+                    .entries()
+                    .map_err(|error| {
+                        recovery_conflict(
+                            journal.record(),
+                            format!("cannot inspect staging directory: {error}"),
+                        )
+                    })?
+                    .is_empty()
+            {
+                return Err(recovery_conflict(
+                    journal.record(),
+                    "staging root identity changed or it is not empty",
+                ));
+            }
+            journal
+                .record_cleanup_intent(stage_intent.to_owned(), journal_faults)
+                .map_err(RecoveryError::Journal)?;
+            let current = skills
+                .open_directory(std::ffi::OsStr::new(&stage_name))
+                .map_err(|error| {
+                    recovery_conflict(
+                        journal.record(),
+                        format!("cannot recheck staging directory before cleanup: {error}"),
+                    )
+                })?;
+            if current.identity().ok() != Some(stage_identity)
+                || !current
+                    .entries()
+                    .map_err(|error| {
+                        recovery_conflict(
+                            journal.record(),
+                            format!("cannot recheck staging directory before cleanup: {error}"),
+                        )
+                    })?
+                    .is_empty()
+            {
+                return Err(recovery_conflict(
+                    journal.record(),
+                    "staging root changed after its cleanup intent was recorded",
+                ));
+            }
+            install_faults
+                .before(InstallOperation::RemoveDirectory)
+                .map_err(|error| {
+                    recovery_conflict(
+                        journal.record(),
+                        format!("injected or failed staging-root cleanup: {error}"),
+                    )
+                })?;
+            skills.remove_directory(&stage_name).map_err(|error| {
+                recovery_conflict(
+                    journal.record(),
+                    format!("cannot remove empty operation staging directory: {error}"),
+                )
+            })?;
+            install_faults
+                .after(InstallOperation::RemoveDirectory)
+                .map_err(|error| {
+                    recovery_conflict(
+                        journal.record(),
+                        format!("staging-root cleanup completed but reported failure: {error}"),
+                    )
+                })?;
+            install_faults
+                .before(InstallOperation::SyncParentDirectory)
+                .map_err(|error| {
+                    recovery_conflict(
+                        journal.record(),
+                        format!("staging-root parent sync failed: {error}"),
+                    )
+                })?;
+            skills.sync_directory().map_err(|error| {
+                recovery_conflict(
+                    journal.record(),
+                    format!("cannot synchronize staging-root cleanup: {error}"),
+                )
+            })?;
+            install_faults
+                .after(InstallOperation::SyncParentDirectory)
+                .map_err(|error| {
+                    recovery_conflict(
+                        journal.record(),
+                        format!("staging-root parent sync completed but reported failure: {error}"),
+                    )
+                })?;
+        }
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                && journal.record().has_cleanup_intent(stage_intent) => {}
+        Err(error) => {
+            return Err(recovery_conflict(
+                journal.record(),
+                format!("cannot inspect staging directory before cleanup: {error}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn open_relative_parent(root: &SecureDir, path: &str) -> io::Result<Option<(SecureDir, String)>> {
+    let mut parts = path.split('/').collect::<Vec<_>>();
+    let name = parts
+        .pop()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty relative path"))?
+        .to_owned();
+    let mut current = root.clone();
+    for part in parts {
+        match current.open_directory(std::ffi::OsStr::new(part)) {
+            Ok(directory) => current = directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(Some((current, name)))
+}
+
+fn receipt_file_matches(file: &mut fs::File, expected: &ReceiptFile) -> io::Result<bool> {
+    let expected_bytes = expected.byte_count();
+    if file.metadata()?.len() != expected_bytes {
+        return Ok(false);
+    }
+    let mut digest = Context::new(&SHA256);
+    let mut count = 0_u64;
+    let mut buffer = [0; IO_CHUNK_BYTES];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        count = count
+            .checked_add(read as u64)
+            .filter(|value| *value <= expected_bytes)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "file changed while hashing")
+            })?;
+        digest.update(&buffer[..read]);
+    }
+    let mut hash = String::from("sha256:");
+    for byte in digest.finish().as_ref() {
+        use std::fmt::Write as _;
+        let _ = write!(hash, "{byte:02x}");
+    }
+    Ok(count == expected_bytes && hash == expected.sha256())
+}
+
+fn verify_receipt_inventory_at(
+    receipt: &InstallationReceipt,
+    root: SecureDir,
+) -> Result<ReceiptContentState, RecoveryError> {
+    let expected_files = receipt
+        .files()
+        .iter()
+        .map(|file| {
+            (
+                file.path().to_owned(),
+                (file.byte_count(), file.sha256().to_owned()),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let expected_dirs = receipt
+        .directories()
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut actual_files = BTreeMap::new();
+    let mut actual_dirs = BTreeSet::new();
+    let mut stack = vec![(root, String::new(), 0_usize)];
+    let mut total = 0_u64;
+    while let Some((directory, prefix, depth)) = stack.pop() {
+        if depth > 32 {
+            return Ok(ReceiptContentState::Modified);
+        }
+        let mut entries = directory.entries().map_err(|error| {
+            RecoveryError::Store(content_error("read recovery inventory", error))
+        })?;
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, kind) in entries {
+            let Some(name) = name.to_str() else {
+                return Ok(ReceiptContentState::Modified);
+            };
+            let path = if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if !valid_inventory_path(&path) {
+                return Ok(ReceiptContentState::Modified);
+            }
+            match kind {
+                NodeKind::Directory => {
+                    actual_dirs.insert(path.clone());
+                    stack.push((
+                        directory
+                            .open_directory(std::ffi::OsStr::new(name))
+                            .map_err(|error| {
+                                RecoveryError::Store(content_error(
+                                    "open recovery directory",
+                                    error,
+                                ))
+                            })?,
+                        path,
+                        depth + 1,
+                    ));
+                }
+                NodeKind::RegularFile => {
+                    let mut file = directory.open_regular_file(name).map_err(|error| {
+                        RecoveryError::Store(content_error("open recovery file", error))
+                    })?;
+                    let length = file
+                        .metadata()
+                        .map_err(|error| {
+                            RecoveryError::Store(content_error("inspect recovery file", error))
+                        })?
+                        .len();
+                    if length > crate::sources::archive::MAX_FILE_UNCOMPRESSED_BYTES {
+                        return Ok(ReceiptContentState::Modified);
+                    }
+                    let mut digest = Context::new(&SHA256);
+                    let mut count = 0_u64;
+                    let mut buffer = [0; IO_CHUNK_BYTES];
+                    loop {
+                        let read = file.read(&mut buffer).map_err(|error| {
+                            RecoveryError::Store(content_error("hash recovery file", error))
+                        })?;
+                        if read == 0 {
+                            break;
+                        }
+                        count = count
+                            .checked_add(read as u64)
+                            .filter(|value| *value <= length)
+                            .ok_or_else(|| {
+                                RecoveryError::Store(content_error(
+                                    "bound recovery hash",
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "file changed while hashing",
+                                    ),
+                                ))
+                            })?;
+                        digest.update(&buffer[..read]);
+                    }
+                    let mut hash = String::from("sha256:");
+                    for byte in digest.finish().as_ref() {
+                        use std::fmt::Write as _;
+                        let _ = write!(hash, "{byte:02x}");
+                    }
+                    total = total.saturating_add(count);
+                    actual_files.insert(path, (count, hash));
+                }
+                NodeKind::Symlink | NodeKind::Other => return Ok(ReceiptContentState::Modified),
+            }
+            if actual_files.len() + actual_dirs.len() > 4096 {
+                return Ok(ReceiptContentState::Modified);
+            }
+        }
+    }
+    let expected_total = receipt
+        .files()
+        .iter()
+        .map(ReceiptFile::byte_count)
+        .sum::<u64>();
+    Ok(
+        if total == expected_total && actual_files == expected_files && actual_dirs == expected_dirs
+        {
+            ReceiptContentState::Verified
+        } else {
+            ReceiptContentState::Modified
+        },
+    )
+}
+
+fn finalize_recovered_receipt(
+    record: &JournalRecord,
+    directory: &SecureDir,
+    destination_identity: FileIdentity,
+    faults: &dyn ReceiptFaultInjector,
+) -> Result<(), RecoveryError> {
+    recover_temporary_receipt(record, directory, destination_identity, faults)?;
+    let receipts = read_receipts(directory, true).map_err(|error| RecoveryError::Conflict {
+        operation_id: record.operation_id().to_owned(),
+        detail: error.to_string(),
+    })?;
+    let final_name =
+        record
+            .receipt()
+            .receipt_filename()
+            .map_err(|error| RecoveryError::Conflict {
+                operation_id: record.operation_id().to_owned(),
+                detail: error.to_string(),
+            })?;
+    if let Some((_, existing)) = receipts.iter().find(|(name, _)| name == &final_name) {
+        if existing != record.receipt() {
+            return Err(recovery_conflict(
+                record,
+                "a conflicting receipt already exists",
+            ));
+        }
+        faults
+            .before(ReceiptOperation::SyncReceiptDirectory)
+            .map_err(|error| {
+                recovery_conflict(
+                    record,
+                    format!("cannot synchronize existing receipt publication: {error}"),
+                )
+            })?;
+        directory.sync_directory().map_err(|error| {
+            recovery_conflict(
+                record,
+                format!("cannot synchronize existing receipt publication: {error}"),
+            )
+        })?;
+        faults
+            .after(ReceiptOperation::SyncReceiptDirectory)
+            .map_err(|error| {
+                recovery_conflict(
+                    record,
+                    format!("cannot synchronize existing receipt publication: {error}"),
+                )
+            })?;
+        return Ok(());
+    }
+    validate_new_claim(record.receipt(), &receipts).map_err(|error| RecoveryError::Conflict {
+        operation_id: record.operation_id().to_owned(),
+        detail: error.to_string(),
+    })?;
+    publish_recovered_receipt(directory, record.receipt(), faults).map_err(|error| {
+        RecoveryError::Conflict {
+            operation_id: record.operation_id().to_owned(),
+            detail: error.to_string(),
+        }
+    })
+}
+
+fn recover_temporary_receipt(
+    record: &JournalRecord,
+    directory: &SecureDir,
+    destination_identity: FileIdentity,
+    faults: &dyn ReceiptFaultInjector,
+) -> Result<(), RecoveryError> {
+    let pending = directory
+        .entries()
+        .map_err(|error| RecoveryError::Store(map_io("inspect receipt storage", error)))?
+        .into_iter()
+        .filter_map(|(name, kind)| {
+            let name = name.to_str()?.to_owned();
+            name.starts_with(".pending-").then_some((name, kind))
+        })
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    if pending.len() != 1 {
+        return Err(recovery_conflict(
+            record,
+            "multiple interrupted receipt temporary files exist",
+        ));
+    }
+    let (name, kind) = &pending[0];
+    if *kind != NodeKind::RegularFile {
+        return Err(recovery_conflict(
+            record,
+            "receipt temporary is not a regular file",
+        ));
+    }
+    let mut file = directory.open_regular_file(name).map_err(|error| {
+        recovery_conflict(record, format!("cannot inspect receipt temporary: {error}"))
+    })?;
+    let len = file
+        .metadata()
+        .map_err(|error| {
+            recovery_conflict(record, format!("cannot inspect receipt temporary: {error}"))
+        })?
+        .len();
+    if len > MAX_RECEIPT_BYTES as u64 {
+        return Err(recovery_conflict(
+            record,
+            "receipt temporary exceeds the size limit",
+        ));
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_RECEIPT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            recovery_conflict(record, format!("cannot read receipt temporary: {error}"))
+        })?;
+    let parsed = InstallationReceipt::from_json(&bytes)
+        .map_err(|_| recovery_conflict(record, "receipt temporary is corrupt or incomplete"))?;
+    if parsed != *record.receipt()
+        || verify_receipt_tree(record.receipt(), Some(destination_identity)).map_err(|error| {
+            recovery_conflict(
+                record,
+                format!("cannot verify destination for receipt recovery: {error}"),
+            )
+        })? != ReceiptContentState::Verified
+    {
+        return Err(recovery_conflict(
+            record,
+            "receipt temporary or committed content differs from the operation",
+        ));
+    }
+    let final_name = record
+        .receipt()
+        .receipt_filename()
+        .map_err(|error| recovery_conflict(record, format!("invalid receipt identity: {error}")))?;
+    let existing = read_receipts_with_pending(directory, true, true).map_err(|error| {
+        recovery_conflict(
+            record,
+            format!("existing receipt storage is conflicting: {error}"),
+        )
+    })?;
+    validate_new_claim(record.receipt(), &existing).map_err(|error| {
+        recovery_conflict(
+            record,
+            format!("existing receipt conflicts with recovery: {error}"),
+        )
+    })?;
+    faults
+        .before(ReceiptOperation::PublishNoReplace)
+        .map_err(|error| RecoveryError::Store(map_io("recover receipt publication", error)))?;
+    directory
+        .rename_file_child_noreplace(name, &final_name, &file)
+        .map_err(|error| {
+            recovery_conflict(
+                record,
+                format!("cannot publish recovered receipt without replacement: {error}"),
+            )
+        })?;
+    faults
+        .after(ReceiptOperation::PublishNoReplace)
+        .map_err(|error| RecoveryError::Store(map_io("recover receipt publication", error)))?;
+    faults
+        .before(ReceiptOperation::SyncReceiptDirectory)
+        .map_err(|error| RecoveryError::Store(map_io("synchronize recovered receipt", error)))?;
+    directory
+        .sync_directory()
+        .map_err(|error| RecoveryError::Store(map_io("synchronize recovered receipt", error)))?;
+    faults
+        .after(ReceiptOperation::SyncReceiptDirectory)
+        .map_err(|error| RecoveryError::Store(map_io("synchronize recovered receipt", error)))
+}
+
+fn publish_recovered_receipt(
+    directory: &SecureDir,
+    receipt: &InstallationReceipt,
+    faults: &dyn ReceiptFaultInjector,
+) -> Result<(), ReceiptStoreError> {
+    let bytes = receipt
+        .to_json()
+        .map_err(|source| validation_error("recovered receipt", source))?;
+    if bytes.len() > MAX_RECEIPT_BYTES {
+        return Err(validation_error(
+            "recovered receipt",
+            ReceiptValidationError::InputTooLarge {
+                maximum: MAX_RECEIPT_BYTES,
+            },
+        ));
+    }
+    let final_name = receipt
+        .receipt_filename()
+        .map_err(|source| validation_error("recovered receipt", source))?;
+    let mut temporary_name = None;
+    let mut temporary_file = None;
+    for _ in 0..TEMP_NAME_ATTEMPTS {
+        let name = random_temp_name().map_err(|error| map_io("name recovered receipt", error))?;
+        faults
+            .before(ReceiptOperation::CreateTemporaryReceipt)
+            .map_err(|error| map_io("create recovered receipt", error))?;
+        match directory.create_regular_file(&name) {
+            Ok(file) => {
+                temporary_name = Some(name);
+                temporary_file = Some(file);
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(map_io("create recovered receipt", error)),
+        }
+    }
+    let name = temporary_name.ok_or(ReceiptStoreError::TemporaryNameExhausted)?;
+    let mut file = temporary_file.ok_or(ReceiptStoreError::TemporaryNameExhausted)?;
+    let identity = SecureDir::file_identity(&file)
+        .map_err(|error| map_io("identify recovered receipt", error))?;
+    let mut guard = TempReceipt {
+        directory: directory.clone(),
+        name: name.clone(),
+        identity,
+        active: true,
+    };
+    faults
+        .before(ReceiptOperation::WriteTemporaryReceipt)
+        .map_err(|error| map_io("write recovered receipt", error))?;
+    file.write_all(&bytes)
+        .map_err(|error| map_io("write recovered receipt", error))?;
+    file.flush()
+        .map_err(|error| map_io("flush recovered receipt", error))?;
+    faults
+        .before(ReceiptOperation::SyncTemporaryReceipt)
+        .map_err(|error| map_io("synchronize recovered receipt", error))?;
+    file.sync_all()
+        .map_err(|error| map_io("synchronize recovered receipt", error))?;
+    faults
+        .after(ReceiptOperation::SyncTemporaryReceipt)
+        .map_err(|error| map_io("synchronize recovered receipt", error))?;
+    let reread = read_receipt_file(directory, &name)?;
+    if reread != *receipt {
+        return Err(ReceiptStoreError::TemporaryReceiptMismatch);
+    }
+    faults
+        .before(ReceiptOperation::PublishNoReplace)
+        .map_err(|error| map_io("publish recovered receipt", error))?;
+    directory
+        .rename_file_child_noreplace(&name, &final_name, &file)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                ReceiptStoreError::DuplicateIdentity
+            } else {
+                map_io("publish recovered receipt", error)
+            }
+        })?;
+    guard.active = false;
+    faults
+        .after(ReceiptOperation::PublishNoReplace)
+        .map_err(|error| map_io("publish recovered receipt", error))?;
+    faults
+        .before(ReceiptOperation::SyncReceiptDirectory)
+        .map_err(|error| ReceiptStoreError::Durability {
+            kind: error.kind(),
+            os_error: error.raw_os_error(),
+        })?;
+    directory
+        .sync_directory()
+        .map_err(|error| ReceiptStoreError::Durability {
+            kind: error.kind(),
+            os_error: error.raw_os_error(),
+        })?;
+    faults
+        .after(ReceiptOperation::SyncReceiptDirectory)
+        .map_err(|error| ReceiptStoreError::Durability {
+            kind: error.kind(),
+            os_error: error.raw_os_error(),
+        })
+}
+
+fn recovery_conflict(record: &JournalRecord, detail: impl Into<String>) -> RecoveryError {
+    RecoveryError::Conflict {
+        operation_id: record.operation_id().to_owned(),
+        detail: detail.into(),
     }
 }
 
@@ -516,14 +2161,46 @@ pub enum ReceiptStoreError {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryOutcome {
+    CleanedCompletedRecord,
+    RolledBack,
+    FinalizedReceipt,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum RecoveryError {
+    #[error("receipt storage is not a safe absolute path")]
+    UnsafeStore,
+    #[error("receipt-store coordination failed: {0}")]
+    Store(#[source] ReceiptStoreError),
+    #[error("installation journal is invalid: {0}")]
+    Journal(#[source] JournalError),
+    #[error(
+        "operation {operation_id} conflicts with current filesystem or receipt state: {detail}; preserve the content and inspect it manually"
+    )]
+    Conflict {
+        operation_id: String,
+        detail: String,
+    },
+}
+
 fn read_receipts(
     directory: &SecureDir,
     allow_writer_lock: bool,
 ) -> Result<Vec<(String, InstallationReceipt)>, ReceiptStoreError> {
+    read_receipts_with_pending(directory, allow_writer_lock, false)
+}
+
+fn read_receipts_with_pending(
+    directory: &SecureDir,
+    allow_writer_lock: bool,
+    allow_pending: bool,
+) -> Result<Vec<(String, InstallationReceipt)>, ReceiptStoreError> {
     let mut entries = directory
         .entries()
         .map_err(|error| map_io("read receipt storage", error))?;
-    if entries.len() > MAX_RECEIPTS + usize::from(allow_writer_lock) {
+    if entries.len() > MAX_RECEIPTS + usize::from(allow_writer_lock) + usize::from(allow_pending) {
         return Err(ReceiptStoreError::TooManyReceipts {
             maximum: MAX_RECEIPTS,
         });
@@ -558,6 +2235,9 @@ fn read_receipts(
             return Err(ReceiptStoreError::BusyOrInterrupted);
         }
         if name.starts_with(".pending-") {
+            if allow_pending {
+                continue;
+            }
             return Err(ReceiptStoreError::InterruptedReceiptWrite);
         }
         if kind != NodeKind::RegularFile {
@@ -582,6 +2262,47 @@ fn read_receipts(
     }
     validate_unique_destinations(&receipts)?;
     Ok(receipts)
+}
+
+/// An unlocked persistent lock file is a stale reservation: OS locks, rather than age or PID,
+/// decide whether a writer is still active. Listing only probes the lock and never removes it.
+fn check_idle_writer_lock(directory: &SecureDir) -> Result<bool, ReceiptStoreError> {
+    let entries = directory
+        .entries()
+        .map_err(|error| map_io("inspect receipt storage", error))?;
+    let Some((_, kind)) = entries
+        .iter()
+        .find(|(name, _)| name.to_str() == Some(WRITER_LOCK_NAME))
+    else {
+        return Ok(false);
+    };
+    if *kind != NodeKind::RegularFile {
+        return Err(ReceiptStoreError::UnsafeObject {
+            name: WRITER_LOCK_NAME.to_owned(),
+        });
+    }
+    let file = directory
+        .open_lock_file(WRITER_LOCK_NAME)
+        .map_err(|error| map_io("inspect receipt-store lock", error))?;
+    if file
+        .metadata()
+        .map_err(|error| map_io("inspect receipt-store lock", error))?
+        .len()
+        != 0
+    {
+        return Err(ReceiptStoreError::UnsafeObject {
+            name: WRITER_LOCK_NAME.to_owned(),
+        });
+    }
+    match file.try_lock() {
+        Ok(()) => {
+            file.unlock()
+                .map_err(|error| map_io("release receipt-store read probe", error))?;
+            Ok(true)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => Err(ReceiptStoreError::BusyOrInterrupted),
+        Err(std::fs::TryLockError::Error(error)) => Err(map_io("probe receipt-store lock", error)),
+    }
 }
 
 fn read_receipt_file(
@@ -891,6 +2612,7 @@ mod tests {
         collections::HashMap,
         fs, io,
         path::{Path, PathBuf},
+        process::Command,
         sync::Mutex,
     };
 
@@ -902,6 +2624,7 @@ mod tests {
         install::{
             command::prepare_install_session,
             commit::{InstallFaultInjector, InstallOperation, InstallationSession},
+            journal::{JournalError, JournalFaultInjector, JournalOperation, MAX_JOURNAL_BYTES},
             receipt::InstallationReceipt,
         },
         registry::catalog::parse_catalog_json,
@@ -940,6 +2663,10 @@ mod tests {
     }
 
     fn archive() -> Vec<u8> {
+        archive_with_guide(b"guide")
+    }
+
+    fn archive_with_guide(guide_contents: &[u8]) -> Vec<u8> {
         let mut bytes = Cursor::new(Vec::new());
         let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
         let root = "catalog-test-fixtures-2f68bee292a8c68346b4294fb31d9563eefe1ade/";
@@ -949,22 +2676,30 @@ mod tests {
         zip.add_directory(format!("{root}skills/"), options)
             .expect("skills");
         zip.add_directory(&skill, options).expect("skill");
-        for (name, contents) in [
-            (
-                format!("{skill}SKILL.md"),
-                b"---\nname: uncharted-ideation\ndescription: Receipt test skill.\n---\n"
-                    .as_slice(),
-            ),
-            (format!("{skill}guide.md"), b"guide".as_slice()),
-        ] {
-            zip.start_file(name, options).expect("file");
-            zip.write_all(contents).expect("content");
+        zip.start_file(format!("{skill}SKILL.md"), options)
+            .expect("skill metadata file");
+        let mut metadata =
+            b"---\nname: uncharted-ideation\ndescription: Receipt test skill.\n---\n".to_vec();
+        if guide_contents.len() > 8 * 1024 {
+            metadata.extend_from_slice(&[b'x'; 24 * 1024]);
         }
+        zip.write_all(&metadata).expect("metadata");
+        zip.start_file(format!("{skill}guide.md"), options)
+            .expect("guide file");
+        zip.write_all(guide_contents).expect("guide content");
         zip.finish().expect("archive");
         bytes.into_inner()
     }
 
     fn session(project: &Path, stage_parent: &Path) -> InstallationSession {
+        session_with_archive(project, stage_parent, archive())
+    }
+
+    fn session_with_archive(
+        project: &Path,
+        stage_parent: &Path,
+        archive: Vec<u8>,
+    ) -> InstallationSession {
         let catalog = parse_catalog_json(include_bytes!(
             "../../tests/fixtures/catalog/test-only-valid-v1.json"
         ))
@@ -975,10 +2710,26 @@ mod tests {
             "codex",
             None,
             project,
-            &FakeTransport(archive()),
+            &FakeTransport(archive),
             &TestFactory(stage_parent.to_path_buf()),
         )
         .expect("validated session")
+    }
+
+    fn copy_directory_tree(source: &Path, destination: &Path) {
+        fs::create_dir(destination).expect("create replacement directory");
+        for entry in fs::read_dir(source).expect("read source directory") {
+            let entry = entry.expect("directory entry");
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            let kind = entry.file_type().expect("entry type");
+            if kind.is_dir() {
+                copy_directory_tree(&source_path, &destination_path);
+            } else {
+                assert!(kind.is_file(), "fixture contains only regular files");
+                fs::copy(source_path, destination_path).expect("copy replacement file");
+            }
+        }
     }
 
     #[derive(Default)]
@@ -988,6 +2739,10 @@ mod tests {
     #[derive(Default)]
     struct NoReceiptFaults;
     impl ReceiptFaultInjector for NoReceiptFaults {}
+
+    #[derive(Default)]
+    struct NoJournalFaultsForTest;
+    impl JournalFaultInjector for NoJournalFaultsForTest {}
 
     struct FailReceiptAt {
         operation: ReceiptOperation,
@@ -1016,6 +2771,162 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    struct FailAfterInstallAt(InstallOperation);
+    impl InstallFaultInjector for FailAfterInstallAt {
+        fn after(&self, operation: InstallOperation) -> io::Result<()> {
+            if operation == self.0 {
+                Err(io::Error::other("injected post-filesystem failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct FailJournalAt(JournalOperation);
+    impl JournalFaultInjector for FailJournalAt {
+        fn before(&self, operation: JournalOperation) -> io::Result<()> {
+            if operation == self.0 {
+                Err(io::Error::other("injected journal failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct FailAfterJournalCleanupSync {
+        cleanup_started: Mutex<bool>,
+    }
+
+    impl JournalFaultInjector for FailAfterJournalCleanupSync {
+        fn after(&self, operation: JournalOperation) -> io::Result<()> {
+            let mut cleanup_started = self
+                .cleanup_started
+                .lock()
+                .map_err(|_| io::Error::other("journal cleanup test lock"))?;
+            if operation == JournalOperation::CleanupRecord {
+                *cleanup_started = true;
+            } else if operation == JournalOperation::SyncStore && *cleanup_started {
+                *cleanup_started = false;
+                return Err(io::Error::other("injected journal cleanup sync failure"));
+            }
+            Ok(())
+        }
+    }
+
+    struct ExitAtInstall(InstallOperation);
+    impl InstallFaultInjector for ExitAtInstall {
+        fn before(&self, operation: InstallOperation) -> io::Result<()> {
+            if operation == self.0 {
+                std::process::exit(86);
+            }
+            Ok(())
+        }
+    }
+
+    struct ExitAfterInstall(InstallOperation);
+    impl InstallFaultInjector for ExitAfterInstall {
+        fn after(&self, operation: InstallOperation) -> io::Result<()> {
+            if operation == self.0 {
+                std::process::exit(87);
+            }
+            Ok(())
+        }
+    }
+
+    struct ExitAfterJournal(JournalOperation);
+    impl JournalFaultInjector for ExitAfterJournal {
+        fn after(&self, operation: JournalOperation) -> io::Result<()> {
+            if operation == self.0 {
+                std::process::exit(88);
+            }
+            Ok(())
+        }
+    }
+
+    struct ExitAfterJournalState {
+        directory: PathBuf,
+        state: String,
+    }
+
+    impl JournalFaultInjector for ExitAfterJournalState {
+        fn after(&self, operation: JournalOperation) -> io::Result<()> {
+            if operation != JournalOperation::SyncStore {
+                return Ok(());
+            }
+            let mut records = match fs::read_dir(&self.directory) {
+                Ok(entries) => entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.extension()
+                            .is_some_and(|extension| extension == "json")
+                    })
+                    .collect::<Vec<_>>(),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            records.sort();
+            if let Some(path) = records.last() {
+                let bytes = fs::read(path)?;
+                let value: serde_json::Value = serde_json::from_slice(&bytes)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                if value.get("state").and_then(serde_json::Value::as_str)
+                    == Some(self.state.as_str())
+                {
+                    std::process::exit(90);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    struct ExitAfterReceipt(ReceiptOperation);
+    impl ReceiptFaultInjector for ExitAfterReceipt {
+        fn after(&self, operation: ReceiptOperation) -> io::Result<()> {
+            if operation == self.0 {
+                std::process::exit(89);
+            }
+            Ok(())
+        }
+    }
+
+    struct ExitAtReceipt(ReceiptOperation);
+    impl ReceiptFaultInjector for ExitAtReceipt {
+        fn before(&self, operation: ReceiptOperation) -> io::Result<()> {
+            if operation == self.0 {
+                std::process::exit(86);
+            }
+            Ok(())
+        }
+    }
+
+    struct RecoverWhileWriting {
+        receipt_directory: PathBuf,
+        attempted: Mutex<bool>,
+    }
+
+    impl ReceiptFaultInjector for RecoverWhileWriting {
+        fn before(&self, operation: ReceiptOperation) -> io::Result<()> {
+            if operation == ReceiptOperation::CreateTemporaryReceipt {
+                let store = ReceiptStore::new(self.receipt_directory.clone());
+                let result = store.recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults);
+                if !matches!(
+                    result,
+                    Err(super::RecoveryError::Store(
+                        ReceiptStoreError::BusyOrInterrupted
+                    ))
+                ) {
+                    return Err(io::Error::other("concurrent recovery was not excluded"));
+                }
+                *self
+                    .attempted
+                    .lock()
+                    .map_err(|_| io::Error::other("recovery probe lock"))? = true;
+            }
+            Ok(())
         }
     }
 
@@ -1162,6 +3073,1001 @@ mod tests {
     }
 
     #[test]
+    fn destination_directory_sync_failure_is_recovered_from_the_journal() {
+        let (_parent, project, staging, data) = setup();
+        let store = ReceiptStore::new(data.join("receipts"));
+        let result = session(&project, &staging).commit_and_record_at(
+            &store,
+            1,
+            &FailInstallAt(InstallOperation::SyncDestinationDirectory),
+            &NoReceiptFaults,
+        );
+        assert!(matches!(
+            result,
+            Err(crate::install::commit::InstallationCompletionError::Commit(
+                _
+            ))
+        ));
+        assert!(
+            project
+                .join(".agents/skills/uncharted-ideation/SKILL.md")
+                .is_file()
+        );
+        assert!(
+            store
+                .list()
+                .expect("receipt is not yet published")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults)
+                .expect("recover after destination sync failure"),
+            vec![super::RecoveryOutcome::FinalizedReceipt]
+        );
+        assert_eq!(store.list().expect("recovered receipt").len(), 1);
+    }
+
+    #[test]
+    fn journal_failure_before_publication_prevents_project_mutation() {
+        let (_parent, project, staging, data) = setup();
+        let store = ReceiptStore::new(data.join("receipts"));
+        let result = session(&project, &staging).commit_and_record_at_with_journal(
+            &store,
+            1,
+            &NoInstallFaults,
+            &NoReceiptFaults,
+            &FailJournalAt(JournalOperation::WriteRecord),
+        );
+        assert!(matches!(
+            result,
+            Err(crate::install::commit::InstallationCompletionError::JournalBeforeCommit(_))
+        ));
+        assert!(!project.join(".agents").exists());
+        assert!(store.list().expect("receipt listing").is_empty());
+    }
+
+    #[test]
+    fn recovery_rolls_back_a_failed_pre_rename_commit_and_is_idempotent() {
+        let (_parent, project, staging, data) = setup();
+        let store = ReceiptStore::new(data.join("receipts"));
+        let result = session(&project, &staging).commit_and_record_at(
+            &store,
+            1,
+            &FailInstallAt(InstallOperation::CommitNoReplace),
+            &NoReceiptFaults,
+        );
+        assert!(matches!(
+            result,
+            Err(crate::install::commit::InstallationCompletionError::Commit(
+                _
+            ))
+        ));
+        assert_eq!(
+            store
+                .recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults)
+                .expect("rollback recovery"),
+            vec![super::RecoveryOutcome::RolledBack]
+        );
+        assert!(!project.join(".agents/skills/uncharted-ideation").exists());
+        assert!(store.list().expect("no successful receipt").is_empty());
+        assert!(
+            store
+                .recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults)
+                .expect("repeat recovery")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn recovery_retries_after_cleanup_mutation_reports_failure() {
+        let (_parent, project, staging, data) = setup();
+        let store = ReceiptStore::new(data.join("receipts"));
+        assert!(
+            session(&project, &staging)
+                .commit_and_record_at(
+                    &store,
+                    1,
+                    &FailInstallAt(InstallOperation::CommitNoReplace),
+                    &NoReceiptFaults,
+                )
+                .is_err()
+        );
+        assert!(matches!(
+            store.recover_with_all_faults(
+                &FailAfterInstallAt(InstallOperation::RemoveFile),
+                &NoJournalFaultsForTest,
+                &NoReceiptFaults,
+            ),
+            Err(super::RecoveryError::Conflict { .. })
+        ));
+        assert_eq!(
+            store
+                .recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults)
+                .expect("retry cleanup"),
+            vec![super::RecoveryOutcome::RolledBack]
+        );
+        assert!(!project.join(".agents/skills/uncharted-ideation").exists());
+        assert!(store.list().expect("no receipt").is_empty());
+    }
+
+    #[test]
+    fn recovery_finalizes_a_verified_directory_after_receipt_publication_failure() {
+        let (_parent, project, staging, data) = setup();
+        let store = ReceiptStore::new(data.join("receipts"));
+        let fail = FailReceiptAt {
+            operation: ReceiptOperation::PublishNoReplace,
+            occurrence: 1,
+            seen: Mutex::new(HashMap::new()),
+        };
+        assert!(matches!(
+            session(&project, &staging).commit_and_record_at(&store, 1, &NoInstallFaults, &fail),
+            Err(crate::install::commit::InstallationCompletionError::ReceiptAfterCommit(_))
+        ));
+        assert!(store.list().expect("no receipt yet").is_empty());
+        assert_eq!(
+            store
+                .recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults)
+                .expect("finalize receipt"),
+            vec![super::RecoveryOutcome::FinalizedReceipt]
+        );
+        let receipts = store.list().expect("final receipt");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            store
+                .verify_current_content(&receipts[0])
+                .expect("hash final content"),
+            ReceiptContentState::Verified
+        );
+        assert!(
+            store
+                .recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults)
+                .expect("repeated finalization")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn recovery_retries_receipt_directory_sync_after_publication() {
+        let (_parent, project, staging, data) = setup();
+        let store = ReceiptStore::new(data.join("receipts"));
+        let fail = FailReceiptAt {
+            operation: ReceiptOperation::SyncReceiptDirectory,
+            occurrence: 1,
+            seen: Mutex::new(HashMap::new()),
+        };
+        assert!(matches!(
+            session(&project, &staging).commit_and_record_at(&store, 1, &NoInstallFaults, &fail,),
+            Err(
+                crate::install::commit::InstallationCompletionError::ReceiptAfterCommit(
+                    ReceiptStoreError::Durability { .. }
+                )
+            )
+        ));
+        assert_eq!(store.list().expect("visible published receipt").len(), 1);
+        let journal_directory = data.join("operations");
+        assert!(
+            fs::read_dir(&journal_directory)
+                .expect("pending journal")
+                .filter_map(Result::ok)
+                .any(|entry| entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "json"))
+        );
+        assert_eq!(
+            store
+                .recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults)
+                .expect("retry directory synchronization and complete"),
+            vec![super::RecoveryOutcome::FinalizedReceipt]
+        );
+        assert_eq!(store.list().expect("one receipt").len(), 1);
+        assert!(
+            fs::read_dir(journal_directory)
+                .expect("cleaned journal")
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn recovery_preserves_a_modified_committed_directory_and_reports_conflict() {
+        let (_parent, project, staging, data) = setup();
+        let store = ReceiptStore::new(data.join("receipts"));
+        let fail = FailReceiptAt {
+            operation: ReceiptOperation::PublishNoReplace,
+            occurrence: 1,
+            seen: Mutex::new(HashMap::new()),
+        };
+        let result =
+            session(&project, &staging).commit_and_record_at(&store, 1, &NoInstallFaults, &fail);
+        assert!(result.is_err());
+        let changed = project.join(".agents/skills/uncharted-ideation/guide.md");
+        fs::write(&changed, b"user change").expect("modify committed content");
+        let recovery = store.recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults);
+        assert!(
+            matches!(recovery, Err(super::RecoveryError::Conflict { .. })),
+            "modified committed content recovery result: {recovery:?}"
+        );
+        assert_eq!(
+            fs::read(changed).expect("preserved user content"),
+            b"user change"
+        );
+        assert!(store.list().expect("no receipt was published").is_empty());
+    }
+
+    #[test]
+    fn recovery_rejects_a_replaced_directory_with_matching_hashes() {
+        let (_parent, project, staging, data) = setup();
+        let store = ReceiptStore::new(data.join("receipts"));
+        let fail = FailReceiptAt {
+            operation: ReceiptOperation::PublishNoReplace,
+            occurrence: 1,
+            seen: Mutex::new(HashMap::new()),
+        };
+        assert!(
+            session(&project, &staging)
+                .commit_and_record_at(&store, 1, &NoInstallFaults, &fail)
+                .is_err()
+        );
+        let target = project.join(".agents/skills/uncharted-ideation");
+        let preserved = project.join(".agents/skills/previous-object");
+        fs::rename(&target, &preserved).expect("preserve original committed object");
+        copy_directory_tree(&preserved, &target);
+        assert!(matches!(
+            store.recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults),
+            Err(super::RecoveryError::Conflict { .. })
+        ));
+        assert_eq!(
+            fs::read(target.join("guide.md")).expect("replacement content preserved"),
+            b"guide"
+        );
+        assert_eq!(
+            fs::read(preserved.join("guide.md")).expect("original content preserved"),
+            b"guide"
+        );
+        assert!(store.list().expect("no receipt").is_empty());
+    }
+
+    #[test]
+    fn recovery_rejects_a_replaced_project_root() {
+        let (parent, project, staging, data) = setup();
+        let store = ReceiptStore::new(data.join("receipts"));
+        let fail = FailReceiptAt {
+            operation: ReceiptOperation::PublishNoReplace,
+            occurrence: 1,
+            seen: Mutex::new(HashMap::new()),
+        };
+        assert!(
+            session(&project, &staging)
+                .commit_and_record_at(&store, 1, &NoInstallFaults, &fail)
+                .is_err()
+        );
+        let preserved = parent.path().join("project-original");
+        fs::rename(&project, &preserved).expect("preserve original project root");
+        fs::create_dir(&project).expect("replace project root");
+        assert!(matches!(
+            store.recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults),
+            Err(super::RecoveryError::Conflict { .. })
+        ));
+        assert!(
+            preserved
+                .join(".agents/skills/uncharted-ideation/guide.md")
+                .is_file()
+        );
+        assert!(!project.join(".agents").exists());
+        assert!(store.list().expect("no receipt").is_empty());
+    }
+
+    #[test]
+    fn recovery_rejects_missing_and_extra_destination_files() {
+        for add_extra_file in [false, true] {
+            let (_parent, project, staging, data) = setup();
+            let store = ReceiptStore::new(data.join("receipts"));
+            let fail = FailReceiptAt {
+                operation: ReceiptOperation::PublishNoReplace,
+                occurrence: 1,
+                seen: Mutex::new(HashMap::new()),
+            };
+            assert!(
+                session(&project, &staging)
+                    .commit_and_record_at(&store, 1, &NoInstallFaults, &fail)
+                    .is_err()
+            );
+            let destination = project.join(".agents/skills/uncharted-ideation");
+            let changed = if add_extra_file {
+                let extra = destination.join("user-added.txt");
+                fs::write(&extra, b"user content").expect("add user file");
+                extra
+            } else {
+                let missing = destination.join("guide.md");
+                fs::remove_file(&missing).expect("remove expected file");
+                missing
+            };
+            assert!(matches!(
+                store.recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults),
+                Err(super::RecoveryError::Conflict { .. })
+            ));
+            assert_eq!(
+                changed.exists(),
+                add_extra_file,
+                "recovery must preserve user-created content and not recreate missing content"
+            );
+            assert!(store.list().expect("no receipt finalized").is_empty());
+        }
+    }
+
+    #[test]
+    fn recovery_preserves_a_conflicting_valid_receipt() {
+        let (_parent, project, staging, data) = setup();
+        let store = ReceiptStore::new(data.join("receipts"));
+        let install = session(&project, &staging);
+        let project_identity = install
+            .plan()
+            .destination_snapshot()
+            .project_identity()
+            .expect("project identity");
+        let expected = InstallationReceipt::from_committed_plan(
+            install.plan(),
+            install.inventory(),
+            project_identity,
+            1,
+        )
+        .expect("expected receipt");
+        let mut conflicting_json: serde_json::Value =
+            serde_json::from_slice(&expected.to_json().expect("serialize expected receipt"))
+                .expect("receipt json");
+        conflicting_json["installedAtUnixSeconds"] = serde_json::Value::from(2_u64);
+        let conflicting = InstallationReceipt::from_json(
+            &serde_json::to_vec(&conflicting_json).expect("serialize conflicting receipt"),
+        )
+        .expect("valid conflicting receipt");
+        assert_ne!(conflicting, expected);
+
+        let fail = FailReceiptAt {
+            operation: ReceiptOperation::PublishNoReplace,
+            occurrence: 1,
+            seen: Mutex::new(HashMap::new()),
+        };
+        assert!(
+            install
+                .commit_and_record_at(&store, 1, &NoInstallFaults, &fail)
+                .is_err()
+        );
+        let receipt_path = data.join("receipts").join(
+            conflicting
+                .receipt_filename()
+                .expect("conflicting filename"),
+        );
+        let bytes = conflicting.to_json().expect("conflicting bytes");
+        fs::write(&receipt_path, &bytes).expect("install conflicting receipt fixture");
+        assert!(matches!(
+            store.recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults),
+            Err(super::RecoveryError::Conflict { .. })
+        ));
+        assert_eq!(fs::read(receipt_path).expect("preserved receipt"), bytes);
+        assert!(
+            project
+                .join(".agents/skills/uncharted-ideation/SKILL.md")
+                .is_file()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_rejects_symlink_parent_substitution_and_preserves_external_content() {
+        use std::os::unix::fs::symlink;
+
+        let (_parent, project, staging, data) = setup();
+        let store = ReceiptStore::new(data.join("receipts"));
+        let fail = FailReceiptAt {
+            operation: ReceiptOperation::PublishNoReplace,
+            occurrence: 1,
+            seen: Mutex::new(HashMap::new()),
+        };
+        assert!(
+            session(&project, &staging)
+                .commit_and_record_at(&store, 1, &NoInstallFaults, &fail)
+                .is_err()
+        );
+        let skills = project.join(".agents/skills");
+        let preserved = project.join(".agents/skills-original");
+        let external = project.join("external");
+        fs::rename(&skills, &preserved).expect("preserve original skills directory");
+        fs::create_dir(&external).expect("external directory");
+        fs::write(external.join("user.txt"), b"keep outside link").expect("external sentinel");
+        symlink(&external, &skills).expect("substitute skills symlink");
+        let recovery = store.recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults);
+        assert!(
+            matches!(recovery, Err(super::RecoveryError::Conflict { .. })),
+            "symlink substitution recovery result: {recovery:?}"
+        );
+        assert_eq!(
+            fs::read(external.join("user.txt")).expect("external content preserved"),
+            b"keep outside link"
+        );
+        assert!(preserved.join("uncharted-ideation/guide.md").is_file());
+        assert!(store.list().expect("no receipt").is_empty());
+    }
+
+    #[test]
+    fn active_installation_excludes_simultaneous_recovery() {
+        let (_parent, project, staging, data) = setup();
+        let receipt_directory = data.join("receipts");
+        let store = ReceiptStore::new(receipt_directory.clone());
+        let probe = RecoverWhileWriting {
+            receipt_directory,
+            attempted: Mutex::new(false),
+        };
+        session(&project, &staging)
+            .commit_and_record_at(&store, 1, &NoInstallFaults, &probe)
+            .expect("install succeeds despite blocked concurrent recovery");
+        assert!(*probe.attempted.lock().expect("probe result"));
+    }
+
+    #[test]
+    fn failed_completed_journal_cleanup_is_retried_idempotently() {
+        let (_parent, project, staging, data) = setup();
+        let store = ReceiptStore::new(data.join("receipts"));
+        let result = session(&project, &staging).commit_and_record_at_with_journal(
+            &store,
+            1,
+            &NoInstallFaults,
+            &NoReceiptFaults,
+            &FailJournalAt(JournalOperation::CleanupRecord),
+        );
+        assert!(matches!(
+            result,
+            Err(crate::install::commit::InstallationCompletionError::JournalAfterReceipt(_))
+        ));
+        assert_eq!(store.list().expect("published receipt remains").len(), 1);
+        assert_eq!(
+            store
+                .recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults)
+                .expect("cleanup complete operation record"),
+            vec![super::RecoveryOutcome::CleanedCompletedRecord]
+        );
+    }
+
+    #[test]
+    fn journal_cleanup_sync_failure_keeps_terminal_record_for_retry() {
+        let (_parent, project, staging, data) = setup();
+        let store = ReceiptStore::new(data.join("receipts"));
+        let result = session(&project, &staging).commit_and_record_at_with_journal(
+            &store,
+            1,
+            &NoInstallFaults,
+            &NoReceiptFaults,
+            &FailAfterJournalCleanupSync {
+                cleanup_started: Mutex::new(false),
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(crate::install::commit::InstallationCompletionError::JournalAfterReceipt(_))
+        ));
+        assert_eq!(store.list().expect("published receipt remains").len(), 1);
+        assert_eq!(
+            store
+                .recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults)
+                .expect("retry journal cleanup"),
+            vec![super::RecoveryOutcome::CleanedCompletedRecord]
+        );
+    }
+
+    #[test]
+    fn corrupt_or_interrupted_journal_is_preserved_and_reported() {
+        let (_parent, project, staging, data) = setup();
+        let store = ReceiptStore::new(data.join("receipts"));
+        assert!(
+            session(&project, &staging)
+                .commit_and_record_at(
+                    &store,
+                    1,
+                    &FailInstallAt(InstallOperation::CommitNoReplace),
+                    &NoReceiptFaults,
+                )
+                .is_err()
+        );
+        let journal_path = fs::read_dir(data.join("operations"))
+            .expect("journal store")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .expect("journal record");
+        let valid_record = fs::read(&journal_path).expect("valid journal bytes");
+        fs::write(&journal_path, b"{").expect("truncate journal");
+        assert!(matches!(
+            store.recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults),
+            Err(super::RecoveryError::Journal(JournalError::Corrupt { .. }))
+        ));
+        assert_eq!(
+            fs::read(&journal_path).expect("preserved corrupt journal"),
+            b"{"
+        );
+        let mut unsupported: serde_json::Value =
+            serde_json::from_slice(&valid_record).expect("valid journal json");
+        unsupported["schemaVersion"] = serde_json::Value::from(99_u64);
+        let unsupported_bytes =
+            serde_json::to_vec(&unsupported).expect("unsupported journal bytes");
+        fs::write(&journal_path, &unsupported_bytes).expect("write unsupported schema");
+        assert!(matches!(
+            store.recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults),
+            Err(super::RecoveryError::Journal(
+                JournalError::UnsupportedSchema(99)
+            ))
+        ));
+        assert_eq!(
+            fs::read(&journal_path).expect("preserved unsupported journal"),
+            unsupported_bytes
+        );
+        fs::remove_file(&journal_path).expect("remove corrupted fixture");
+        fs::write(data.join("operations/.pending-interrupted"), b"partial")
+            .expect("interrupted journal publication");
+        assert!(matches!(
+            store.recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults),
+            Err(super::RecoveryError::Journal(
+                JournalError::InterruptedPublication { .. }
+            ))
+        ));
+        assert_eq!(
+            fs::read(data.join("operations/.pending-interrupted")).expect("preserved journal temp"),
+            b"partial"
+        );
+    }
+
+    #[test]
+    fn changed_historical_journal_identity_breaks_the_sequence() {
+        let (_parent, project, staging, data) = setup();
+        let store = ReceiptStore::new(data.join("receipts"));
+        assert!(
+            session(&project, &staging)
+                .commit_and_record_at(
+                    &store,
+                    1,
+                    &FailInstallAt(InstallOperation::CommitNoReplace),
+                    &NoReceiptFaults,
+                )
+                .is_err()
+        );
+        let mut records = fs::read_dir(data.join("operations"))
+            .expect("journal store")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .collect::<Vec<_>>();
+        records.sort();
+        let changed = records
+            .iter()
+            .find_map(|path| {
+                let bytes = fs::read(path).ok()?;
+                let mut value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+                let identity = value.get_mut("stagingIdentity")?.as_object_mut()?;
+                let object = identity.get_mut("object")?.as_u64()?;
+                identity.insert("object".to_owned(), serde_json::Value::from(object + 1));
+                Some((path.clone(), serde_json::to_vec(&value).ok()?))
+            })
+            .expect("a durable staging identity record");
+        fs::write(&changed.0, changed.1).expect("tamper historical identity snapshot");
+        assert!(matches!(
+            store.recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults),
+            Err(super::RecoveryError::Journal(
+                JournalError::InvalidTransition
+            ))
+        ));
+    }
+
+    #[test]
+    fn oversized_journal_fails_closed_before_project_changes() {
+        let (_parent, project, staging, data) = setup();
+        let store = ReceiptStore::new(data.join("receipts"));
+        assert!(
+            session(&project, &staging)
+                .commit_and_record_at(
+                    &store,
+                    1,
+                    &FailInstallAt(InstallOperation::CommitNoReplace),
+                    &NoReceiptFaults,
+                )
+                .is_err()
+        );
+        let journal_path = fs::read_dir(data.join("operations"))
+            .expect("journal store")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .expect("journal record");
+        fs::write(&journal_path, vec![b'x'; MAX_JOURNAL_BYTES + 1]).expect("oversize journal");
+        assert!(matches!(
+            store.recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults),
+            Err(super::RecoveryError::Journal(JournalError::Oversized))
+        ));
+        assert!(!project.join(".agents/skills/uncharted-ideation").exists());
+    }
+
+    #[test]
+    fn subprocess_crash_immediately_before_directory_rename_is_rolled_back() {
+        if std::env::var_os("THRN_M2_06_CRASH_AFTER_RECOVERY_REMOVE").is_some() {
+            let data = PathBuf::from(std::env::var_os("THRN_M2_06_DATA").expect("data"));
+            let store = ReceiptStore::new(data.join("receipts"));
+            let _ = store.recover_with_all_faults(
+                &ExitAfterInstall(InstallOperation::RemoveFile),
+                &NoJournalFaultsForTest,
+                &NoReceiptFaults,
+            );
+            panic!("child should exit after a recovery file removal");
+        }
+        if std::env::var_os("THRN_M2_06_CRASH_BEFORE_RENAME").is_some() {
+            let project = PathBuf::from(std::env::var_os("THRN_M2_06_PROJECT").expect("project"));
+            let staging = PathBuf::from(std::env::var_os("THRN_M2_06_STAGING").expect("staging"));
+            let data = PathBuf::from(std::env::var_os("THRN_M2_06_DATA").expect("data"));
+            let store = ReceiptStore::new(data.join("receipts"));
+            let _ = session(&project, &staging).commit_and_record_at(
+                &store,
+                1,
+                &ExitAtInstall(InstallOperation::CommitNoReplace),
+                &NoReceiptFaults,
+            );
+            panic!("child should exit at the no-replace boundary");
+        }
+
+        let (_parent, project, staging, data) = setup();
+        let status = Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("install::receipt_store::tests::subprocess_crash_immediately_before_directory_rename_is_rolled_back")
+            .arg("--nocapture")
+            .env("THRN_M2_06_CRASH_BEFORE_RENAME", "1")
+            .env("THRN_M2_06_PROJECT", &project)
+            .env("THRN_M2_06_STAGING", &staging)
+            .env("THRN_M2_06_DATA", &data)
+            .status()
+            .expect("launch crash simulation");
+        assert_eq!(status.code(), Some(86));
+        let store = ReceiptStore::new(data.join("receipts"));
+        let cleanup_status = Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("install::receipt_store::tests::subprocess_crash_immediately_before_directory_rename_is_rolled_back")
+            .arg("--nocapture")
+            .env("THRN_M2_06_CRASH_AFTER_RECOVERY_REMOVE", "1")
+            .env("THRN_M2_06_PROJECT", &project)
+            .env("THRN_M2_06_STAGING", &staging)
+            .env("THRN_M2_06_DATA", &data)
+            .status()
+            .expect("launch recovery crash simulation");
+        assert_eq!(cleanup_status.code(), Some(87));
+        assert_eq!(
+            store
+                .recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults)
+                .expect("recover process interruption"),
+            vec![super::RecoveryOutcome::RolledBack]
+        );
+        assert!(!project.join(".agents/skills/uncharted-ideation").exists());
+        assert!(store.list().expect("no receipt").is_empty());
+    }
+
+    #[test]
+    fn subprocess_crash_after_durable_preparation_is_rolled_back() {
+        if std::env::var_os("THRN_M2_06_CRASH_AFTER_PREPARED").is_some() {
+            let project = PathBuf::from(std::env::var_os("THRN_M2_06_PROJECT").expect("project"));
+            let staging = PathBuf::from(std::env::var_os("THRN_M2_06_STAGING").expect("staging"));
+            let data = PathBuf::from(std::env::var_os("THRN_M2_06_DATA").expect("data"));
+            let store = ReceiptStore::new(data.join("receipts"));
+            let _ = session(&project, &staging).commit_and_record_at_with_journal(
+                &store,
+                1,
+                &NoInstallFaults,
+                &NoReceiptFaults,
+                &ExitAfterJournal(JournalOperation::SyncStore),
+            );
+            panic!("child should exit after the prepared journal is synchronized");
+        }
+
+        let (_parent, project, staging, data) = setup();
+        let status = Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("install::receipt_store::tests::subprocess_crash_after_durable_preparation_is_rolled_back")
+            .arg("--nocapture")
+            .env("THRN_M2_06_CRASH_AFTER_PREPARED", "1")
+            .env("THRN_M2_06_PROJECT", &project)
+            .env("THRN_M2_06_STAGING", &staging)
+            .env("THRN_M2_06_DATA", &data)
+            .status()
+            .expect("launch crash simulation");
+        assert_eq!(status.code(), Some(88));
+        let store = ReceiptStore::new(data.join("receipts"));
+        assert_eq!(
+            store
+                .recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults)
+                .expect("recover durable preparation"),
+            vec![super::RecoveryOutcome::RolledBack]
+        );
+        assert!(!project.join(".agents").exists());
+        assert!(store.list().expect("no receipt").is_empty());
+    }
+
+    #[test]
+    fn subprocess_crashes_after_each_durable_operation_state() {
+        let test_name =
+            "install::receipt_store::tests::subprocess_crashes_after_each_durable_operation_state";
+        if let Some(state) = std::env::var_os("THRN_M2_06_CRASH_AFTER_STATE") {
+            let project = PathBuf::from(std::env::var_os("THRN_M2_06_PROJECT").expect("project"));
+            let staging = PathBuf::from(std::env::var_os("THRN_M2_06_STAGING").expect("staging"));
+            let data = PathBuf::from(std::env::var_os("THRN_M2_06_DATA").expect("data"));
+            let store = ReceiptStore::new(data.join("receipts"));
+            let _ = session(&project, &staging).commit_and_record_at_with_journal(
+                &store,
+                1,
+                &NoInstallFaults,
+                &NoReceiptFaults,
+                &ExitAfterJournalState {
+                    directory: data.join("operations"),
+                    state: state.to_string_lossy().into_owned(),
+                },
+            );
+            panic!("child should exit after the requested durable journal state");
+        }
+
+        for (state, expected_outcome) in [
+            ("prepared", super::RecoveryOutcome::RolledBack),
+            (
+                "filesystemCommitInProgress",
+                super::RecoveryOutcome::RolledBack,
+            ),
+            (
+                "directoryCommitVerified",
+                super::RecoveryOutcome::FinalizedReceipt,
+            ),
+            (
+                "receiptPublicationPending",
+                super::RecoveryOutcome::FinalizedReceipt,
+            ),
+            ("receiptPublished", super::RecoveryOutcome::FinalizedReceipt),
+            ("complete", super::RecoveryOutcome::CleanedCompletedRecord),
+        ] {
+            let (_parent, project, staging, data) = setup();
+            let status = Command::new(std::env::current_exe().expect("test executable"))
+                .arg("--exact")
+                .arg(test_name)
+                .arg("--nocapture")
+                .env("THRN_M2_06_CRASH_AFTER_STATE", state)
+                .env("THRN_M2_06_PROJECT", &project)
+                .env("THRN_M2_06_STAGING", &staging)
+                .env("THRN_M2_06_DATA", &data)
+                .status()
+                .expect("launch state crash simulation");
+            assert_eq!(status.code(), Some(90), "state={state}");
+            let store = ReceiptStore::new(data.join("receipts"));
+            assert_eq!(
+                store
+                    .recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults)
+                    .expect("recover durable operation state"),
+                vec![expected_outcome],
+                "state={state}"
+            );
+            let receipts = store.list().expect("consistent receipt listing");
+            if expected_outcome == super::RecoveryOutcome::RolledBack {
+                assert!(receipts.is_empty(), "state={state}");
+                assert!(!project.join(".agents").exists(), "state={state}");
+            } else {
+                assert_eq!(receipts.len(), 1, "state={state}");
+                assert_eq!(
+                    store
+                        .verify_current_content(&receipts[0])
+                        .expect("verified recovered destination"),
+                    ReceiptContentState::Verified,
+                    "state={state}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn subprocess_crash_after_directory_rename_finalizes_verified_receipt() {
+        if std::env::var_os("THRN_M2_06_CRASH_AFTER_DIRECTORY_RENAME").is_some() {
+            let project = PathBuf::from(std::env::var_os("THRN_M2_06_PROJECT").expect("project"));
+            let staging = PathBuf::from(std::env::var_os("THRN_M2_06_STAGING").expect("staging"));
+            let data = PathBuf::from(std::env::var_os("THRN_M2_06_DATA").expect("data"));
+            let store = ReceiptStore::new(data.join("receipts"));
+            let _ = session(&project, &staging).commit_and_record_at(
+                &store,
+                1,
+                &ExitAfterInstall(InstallOperation::CommitNoReplace),
+                &NoReceiptFaults,
+            );
+            panic!("child should exit after the no-replace rename");
+        }
+
+        let (_parent, project, staging, data) = setup();
+        let status = Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("install::receipt_store::tests::subprocess_crash_after_directory_rename_finalizes_verified_receipt")
+            .arg("--nocapture")
+            .env("THRN_M2_06_CRASH_AFTER_DIRECTORY_RENAME", "1")
+            .env("THRN_M2_06_PROJECT", &project)
+            .env("THRN_M2_06_STAGING", &staging)
+            .env("THRN_M2_06_DATA", &data)
+            .status()
+            .expect("launch crash simulation");
+        assert_eq!(status.code(), Some(87));
+        let store = ReceiptStore::new(data.join("receipts"));
+        assert_eq!(
+            store
+                .recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults)
+                .expect("finalize verified committed directory"),
+            vec![super::RecoveryOutcome::FinalizedReceipt]
+        );
+        let receipts = store.list().expect("published receipt");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            store
+                .verify_current_content(&receipts[0])
+                .expect("verify recovered install"),
+            ReceiptContentState::Verified
+        );
+    }
+
+    #[test]
+    fn subprocess_crash_during_partial_file_copy_preserves_unverified_staging() {
+        if std::env::var_os("THRN_M2_06_CRASH_DURING_COPY").is_some() {
+            let project = PathBuf::from(std::env::var_os("THRN_M2_06_PROJECT").expect("project"));
+            let staging = PathBuf::from(std::env::var_os("THRN_M2_06_STAGING").expect("staging"));
+            let data = PathBuf::from(std::env::var_os("THRN_M2_06_DATA").expect("data"));
+            let store = ReceiptStore::new(data.join("receipts"));
+            let session = session_with_archive(
+                &project,
+                &staging,
+                archive_with_guide(&vec![b'x'; 24 * 1024]),
+            );
+            let _ = session.commit_and_record_at(
+                &store,
+                1,
+                &ExitAfterInstall(InstallOperation::WriteDestination),
+                &NoReceiptFaults,
+            );
+            panic!("child should exit during the staged file copy");
+        }
+
+        let (_parent, project, staging, data) = setup();
+        let status = Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("install::receipt_store::tests::subprocess_crash_during_partial_file_copy_preserves_unverified_staging")
+            .arg("--nocapture")
+            .env("THRN_M2_06_CRASH_DURING_COPY", "1")
+            .env("THRN_M2_06_PROJECT", &project)
+            .env("THRN_M2_06_STAGING", &staging)
+            .env("THRN_M2_06_DATA", &data)
+            .status()
+            .expect("launch crash simulation");
+        assert_eq!(status.code(), Some(87));
+        let store = ReceiptStore::new(data.join("receipts"));
+        let recovery = store.recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults);
+        assert!(
+            matches!(recovery, Err(super::RecoveryError::Conflict { .. })),
+            "partial-copy recovery must report a preserved-content conflict: {recovery:?}"
+        );
+        let stage = fs::read_dir(project.join(".agents/skills"))
+            .expect("skills parent")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".thrn-install-"))
+            })
+            .expect("partial operation staging is preserved");
+        assert!(
+            stage
+                .join("SKILL.md")
+                .metadata()
+                .expect("partial file")
+                .len()
+                > 0
+        );
+        assert!(store.list().expect("no successful receipt").is_empty());
+    }
+
+    #[test]
+    fn subprocess_crash_after_receipt_rename_is_completed_idempotently() {
+        if std::env::var_os("THRN_M2_06_CRASH_AFTER_RECEIPT_RENAME").is_some() {
+            let project = PathBuf::from(std::env::var_os("THRN_M2_06_PROJECT").expect("project"));
+            let staging = PathBuf::from(std::env::var_os("THRN_M2_06_STAGING").expect("staging"));
+            let data = PathBuf::from(std::env::var_os("THRN_M2_06_DATA").expect("data"));
+            let store = ReceiptStore::new(data.join("receipts"));
+            let _ = session(&project, &staging).commit_and_record_at(
+                &store,
+                1,
+                &NoInstallFaults,
+                &ExitAfterReceipt(ReceiptOperation::PublishNoReplace),
+            );
+            panic!("child should exit after the receipt rename");
+        }
+
+        let (_parent, project, staging, data) = setup();
+        let status = Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("install::receipt_store::tests::subprocess_crash_after_receipt_rename_is_completed_idempotently")
+            .arg("--nocapture")
+            .env("THRN_M2_06_CRASH_AFTER_RECEIPT_RENAME", "1")
+            .env("THRN_M2_06_PROJECT", &project)
+            .env("THRN_M2_06_STAGING", &staging)
+            .env("THRN_M2_06_DATA", &data)
+            .status()
+            .expect("launch crash simulation");
+        assert_eq!(status.code(), Some(89));
+        let store = ReceiptStore::new(data.join("receipts"));
+        assert_eq!(
+            store
+                .recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults)
+                .expect("complete already-published receipt"),
+            vec![super::RecoveryOutcome::FinalizedReceipt]
+        );
+        assert_eq!(store.list().expect("one receipt").len(), 1);
+        assert!(
+            store
+                .recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults)
+                .expect("repeat recovery")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn subprocess_crash_after_receipt_temp_sync_finalizes_without_overwrite() {
+        if std::env::var_os("THRN_M2_06_CRASH_BEFORE_RECEIPT_RENAME").is_some() {
+            let project = PathBuf::from(std::env::var_os("THRN_M2_06_PROJECT").expect("project"));
+            let staging = PathBuf::from(std::env::var_os("THRN_M2_06_STAGING").expect("staging"));
+            let data = PathBuf::from(std::env::var_os("THRN_M2_06_DATA").expect("data"));
+            let store = ReceiptStore::new(data.join("receipts"));
+            let _ = session(&project, &staging).commit_and_record_at(
+                &store,
+                1,
+                &NoInstallFaults,
+                &ExitAtReceipt(ReceiptOperation::PublishNoReplace),
+            );
+            panic!("child should exit at receipt publication boundary");
+        }
+
+        let (_parent, project, staging, data) = setup();
+        let status = Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("install::receipt_store::tests::subprocess_crash_after_receipt_temp_sync_finalizes_without_overwrite")
+            .arg("--nocapture")
+            .env("THRN_M2_06_CRASH_BEFORE_RECEIPT_RENAME", "1")
+            .env("THRN_M2_06_PROJECT", &project)
+            .env("THRN_M2_06_STAGING", &staging)
+            .env("THRN_M2_06_DATA", &data)
+            .status()
+            .expect("launch crash simulation");
+        assert_eq!(status.code(), Some(86));
+        let store = ReceiptStore::new(data.join("receipts"));
+        assert!(matches!(
+            store.list(),
+            Err(ReceiptStoreError::InterruptedReceiptWrite)
+        ));
+        assert_eq!(
+            store
+                .recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults)
+                .expect("recover exact receipt temporary"),
+            vec![super::RecoveryOutcome::FinalizedReceipt]
+        );
+        let receipts = store.list().expect("published receipt");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            store
+                .verify_current_content(&receipts[0])
+                .expect("verified installed tree"),
+            ReceiptContentState::Verified
+        );
+    }
+
+    #[test]
     fn receipt_store_preflight_failures_happen_before_project_commit() {
         for operation in [
             ReceiptOperation::CreateStore,
@@ -1296,6 +4202,7 @@ mod tests {
         let names = fs::read_dir(data.join("receipts"))
             .expect("storage exists")
             .map(|entry| entry.expect("entry").file_name())
+            .filter(|name| name != ".writer.lock")
             .collect::<Vec<_>>();
         assert!(names.is_empty());
     }
@@ -1450,6 +4357,18 @@ mod tests {
         ));
         fs::remove_file(data.join("receipts/.pending-interrupted")).expect("remove temp");
         fs::write(data.join("receipts/.writer.lock"), b"").expect("stale lock");
+        assert!(
+            store
+                .list()
+                .expect("idle stale lock is read-only")
+                .is_empty()
+        );
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(data.join("receipts/.writer.lock"))
+            .expect("open active lock");
+        lock.try_lock().expect("hold active lock");
         assert!(matches!(
             store.list(),
             Err(ReceiptStoreError::BusyOrInterrupted)

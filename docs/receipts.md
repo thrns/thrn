@@ -66,23 +66,28 @@ files, directories, links/reparse points, malformed receipts, unsupported versio
 duplicate identities, and multiple resource claims for one destination are errors rather than an
 empty list.
 
-Receipt creation is available only behind the internal commit/receipt boundary. It first reserves
-the store with an exclusive `.writer.lock`, validates existing receipts, and rejects a key or
-destination conflict before the project commit. After a successful no-replace directory commit, it
-reopens the committed tree without following links, checks the project and destination identities,
-compares the complete directory/file inventory, and rehashes every regular file. It then serializes
-within the size limit, creates an unpredictable temporary file exclusively in receipt storage,
-writes and flushes the complete JSON, syncs the file, parses it back, and publishes it with a
-platform no-replace rename. A pre-existing receipt is never overwritten. Temporary files and locks
-created by a handled failure are removed only after their open-handle identity is checked.
+Receipt creation is available only behind the internal commit/receipt boundary. It reserves the
+store with the persistent `.writer.lock` file and an exclusive OS file lock, validates existing
+receipts, and rejects a key or destination conflict before the project commit. The lock file is
+never removed based on age or PID; a live OS lock excludes competing install and recovery work. The
+same lock coordinates the journaled recovery API. After a successful no-replace directory commit,
+the writer reopens the committed tree without following links, checks the project and destination
+identities, compares the complete directory/file inventory, and rehashes every regular file. It
+then serializes within the size limit, creates an unpredictable temporary file exclusively in
+receipt storage, writes and flushes the complete JSON, syncs the file, parses it back, and publishes
+it with a platform no-replace rename. A pre-existing receipt is never overwritten. A temporary
+receipt is recoverable only when its complete strict contents equal the journal's receipt and the
+committed destination still verifies. Other pending content is preserved and reported as a conflict.
 
 On Linux and macOS, file data and containing directory entries are synchronized with `sync_all`
-before a successful result. On Windows the receipt file is flushed before rename, but the current
-directory handle path does not provide a portable directory-entry flush; entry durability depends
-on the filesystem and OS. A directory-sync error after publication is reported as incomplete
-receipt persistence even though the final receipt may be visible. Abrupt termination can leave a
-temporary receipt or writer lock; listing fails closed on either. M2-06 must add persistent recovery
-state and coordinated recovery for these post-commit and interrupted states.
+before a successful result. On Windows receipt file bytes are flushed before rename, but the current
+directory-handle path cannot portably flush directory-entry metadata; entry durability depends on
+the filesystem and OS. A directory-sync error after publication is reported as incomplete receipt
+persistence even though the final receipt may be visible. Abrupt termination can leave a temporary
+receipt or the persistent lock file; OS locks are released by process exit, but recovery still
+treats pending receipt data conservatively. Read-only listing never removes journal or receipt state
+and does not imply that an unreceipted destination is managed. See [the recovery protocol](recovery.md)
+for journal state, retry, and durability behavior.
 
 ## Trust and platform path identity
 
@@ -102,5 +107,5 @@ compare paths case-insensitively and also compare the stored project identity. R
 different machine is not supported as proof that the target directory is the same object.
 
 Receipts do not upgrade manually installed or otherwise unreceipted skills into THRN-owned content.
-Corrupt records never authorize removal. Public installation remains disabled until M2-06 has
-coordinated rollback and crash recovery.
+Corrupt records never authorize removal. Public installation remains disabled pending independent
+architectural review of M2-06 recovery and cross-platform tests.

@@ -2,7 +2,7 @@
 
 ## Current exposure
 
-THRN is under development and has no supported installer release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, reads validated local catalog data, offers an explicit HTTPS catalog refresh, performs read-only local `SKILL.md` validation, lists validated receipt-backed installations, and provides a read-only Codex project install dry-run. Default discovery and both `skills list` modes never use the network. Explicit refresh contacts one fixed THRN-operated HTTPS endpoint, validates the response, and writes only the catalog cache. An install dry-run reads the local catalog without refreshing it, fetches the selected skill at its pinned public GitHub commit, validates and stages it privately, then prints a plan without changing the project. The internal M2-04/M2-05 boundary can atomically add a complete Codex project skill directory and record its receipt in isolated tests, but the CLI does not call it and still rejects installation without `--dry-run`. No retrieved content or subprocess is executed. Installed listing reads only THRN's application-data receipt directory: it does not inspect agent skill folders, create receipt storage, fetch the catalog, or open receipt-referenced project paths. It labels current content integrity as unchecked. Public installation, coordinated rollback, and crash recovery are not implemented.
+THRN is under development and has no supported installer release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, reads validated local catalog data, offers an explicit HTTPS catalog refresh, performs read-only local `SKILL.md` validation, lists validated receipt-backed installations, and provides a read-only Codex project install dry-run. Default discovery and both `skills list` modes never use the network. Explicit refresh contacts one fixed THRN-operated HTTPS endpoint, validates the response, and writes only the catalog cache. An install dry-run reads the local catalog without refreshing it, fetches the selected skill at its pinned public GitHub commit, validates and stages it privately, then prints a plan without changing the project. The internal M2-04/M2-05/M2-06 boundary can commit a Codex project skill, publish its ownership receipt, and recover interrupted transactions in isolated tests, but the CLI does not call it and still rejects installation without `--dry-run` pending independent architectural review. No retrieved content or subprocess is executed. Installed listing reads only THRN's application-data receipt directory: it does not inspect agent skill folders, create receipt storage, fetch the catalog, open receipt-referenced project paths, or mutate recovery state. It labels current content integrity as unchecked. See [the recovery protocol](recovery.md) for transaction and durability limits.
 
 ## Boundaries required before public installation
 
@@ -18,7 +18,7 @@ Before the CLI enables installation, source and filesystem handling must:
 - Avoid logging credentials, tokens, environment secrets, private skill content, or unnecessary personal paths. The v1 public-source workflow should not require a GitHub token. Any future credential support needs an explicit design and redaction tests.
 - Make supply-chain claims proportionate to evidence. Pinned commits identify source revisions, not author identity. Stronger publisher authenticity requires a separately reviewed signing or attestation design; do not imply that TLS or a same-origin digest provides it.
 
-M2-03 implements read-only destination checks and an immutable proposal. M2-04 adds an internal Codex project directory commit; M2-05 adds post-commit ownership receipts and receipt-backed listing. These APIs are deliberately not connected to the CLI. `--dry-run` remains mandatory until coordinated rollback and recovery are implemented and independently reviewed.
+M2-03 implements read-only destination checks and an immutable proposal. M2-04 adds an internal Codex project directory commit; M2-05 adds post-commit ownership receipts and receipt-backed listing; M2-06 adds an internal journaled recovery path. These APIs are deliberately not connected to the CLI. `--dry-run` remains mandatory until recovery has passed independent architectural review.
 
 ## Milestone status
 
@@ -229,11 +229,11 @@ Before the final rename, failures remove only files and directories the operatio
 private staging directory, then remove newly created parent directories only if they are empty.
 Cleanup failures are reported in the structured error; unrelated project content is never
 recursively deleted. After a successful rename, the complete skill directory is visible. The rename
-does not guarantee disk durability, recover an abrupt process or machine crash, or make future
-receipt creation atomic with the directory. M2-05 adds durable receipts after commit; M2-06 owns
-coordinated rollback and crash recovery. There is no provisional receipt in M2-04, and the internal
-engine is not a complete production-safe installer until M2-06 closes post-commit failure and
-interruption states.
+does not guarantee disk durability or make receipt creation atomic with the directory. M2-06 adds
+a separate durable operation journal and coordinated internal recovery; see [the recovery
+protocol](recovery.md). Filesystem and receipt state still cannot be made one power-loss-atomic
+transaction across independent storage locations. The CLI remains dry-run-only pending independent
+architectural review.
 
 ## Non-blocking M1-04 follow-up review
 
@@ -257,9 +257,9 @@ M2-02 network boundary.
 
 Remaining requirements:
 
-- **M2-04/M2-05:** internal committed installation and durable ownership receipts. The API is not
-  exposed through the CLI and post-commit persistence failure is incomplete installation state.
-- **M2-06:** coordinated rollback and recovery for failed or interrupted installation sequences.
+- **M2-04/M2-05/M2-06:** internal committed installation, durable ownership receipts, and coordinated
+  recovery are implemented. The API is not exposed through the CLI pending independent architectural
+  review.
 - **M3:** safe user-scope support and receipt-backed update/remove behavior that detects modified content and reports partial failure.
 
 Security-sensitive parsing and writes require negative tests with hostile fixtures, isolated temporary directories, and deterministic network mocks. See the [roadmap](ROADMAP.md) and [repository security policy](../SECURITY.md) for project status.
