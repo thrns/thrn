@@ -743,8 +743,10 @@ mod tests {
             Err(ReceiptValidationError::InvalidMetadata)
         ));
         let mut wrong_destination = receipt.clone();
-        wrong_destination.destination =
-            "/another/project/.agents/skills/uncharted-ideation".to_owned();
+        wrong_destination.destination = PathBuf::from(&receipt.canonical_project_root)
+            .join("another-project/.agents/skills/uncharted-ideation")
+            .to_string_lossy()
+            .into_owned();
         assert!(matches!(
             wrong_destination.validate(),
             Err(ReceiptValidationError::DestinationMismatch)

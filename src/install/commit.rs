@@ -1592,64 +1592,39 @@ impl SecureDir {
                 "path is not absolute",
             ));
         }
-        let mut root = PathBuf::new();
-        let mut saw_root = false;
-        for component in path.components() {
-            match component {
-                Component::Prefix(prefix) if !saw_root => root.push(prefix.as_os_str()),
-                Component::RootDir if !saw_root => {
-                    root.push(component.as_os_str());
-                    saw_root = true;
-                }
-                Component::Normal(_) => break,
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "ambiguous absolute path",
-                    ));
-                }
-            }
-        }
-        if !saw_root {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "path has no root directory",
-            ));
-        }
-        let root_file = open_windows_directory(&root)?;
-        let mut current = Self {
-            file: std::sync::Arc::new(root_file),
-            path: root,
-        };
-        for component in path.components() {
-            match component {
-                Component::Prefix(_) | Component::RootDir => {}
-                Component::Normal(name) => {
-                    current = match current.open_directory(name) {
-                        Ok(directory) => directory,
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                            let name = name.to_str().ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    "directory component is not UTF-8",
-                                )
-                            })?;
-                            current.create_directory(name)?;
-                            current.sync_directory()?;
-                            current.open_directory(std::ffi::OsStr::new(name))?
+        let mut ancestor = path;
+        let mut missing = Vec::<std::ffi::OsString>::new();
+        loop {
+            match Self::open_absolute(ancestor) {
+                Ok(mut current) => {
+                    for component in missing.iter().rev() {
+                        let name = component.to_str().ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "directory component is not UTF-8",
+                            )
+                        })?;
+                        match current.create_directory(name) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                            Err(error) => return Err(error),
                         }
-                        Err(error) => return Err(error),
-                    };
+                        current = current.open_directory(component)?;
+                    }
+                    return Ok(current);
                 }
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "ambiguous absolute path",
-                    ));
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    let name = ancestor.file_name().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "path has no existing ancestor")
+                    })?;
+                    missing.push(name.to_os_string());
+                    ancestor = ancestor.parent().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "path has no root directory")
+                    })?;
                 }
+                Err(error) => return Err(error),
             }
         }
-        Ok(current)
     }
 
     pub(super) fn open_directory(&self, name: &std::ffi::OsStr) -> io::Result<Self> {
