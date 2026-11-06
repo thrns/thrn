@@ -6,6 +6,7 @@ use std::{
 };
 
 use crc32fast::Hasher;
+use ring::digest::{Context, SHA256};
 use thiserror::Error;
 
 use crate::models::catalog::{CommitSha, SkillId, SkillName};
@@ -21,6 +22,7 @@ pub struct FileInventoryEntry {
     relative_path: PathBuf,
     expected_bytes: u64,
     expected_crc32: u32,
+    expected_sha256: [u8; 32],
 }
 
 impl FileInventoryEntry {
@@ -34,6 +36,11 @@ impl FileInventoryEntry {
 
     pub fn expected_crc32(&self) -> u32 {
         self.expected_crc32
+    }
+
+    /// SHA-256 of the validated staged bytes, reusable for copy verification and receipts.
+    pub fn expected_sha256(&self) -> &[u8; 32] {
+        &self.expected_sha256
     }
 }
 
@@ -76,6 +83,13 @@ impl StagedInventory {
 
     pub fn total_bytes(&self) -> u64 {
         self.total_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_sha256_for_test(&mut self) {
+        if let Some(file) = self.files.first_mut() {
+            file.expected_sha256[0] ^= 0xff;
+        }
     }
 }
 
@@ -122,6 +136,7 @@ struct ActualEntry {
     kind: ActualEntryKind,
     bytes: u64,
     crc32: u32,
+    sha256: [u8; 32],
 }
 
 /// Walk the private stage without following links and require an exact match with M2-02's
@@ -224,6 +239,7 @@ pub fn inspect_staged_skill(staged: &StagedSkill) -> Result<StagedInventory, Inv
                         kind: ActualEntryKind::Directory,
                         bytes: 0,
                         crc32: 0,
+                        sha256: [0; 32],
                     },
                 )?;
                 stack.push((relative, depth + 1));
@@ -236,7 +252,7 @@ pub fn inspect_staged_skill(staged: &StagedSkill) -> Result<StagedInventory, Inv
                     .checked_add(size)
                     .filter(|bytes| *bytes <= ArchiveLimits::DEFAULT.max_total_uncompressed_bytes)
                     .ok_or(InventoryError::LimitExceeded)?;
-                let (read_bytes, crc32) = read_file_crc32(&path, size)?;
+                let (read_bytes, crc32, sha256) = read_file_digests(&path, size)?;
                 if read_bytes != size {
                     return Err(InventoryError::SizeMismatch {
                         path: relative,
@@ -253,6 +269,7 @@ pub fn inspect_staged_skill(staged: &StagedSkill) -> Result<StagedInventory, Inv
                         kind: ActualEntryKind::File,
                         bytes: size,
                         crc32,
+                        sha256,
                     },
                 )?;
             } else {
@@ -301,6 +318,7 @@ pub fn inspect_staged_skill(staged: &StagedSkill) -> Result<StagedInventory, Inv
                 relative_path: path.clone(),
                 expected_bytes: actual_entry.bytes,
                 expected_crc32: actual_entry.crc32,
+                expected_sha256: actual_entry.sha256,
             });
         }
     }
@@ -394,7 +412,10 @@ fn path_key(path: &Path) -> Result<String, InventoryError> {
     Ok(components.join("/"))
 }
 
-fn read_file_crc32(path: &Path, expected_size: u64) -> Result<(u64, u32), InventoryError> {
+fn read_file_digests(
+    path: &Path,
+    expected_size: u64,
+) -> Result<(u64, u32, [u8; 32]), InventoryError> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -428,6 +449,7 @@ fn read_file_crc32(path: &Path, expected_size: u64) -> Result<(u64, u32), Invent
     }
 
     let mut hasher = Hasher::new();
+    let mut sha256 = Context::new(&SHA256);
     let mut total = 0_u64;
     let mut buffer = [0_u8; READ_CHUNK_BYTES];
     loop {
@@ -446,8 +468,12 @@ fn read_file_crc32(path: &Path, expected_size: u64) -> Result<(u64, u32), Invent
             .filter(|bytes| *bytes <= expected_size)
             .ok_or(InventoryError::LimitExceeded)?;
         hasher.update(&buffer[..read]);
+        sha256.update(&buffer[..read]);
     }
-    Ok((total, hasher.finalize()))
+    let digest = sha256.finish();
+    let mut digest_bytes = [0; 32];
+    digest_bytes.copy_from_slice(digest.as_ref());
+    Ok((total, hasher.finalize(), digest_bytes))
 }
 
 #[cfg(test)]

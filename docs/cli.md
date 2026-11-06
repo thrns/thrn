@@ -1,6 +1,6 @@
 # CLI contract
 
-This page describes the executable that exists today. The CLI supports offline catalog discovery and listing, explicit catalog refresh, a read-only THRN-managed installation listing, read-only local skill validation, `doctor`, and a read-only Codex project installation dry-run. Actual installation, durable receipts, configuration, completions, JSON output, and noninteractive options are not implemented.
+This page describes the executable that exists today. The CLI supports offline catalog discovery and listing, explicit catalog refresh, a read-only THRN-managed installation listing, read-only local skill validation, `doctor`, and a read-only Codex project installation dry-run. An internal M2-04 filesystem commit API is covered by Rust tests but is not called by the CLI. Public installation, durable receipts, rollback and crash recovery, configuration, completions, JSON output, and noninteractive options are not implemented.
 
 ## Available commands
 
@@ -53,9 +53,12 @@ and unreadable paths block the plan with an actionable diagnostic. Each inspecte
 bounded to 16,384 entries. THRN never assumes an existing skill is managed or overwrites, merges,
 renames, or removes existing content.
 
-This command is only a proposal. Filesystem inspection and any future installation are separate
-operations; M2-04 must recheck destination and staged-content assumptions immediately before
-writing, and time-of-check/time-of-use races remain possible.
+This command is only a proposal. Its temporary stage is dropped when planning returns. M2-04 adds
+an internal session API that keeps the stage alive with the plan, rechecks source and destination
+assumptions, verifies a destination-local copy with SHA-256, and commits the complete directory
+without replacing an existing object. The CLI deliberately does not call that API: M2-05 receipts
+and M2-06 recovery remain prerequisites for public installation. The dry-run output and mandatory
+`--dry-run` behavior are unchanged.
 
 ## Local skill validation
 

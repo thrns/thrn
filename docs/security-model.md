@@ -2,13 +2,13 @@
 
 ## Current exposure
 
-THRN is under development and has no supported installer release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, reads validated local catalog data, offers an explicit HTTPS catalog refresh, performs read-only local `SKILL.md` validation, checks the future receipt directory for installed listing, and provides a read-only Codex project install dry-run. Default discovery and both `skills list` modes never use the network. Explicit refresh contacts one fixed THRN-operated HTTPS endpoint, validates the response, and writes only the catalog cache. An install dry-run reads the local catalog without refreshing it, fetches the selected skill at its pinned public GitHub commit, validates and stages it privately, then prints a plan without changing the project. No retrieved content or subprocess is executed. The installed listing reads only THRN's application-data receipt directory: it does not inspect agent skill folders, create receipt storage, or interpret a provisional receipt format. Actual installation, durable receipts, target ownership, and rollback protections are not implemented; the dry-run does not provide those protections.
+THRN is under development and has no supported installer release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, reads validated local catalog data, offers an explicit HTTPS catalog refresh, performs read-only local `SKILL.md` validation, checks the future receipt directory for installed listing, and provides a read-only Codex project install dry-run. Default discovery and both `skills list` modes never use the network. Explicit refresh contacts one fixed THRN-operated HTTPS endpoint, validates the response, and writes only the catalog cache. An install dry-run reads the local catalog without refreshing it, fetches the selected skill at its pinned public GitHub commit, validates and stages it privately, then prints a plan without changing the project. The internal M2-04 commit API can prepare and atomically add a complete Codex project skill directory in isolated tests, but the CLI does not call it and still rejects installation without `--dry-run`. No retrieved content or subprocess is executed. The installed listing reads only THRN's application-data receipt directory: it does not inspect agent skill folders, create receipt storage, or interpret a provisional receipt format. Durable ownership receipts, public installation, rollback, and crash recovery are not implemented; the internal commit API does not provide them.
 
-## Boundaries required before installation
+## Boundaries required before public installation
 
 Registry metadata, GitHub responses, archives, skill files, and instructions inside `SKILL.md` must be treated as untrusted input. A skill is content for a compatible agent, not an instruction source for THRN. Installing or inspecting one must never implicitly invoke scripts, hooks, shells, package managers, or other retrieved code.
 
-Before an actual installation is implemented, source and filesystem handling must:
+Before the CLI enables installation, source and filesystem handling must:
 
 - Catalog refresh is limited to `https://raw.githubusercontent.com/thrns/thrn/main/src/registry/builtin-v1.json`; require HTTPS certificate verification, reject redirects, use explicit timeouts, and enforce the 1 MiB limit while streaming. Validate UTF-8 and the full catalog schema before caching. This endpoint is curated by THRN, but HTTPS and catalog inclusion do not authenticate or establish the safety of individual skill publishers. For later skill fetching, use public GitHub sources at exact, full commit hashes and independently validate source origin and immutable revision. A checksum from the same registry can detect accidental changes but does not prove publisher identity if that registry is compromised.
 - Bound network time, response size, archive size, expanded bytes, file count, per-file size, and path depth. Reject malformed metadata, absolute or traversal paths, drive/UNC prefixes, unsupported file types, case-fold collisions, and symlinks or hardlinks that escape the staging or target root.
@@ -18,7 +18,7 @@ Before an actual installation is implemented, source and filesystem handling mus
 - Avoid logging credentials, tokens, environment secrets, private skill content, or unnecessary personal paths. The v1 public-source workflow should not require a GitHub token. Any future credential support needs an explicit design and redaction tests.
 - Make supply-chain claims proportionate to evidence. Pinned commits identify source revisions, not author identity. Stronger publisher authenticity requires a separately reviewed signing or attestation design; do not imply that TLS or a same-origin digest provides it.
 
-M2-03 implements read-only destination checks and a proposal; it does not satisfy the write, ownership, receipt, atomicity, or recovery requirements above. `--dry-run` must remain mandatory until a separately reviewed task implements actual installation.
+M2-03 implements read-only destination checks and an immutable proposal. M2-04 adds an internal Codex project directory commit, but it does not provide receipts or recovery and is deliberately not connected to the CLI. `--dry-run` remains mandatory until the later ownership and recovery tasks are independently reviewed.
 
 ## Milestone status
 
@@ -187,9 +187,50 @@ Current implementation boundaries through M2-03:
   includes the source revision, resolved root, destination, directory list, complete regular-file
   list, sizes and totals, and a no-project-modification statement. Any conflict or failure exits
   nonzero without partial plan output. The stage is dropped and cleaned when planning returns.
-  Destination and stage inspection are separate operations, so concurrent same-user changes can
-  still race the snapshot; M2-04 must revalidate, and residual time-of-check/time-of-use limits
-  require review. The M2-03 command creates no `.agents/skills`, receipt, or project file.
+  The M2-03 command creates no `.agents/skills`, receipt, or project file; its temporary stage is
+  dropped when planning returns.
+
+### M2-04 internal prepared and committed directory installation
+
+The CLI remains dry-run-only. `src/install/command.rs` has an internal session path that retains the
+validated `StagedSkill`, its staged inventory and digests, and the corresponding immutable plan for
+the full commit operation. The session rejects mismatched catalog resource, skill name, source
+owner/repository/path/revision, target agent/scope, inventory, file list, or destination identity.
+The Codex adapter supports project scope only and addresses
+`<project-root>/.agents/skills/<skillName>` using the validated catalog `skillName`; IDs and aliases
+are never path components. It does not auto-detect targets or write global or other-agent paths.
+
+Before mutation, the engine rechecks the staged inventory and the project and destination snapshot,
+including directory identities where the OS exposes them. It opens project directories without
+following links, creates missing `.agents` and `skills` components one at a time, and revalidates
+their identities and listings. It rejects preexisting target objects and case-insensitive
+collisions, even if a caller claims ownership. Linux uses directory-relative `openat` calls with
+`O_NOFOLLOW`, and macOS uses the same no-follow directory-relative operations. Windows opens
+directories with `FILE_FLAG_OPEN_REPARSE_POINT`, checks reparse attributes and file identities, and
+uses a handle-relative final rename. These checks defend against ordinary path replacement and
+reparse-point substitution; they do not make arbitrary concurrent same-user filesystem activity a
+durable transaction or remove all filesystem-specific race conditions.
+
+The engine creates a random private staging directory inside the already inspected
+`.agents/skills` directory, so staging and final target are on the same filesystem. It copies only
+the planned regular files and directories, uses exclusive file creation and bounded 8 KiB reads,
+does not carry executable permissions forward, checks CRC-32 and byte counts, and compares a
+deterministic SHA-256 digest for each staged source and copied file. SHA-256 here checks copy
+integrity; it does not authenticate the publisher or source catalog. It verifies the prepared tree,
+rechecks the destination, then renames the complete directory without replacement. Linux requests
+`renameat2(RENAME_NOREPLACE)` and macOS requests `renameatx_np(RENAME_EXCL)` through rustix.
+Windows uses `SetFileInformationByHandle(FileRenameInfo)` with replacement disabled and a destination
+parent handle. A missing or unsupported no-replace primitive is an error; no replacement-capable
+fallback is used.
+
+Before the final rename, failures remove only files and directories the operation created inside its
+private staging directory, then remove newly created parent directories only if they are empty.
+Cleanup failures are reported in the structured error; unrelated project content is never
+recursively deleted. After a successful rename, the complete skill directory is visible. The rename
+does not guarantee disk durability, recover an abrupt process or machine crash, or make future
+receipt creation atomic with the directory. M2-05 adds durable receipts; M2-06 owns rollback and
+crash recovery. There is no provisional receipt in M2-04, and the internal engine is not a complete
+production-safe installer.
 
 ## Non-blocking M1-04 follow-up review
 

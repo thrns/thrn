@@ -60,6 +60,7 @@ pub struct PlannedFile {
     destination: PathBuf,
     expected_bytes: u64,
     expected_crc32: u32,
+    expected_sha256: [u8; 32],
 }
 
 impl PlannedFile {
@@ -78,6 +79,10 @@ impl PlannedFile {
     /// CRC-32 from the already validated archive manifest, for later stage revalidation.
     pub fn expected_crc32(&self) -> u32 {
         self.expected_crc32
+    }
+
+    pub fn expected_sha256(&self) -> &[u8; 32] {
+        &self.expected_sha256
     }
 }
 
@@ -249,6 +254,7 @@ pub fn build_install_plan(
             destination: file_destination,
             expected_bytes: file.expected_bytes(),
             expected_crc32: file.expected_crc32(),
+            expected_sha256: *file.expected_sha256(),
         });
     }
     if total_file_bytes != inventory.total_bytes() {
