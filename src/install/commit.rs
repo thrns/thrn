@@ -1475,7 +1475,7 @@ impl SecureDir {
     ) -> io::Result<()> {
         use std::{
             mem::{offset_of, size_of},
-            os::windows::io::AsRawHandle,
+            os::windows::{ffi::OsStrExt, io::AsRawHandle},
             ptr,
         };
         use windows_sys::Win32::{
@@ -1484,7 +1484,8 @@ impl SecureDir {
         };
         self.ensure_current_path()?;
         source.ensure_current_path()?;
-        let wide = new_name.encode_utf16().collect::<Vec<_>>();
+        let destination = self.path.join(new_name);
+        let wide = destination.as_os_str().encode_wide().collect::<Vec<_>>();
         let name_bytes = u32::try_from(wide.len().saturating_mul(size_of::<u16>()))
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target name too long"))?;
         let header_size = offset_of!(FILE_RENAME_INFO, FileName);
@@ -1506,8 +1507,8 @@ impl SecureDir {
                     Anonymous: windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO_0 {
                         Flags: 0,
                     },
-                    // The private stage and final name share this directory. Use the documented
-                    // same-directory form with a null root instead of resolving a relative name.
+                    // Use a fully qualified name with no root handle, so Windows cannot resolve a
+                    // simple name against the process working directory.
                     RootDirectory: ptr::null_mut::<std::ffi::c_void>() as HANDLE,
                     FileNameLength: name_bytes,
                     FileName: [0],
