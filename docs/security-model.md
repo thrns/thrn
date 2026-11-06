@@ -219,9 +219,9 @@ deterministic SHA-256 digest for each staged source and copied file. SHA-256 her
 integrity; it does not authenticate the publisher or source catalog. It verifies the prepared tree,
 rechecks the destination, then renames the complete directory without replacement. Linux requests
 `renameat2(RENAME_NOREPLACE)` and macOS requests `renameatx_np(RENAME_EXCL)` through rustix.
-Windows uses `SetFileInformationByHandle(FileRenameInfo)` with replacement disabled and a destination
-parent handle. A missing or unsupported no-replace primitive is an error; no replacement-capable
-fallback is used.
+Windows uses `SetFileInformationByHandle(FileRenameInfoEx)` with zero flags and a destination parent
+handle. Zero flags leave replacement disabled. A missing or unsupported no-replace primitive is an
+error; no replacement-capable fallback is used.
 
 Before the final rename, failures remove only files and directories the operation created inside its
 private staging directory, then remove newly created parent directories only if they are empty.

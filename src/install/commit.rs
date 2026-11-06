@@ -1480,9 +1480,7 @@ impl SecureDir {
         };
         use windows_sys::Win32::{
             Foundation::HANDLE,
-            Storage::FileSystem::{
-                FILE_RENAME_INFO, FILE_RENAME_INFO_0, FileRenameInfo, SetFileInformationByHandle,
-            },
+            Storage::FileSystem::{FILE_RENAME_INFO, FileRenameInfoEx, SetFileInformationByHandle},
         };
         self.ensure_current_path()?;
         source.ensure_current_path()?;
@@ -1491,8 +1489,9 @@ impl SecureDir {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target name too long"))?;
         let header_size = offset_of!(FILE_RENAME_INFO, FileName);
         // Include the struct's trailing alignment padding as well as its UTF-16 filename.
-        let byte_len = size_of::<FILE_RENAME_INFO>()
+        let byte_len = header_size
             .checked_add(name_bytes as usize)
+            .map(|len| len.max(size_of::<FILE_RENAME_INFO>()))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target name too long"))?;
         let words = byte_len.div_ceil(size_of::<usize>());
         let mut buffer = vec![0_usize; words];
@@ -1503,8 +1502,9 @@ impl SecureDir {
             ptr::write(
                 info,
                 FILE_RENAME_INFO {
-                    Anonymous: FILE_RENAME_INFO_0 {
-                        ReplaceIfExists: false,
+                    // FileRenameInfoEx with zero flags means replacement is disabled.
+                    Anonymous: windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO_0 {
+                        Flags: 0,
                     },
                     RootDirectory: self.file.as_raw_handle() as HANDLE,
                     FileNameLength: name_bytes,
@@ -1518,7 +1518,7 @@ impl SecureDir {
             );
             let result = SetFileInformationByHandle(
                 source.file.as_raw_handle() as HANDLE,
-                FileRenameInfo,
+                FileRenameInfoEx,
                 info.cast(),
                 u32::try_from(byte_len).map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidInput, "rename data too long")
