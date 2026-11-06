@@ -1506,7 +1506,9 @@ impl SecureDir {
                     Anonymous: windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO_0 {
                         Flags: 0,
                     },
-                    RootDirectory: self.file.as_raw_handle() as HANDLE,
+                    // The private stage and final name share this directory. Use the documented
+                    // same-directory form with a null root instead of resolving a relative name.
+                    RootDirectory: ptr::null_mut::<std::ffi::c_void>() as HANDLE,
                     FileNameLength: name_bytes,
                     FileName: [0],
                 },
@@ -1549,7 +1551,7 @@ fn open_windows_directory(path: &Path) -> io::Result<fs::File> {
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, SYNCHRONIZE,
     };
     let mut options = fs::OpenOptions::new();
     options
@@ -1560,6 +1562,7 @@ fn open_windows_directory(path: &Path) -> io::Result<fs::File> {
                 | FILE_READ_ATTRIBUTES
                 | FILE_ADD_FILE
                 | FILE_ADD_SUBDIRECTORY
+                | FILE_TRAVERSE
                 | DELETE
                 | SYNCHRONIZE,
         )
