@@ -154,6 +154,8 @@ pub(crate) fn windows_file_identity(file: &fs::File) -> io::Result<FileIdentity>
     };
     let mut information =
         windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `file` is a live OS file handle and `information` is a writable out parameter of
+    // the Win32 API's documented structure type.
     let result: BOOL =
         unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) };
     if result == 0 {

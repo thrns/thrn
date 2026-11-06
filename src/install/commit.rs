@@ -92,11 +92,12 @@ pub(crate) enum CommitError {
     #[error("this platform does not provide the required safe no-replace directory commit")]
     UnsupportedPlatform,
     #[error(
-        "installation failed during {operation:?} ({kind}); cleanup_complete={cleanup_complete}"
+        "installation failed during {operation:?} ({kind}, os_error={raw_os_error:?}); cleanup_complete={cleanup_complete}"
     )]
     Operation {
         operation: InstallOperation,
         kind: io::ErrorKind,
+        raw_os_error: Option<i32>,
         cleanup_complete: bool,
         cleanup_errors: Vec<(InstallOperation, io::ErrorKind)>,
     },
@@ -430,6 +431,7 @@ fn operation_error(
     CommitError::Operation {
         operation,
         kind: error.kind(),
+        raw_os_error: error.raw_os_error(),
         cleanup_complete,
         cleanup_errors,
     }
@@ -1488,12 +1490,15 @@ impl SecureDir {
         let name_bytes = u32::try_from(wide.len().saturating_mul(size_of::<u16>()))
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target name too long"))?;
         let header_size = offset_of!(FILE_RENAME_INFO, FileName);
-        let byte_len = header_size
+        // Include the struct's trailing alignment padding as well as its UTF-16 filename.
+        let byte_len = size_of::<FILE_RENAME_INFO>()
             .checked_add(name_bytes as usize)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target name too long"))?;
         let words = byte_len.div_ceil(size_of::<usize>());
         let mut buffer = vec![0_usize; words];
         let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        // SAFETY: `buffer` is pointer-aligned and sized for the struct plus the complete UTF-16
+        // filename. Both raw writes stay inside that allocation, and the handles remain live.
         unsafe {
             ptr::write(
                 info,
