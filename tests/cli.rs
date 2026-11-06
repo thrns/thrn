@@ -422,8 +422,13 @@ fn installed_listing_displays_valid_receipt_without_checking_project_content() {
     assert!(stdout.contains("creative-lab  uncharted-ideation"));
     assert!(stdout.contains("Agent: codex"));
     assert!(stdout.contains("Scope: project"));
+    let expected_destination = PathBuf::from(&project_root)
+        .join(".agents")
+        .join("skills")
+        .join("uncharted-ideation");
     assert!(stdout.contains(&format!(
-        "Project destination: {project_root}/.agents/skills/uncharted-ideation"
+        "Project destination: {}",
+        expected_destination.display()
     )));
     assert!(stdout.contains("Pinned revision: example-org/catalog-test-fixtures@2f68bee292a8c68346b4294fb31d9563eefe1ade"));
     assert!(
