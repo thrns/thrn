@@ -1874,9 +1874,11 @@ fn recover_temporary_receipt(
             "receipt temporary is not a regular file",
         ));
     }
-    let mut file = directory.open_regular_file(name).map_err(|error| {
-        recovery_conflict(record, format!("cannot inspect receipt temporary: {error}"))
-    })?;
+    let mut file = directory
+        .open_regular_file_for_rename(name)
+        .map_err(|error| {
+            recovery_conflict(record, format!("cannot inspect receipt temporary: {error}"))
+        })?;
     let len = file
         .metadata()
         .map_err(|error| {

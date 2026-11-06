@@ -1926,6 +1926,10 @@ impl SecureDir {
         Ok(file)
     }
 
+    pub(super) fn open_regular_file_for_rename(&self, name: &str) -> io::Result<fs::File> {
+        self.open_regular_file(name)
+    }
+
     pub(super) fn entries(&self) -> io::Result<Vec<(std::ffi::OsString, NodeKind)>> {
         self.ensure_current_path()?;
         use rustix::fs::{AtFlags, Dir, FileType, statat};
@@ -2253,6 +2257,29 @@ impl SecureDir {
         Ok(file)
     }
 
+    pub(super) fn open_regular_file_for_rename(&self, name: &str) -> io::Result<fs::File> {
+        self.ensure_current_path()?;
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
+        };
+        let mut options = fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .access_mode(DELETE | FILE_READ_ATTRIBUTES | FILE_READ_DATA | SYNCHRONIZE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+        let file = options.open(self.path.join(name))?;
+        if !file.metadata()?.is_file() || windows_reparse(&file.metadata()?) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "opened rename source is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+
     pub(super) fn entries(&self) -> io::Result<Vec<(std::ffi::OsString, NodeKind)>> {
         self.ensure_current_path()?;
         let mut result = Vec::new();
@@ -2549,6 +2576,12 @@ impl SecureDir {
         ))
     }
     pub(super) fn open_regular_file(&self, _name: &str) -> io::Result<fs::File> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unsupported platform",
+        ))
+    }
+    pub(super) fn open_regular_file_for_rename(&self, _name: &str) -> io::Result<fs::File> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "unsupported platform",
