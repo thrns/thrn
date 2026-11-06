@@ -12,6 +12,7 @@ use crate::{
 };
 
 use super::{
+    commit::InstallationSession,
     destination::{DestinationConflict, DestinationError, inspect_destination},
     inventory::{InventoryError, inspect_staged_skill},
     plan::{InstallPlan, PlanError, build_install_plan},
@@ -56,6 +57,30 @@ pub fn prepare_install_plan<T: GithubTransport + ?Sized>(
     transport: &T,
     tempdir_factory: &dyn TempDirFactory,
 ) -> Result<InstallPlan, InstallCommandError> {
+    Ok(prepare_install_session(
+        catalog,
+        identifier,
+        agent,
+        project,
+        current_directory,
+        transport,
+        tempdir_factory,
+    )?
+    .into_plan())
+}
+
+/// Prepare a commit-capable internal session that keeps the validated source alive alongside
+/// its immutable plan and inventory. The CLI continues to use `prepare_install_plan` for its
+/// read-only dry-run contract.
+pub(crate) fn prepare_install_session<T: GithubTransport + ?Sized>(
+    catalog: &Catalog,
+    identifier: &str,
+    agent: &str,
+    project: Option<&Path>,
+    current_directory: &Path,
+    transport: &T,
+    tempdir_factory: &dyn TempDirFactory,
+) -> Result<InstallationSession, InstallCommandError> {
     if agent != "codex" {
         return Err(InstallCommandError::UnsupportedAgent);
     }
@@ -65,7 +90,8 @@ pub fn prepare_install_plan<T: GithubTransport + ?Sized>(
     let inventory = inspect_staged_skill(&staged)?;
     let destination =
         inspect_destination(project, current_directory, staged.skill_name().as_str())?;
-    Ok(build_install_plan(&staged, &inventory, destination)?)
+    let plan = build_install_plan(&staged, &inventory, destination)?;
+    Ok(InstallationSession::new(staged, inventory, plan))
 }
 
 /// Render a complete successful plan into memory before the CLI writes one byte to stdout.

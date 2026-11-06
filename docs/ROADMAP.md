@@ -27,9 +27,9 @@ Source of truth: `THRN_PROJECT_SPEC.md` §§0–14. Implement a real vertical sl
 | M2-01 | M1-01, M1-03 | Hardened archive/path/file-type validator; reject traversal, Windows prefixes, symlink escapes, collisions, oversized archives, corruption |
 | M2-02 | M2-01, M1-04 | Public GitHub pinned-commit fetcher; restrictive host redirects/size/time bounds, exact directory extraction, isolated fake HTTP tests |
 | M2-03 | M1-02, M1-03 | Pure immutable install-plan builder; project target, collision detection, `--dry-run` prints exact changes and leaves filesystem unchanged |
-| M2-04 | M2-03, M2-01 | Codex project adapter and staged directory copy; verified multi-file install, externally managed destination rejected |
+| M2-04 | M2-03, M2-01 | Internal Codex project adapter with retained staging lifetime, destination revalidation, exclusive copy, SHA-256 verification, and platform no-replace directory commitment; CLI remains dry-run-only |
 | M2-05 | M2-04 | Durable schema-v1 receipt identity keyed by project/agent/resource; deterministic digest, atomic receipt write, corrupted receipt handling |
-| M2-06 | M2-05 | Recovery/rollback for partial or failed install; inject rename/write failure and verify no successful receipt or clobber |
+| M2-06 | M2-05 | Recovery/rollback for partial or failed install; inject rename/write failure and verify no successful receipt or clobber; only then consider enabling public installation |
 
 ## M3 — Lifecycle and agent coverage
 

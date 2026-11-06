@@ -25,7 +25,25 @@ pub struct DirectoryEntrySnapshot {
     kind: ObjectKind,
 }
 
+/// Stable identity for a directory observed during planning, where the platform exposes one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileIdentity {
+    volume: u64,
+    object: u64,
+}
+
+impl FileIdentity {
+    pub fn new(volume: u64, object: u64) -> Self {
+        Self { volume, object }
+    }
+}
+
 impl DirectoryEntrySnapshot {
+    #[allow(dead_code)]
+    pub(crate) fn new(name: std::ffi::OsString, kind: ObjectKind) -> Self {
+        Self { name, kind }
+    }
+
     pub fn name(&self) -> &std::ffi::OsStr {
         &self.name
     }
@@ -40,6 +58,10 @@ pub trait DestinationFileSystem: Send + Sync {
     fn object_kind(&self, path: &Path) -> io::Result<ObjectKind>;
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf>;
     fn read_directory(&self, path: &Path) -> io::Result<Vec<DirectoryEntrySnapshot>>;
+
+    fn object_identity(&self, _path: &Path) -> io::Result<Option<FileIdentity>> {
+        Ok(None)
+    }
 }
 
 /// Standard-library filesystem adapter. All object checks use `symlink_metadata`.
@@ -48,12 +70,11 @@ pub struct RealDestinationFileSystem;
 impl DestinationFileSystem for RealDestinationFileSystem {
     fn object_kind(&self, path: &Path) -> io::Result<ObjectKind> {
         let metadata = fs::symlink_metadata(path)?;
-        let file_type = metadata.file_type();
-        Ok(if file_type.is_symlink() {
+        Ok(if metadata_is_link_or_reparse(&metadata) {
             ObjectKind::Symlink
-        } else if file_type.is_dir() {
+        } else if metadata.is_dir() {
             ObjectKind::Directory
-        } else if file_type.is_file() {
+        } else if metadata.is_file() {
             ObjectKind::RegularFile
         } else {
             ObjectKind::Other
@@ -74,12 +95,12 @@ impl DestinationFileSystem for RealDestinationFileSystem {
                 ));
             }
             let entry = entry?;
-            let file_type = entry.file_type()?;
-            let kind = if file_type.is_symlink() {
+            let metadata = fs::symlink_metadata(entry.path())?;
+            let kind = if metadata_is_link_or_reparse(&metadata) {
                 ObjectKind::Symlink
-            } else if file_type.is_dir() {
+            } else if metadata.is_dir() {
                 ObjectKind::Directory
-            } else if file_type.is_file() {
+            } else if metadata.is_file() {
                 ObjectKind::RegularFile
             } else {
                 ObjectKind::Other
@@ -91,6 +112,74 @@ impl DestinationFileSystem for RealDestinationFileSystem {
         }
         Ok(snapshots)
     }
+
+    fn object_identity(&self, path: &Path) -> io::Result<Option<FileIdentity>> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = fs::symlink_metadata(path)?;
+            return Ok(Some(FileIdentity::new(metadata.dev(), metadata.ino())));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            };
+            let mut options = fs::OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+            let file = options.open(path)?;
+            let opened_metadata = file.metadata()?;
+            if metadata_is_link_or_reparse(&opened_metadata) || !opened_metadata.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "directory changed while reading its identity",
+                ));
+            }
+            return windows_file_identity(&file).map(Some);
+        }
+        #[allow(unreachable_code)]
+        Ok(None)
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_file_identity(file: &fs::File) -> io::Result<FileIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::{
+        Win32::{Foundation::HANDLE, Storage::FileSystem::GetFileInformationByHandle},
+        core::BOOL,
+    };
+    let mut information =
+        windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `file` is a live OS file handle and `information` is a writable out parameter of
+    // the Win32 API's documented structure type.
+    let result: BOOL =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Ok(FileIdentity::new(
+        u64::from(information.dwVolumeSerialNumber),
+        index,
+    ))
+}
+
+fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        return metadata.file_attributes() & 0x400 != 0;
+    }
+    #[allow(unreachable_code)]
+    false
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -156,8 +245,11 @@ impl DestinationConflict {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DestinationSnapshot {
     project_root: PathBuf,
+    project_identity: Option<FileIdentity>,
     agents_state: ComponentState,
+    agents_identity: Option<FileIdentity>,
     skills_state: ComponentState,
+    skills_identity: Option<FileIdentity>,
     skill_state: ComponentState,
     destination: PathBuf,
     existing_project_entries: Vec<DirectoryEntrySnapshot>,
@@ -171,6 +263,10 @@ impl DestinationSnapshot {
         &self.project_root
     }
 
+    pub fn project_identity(&self) -> Option<FileIdentity> {
+        self.project_identity
+    }
+
     pub fn destination(&self) -> &Path {
         &self.destination
     }
@@ -179,8 +275,16 @@ impl DestinationSnapshot {
         self.agents_state
     }
 
+    pub fn agents_identity(&self) -> Option<FileIdentity> {
+        self.agents_identity
+    }
+
     pub fn skills_state(&self) -> ComponentState {
         self.skills_state
+    }
+
+    pub fn skills_identity(&self) -> Option<FileIdentity> {
+        self.skills_identity
     }
 
     pub fn skill_state(&self) -> ComponentState {
@@ -295,6 +399,9 @@ pub fn inspect_destination_with_file_system(
             return Err(DestinationError::MissingProjectDirectory { path: project_root });
         }
     }
+    let project_identity = file_system
+        .object_identity(&project_root)
+        .map_err(|error| filesystem_error("identify", &project_root, error))?;
 
     let agents = project_root.join(".agents");
     let skills = agents.join("skills");
@@ -312,6 +419,13 @@ pub fn inspect_destination_with_file_system(
         &mut conflicts,
     );
     let agents_state = component_state(file_system, &agents)?;
+    let agents_identity = if agents_state == ComponentState::Directory {
+        file_system
+            .object_identity(&agents)
+            .map_err(|error| filesystem_error("identify", &agents, error))?
+    } else {
+        None
+    };
     if is_unsafe_component(agents_state) {
         conflicts.push(unsafe_component_conflict(&agents));
     }
@@ -325,6 +439,13 @@ pub fn inspect_destination_with_file_system(
         ComponentState::Directory => component_state(file_system, &skills)?,
         ComponentState::Missing => ComponentState::Missing,
         _ => ComponentState::NotInspected,
+    };
+    let skills_identity = if skills_state == ComponentState::Directory {
+        file_system
+            .object_identity(&skills)
+            .map_err(|error| filesystem_error("identify", &skills, error))?
+    } else {
+        None
     };
     if is_unsafe_component(skills_state) {
         conflicts.push(unsafe_component_conflict(&skills));
@@ -387,8 +508,11 @@ pub fn inspect_destination_with_file_system(
 
     Ok(DestinationSnapshot {
         project_root,
+        project_identity,
         agents_state,
+        agents_identity,
         skills_state,
+        skills_identity,
         skill_state,
         destination,
         existing_project_entries,

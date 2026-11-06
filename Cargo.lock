@@ -699,6 +699,8 @@ dependencies = [
  "crc32fast",
  "directories",
  "libc",
+ "ring",
+ "rustix",
  "serde",
  "serde-saphyr",
  "serde_json",
@@ -706,6 +708,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "ureq",
+ "windows-sys 0.61.2",
  "zip",
 ]
 
