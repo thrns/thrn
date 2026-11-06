@@ -182,8 +182,8 @@ and orders entries by canonical ID. Its output identifies the selected source an
 An empty catalog is reported as an empty catalog; it does not trigger a refresh. The no-query form
 of `thrn skills search` remains supported and displays every catalog entry.
 
-`thrn skills list --installed` has a separate meaning: it checks for THRN-managed installations
-only. Receipt storage is planned under the OS application-data directory returned by
+`thrn skills list --installed` has a separate meaning: it lists validated THRN-managed installations
+only. Receipt storage is under the OS application-data directory returned by
 `directories::ProjectDirs::from("im", "thrn", "thrn")`, in a `receipts` subdirectory:
 
 | Platform | Application-data directory |
@@ -196,10 +196,12 @@ only. Receipt storage is planned under the OS application-data directory returne
 then its `receipts` child. This is separate from the catalog cache. A missing or empty receipt
 directory prints `No THRN-managed installations are recorded.` and does not inspect Codex, Claude,
 Cursor, Gemini, or any other agent directory. It also does not create the application-data or
-receipt directories. If receipt storage already contains any content, this milestone reports an
-error because its format is not yet recognized. Durable receipt schema and ownership are deferred
-to M2-05; catalog entries are never presented as installed records. Installation support has not
-been implemented.
+receipt directories. Valid schema-v1 records show the canonical resource ID, actual skill directory
+name, agent, scope, project destination, pinned revision, and state that current content integrity
+was not checked. Corrupt, unsupported, duplicated, conflicting, linked, nonregular, or unknown
+receipt storage is an explicit error. Listing never fetches the catalog or opens project paths;
+catalog entries are never presented as installed records. Public installation support has not been
+implemented. See [the receipt schema and storage contract](receipts.md).
 
 ## Local Agent Skills validation
 

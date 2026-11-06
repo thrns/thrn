@@ -1,6 +1,6 @@
 # CLI contract
 
-This page describes the executable that exists today. The CLI supports offline catalog discovery and listing, explicit catalog refresh, a read-only THRN-managed installation listing, read-only local skill validation, `doctor`, and a read-only Codex project installation dry-run. An internal M2-04 filesystem commit API is covered by Rust tests but is not called by the CLI. Public installation, durable receipts, rollback and crash recovery, configuration, completions, JSON output, and noninteractive options are not implemented.
+This page describes the executable that exists today. The CLI supports offline catalog discovery and listing, explicit catalog refresh, a read-only THRN-managed installation listing backed by durable schema-v1 receipts, read-only local skill validation, `doctor`, and a read-only Codex project installation dry-run. The internal M2-04/M2-05 commit-and-receipt API is covered by Rust tests but is not called by the CLI. Public installation, coordinated rollback and crash recovery, configuration, completions, JSON output, and noninteractive options are not implemented.
 
 ## Available commands
 
@@ -11,7 +11,7 @@ This page describes the executable that exists today. The CLI supports offline c
 | `thrn doctor` | Print version, reported OS and architecture, and the scope of checks performed. It does not perform filesystem or network checks. |
 | `thrn doctor --help` | Print help for the `doctor` subcommand. |
 | `thrn skills list` | List all catalog skills in canonical ID order, using a validated local cache or bundled metadata. Never uses the network. |
-| `thrn skills list --installed` | List THRN-managed installations from receipt storage. Missing or empty storage is a successful empty result; unsupported content is an error. Never uses the network or writes files. |
+| `thrn skills list --installed` | List validated THRN-managed installation receipts. Missing or empty storage is a successful empty result; corrupt, unsupported, duplicated, conflicting, linked, or unknown content is an error. Shows recorded ownership and says current content integrity was not checked. Never uses the network or writes files. |
 | `thrn skills search [query]` | Search the newest valid local catalog cache, or bundled metadata if no valid cache exists. Omit the query to list all entries. Never uses the network. |
 | `thrn skills search --refresh [query]` | Fetch and validate the fixed trusted HTTPS catalog, atomically update the cache, and search the refreshed data. |
 | `thrn skills info <id>` | Show curated metadata from the newest locally available validated catalog for an exact canonical ID or explicit alias. Never uses the network. |
@@ -23,7 +23,7 @@ The root parser requires a subcommand. Clap also supplies its normal short-help 
 
 ## Output and exit status
 
-Successful help, version, doctor, list, search, info, validation, and conflict-free dry-run output goes to stdout and exits `0`. Empty catalog and empty managed-installation states are successful. A search with no matches is also an informative successful result. Catalog list, search, and info identify their selected catalog source (`local cache` or `bundled metadata`) and freshness (`fresh`, `stale`, or `unknown`). Cache problems that permit bundled fallback are reported on stderr; discovery still succeeds. Installed listing says only whether THRN-managed installations are recorded; it does not inspect manually installed skills. Clap usage errors, including missing required arguments, unknown commands, and invalid options, go to stderr and exit `2`. Invalid lookup identifiers, unknown IDs, unsupported receipt content, destination conflicts or inspection failures, skill validation errors, fetch failures, refresh failures, cache replacement failures, missing `--dry-run`, unsupported agents, and output I/O failures go to stderr and exit `1`. A failed operation writes no partial plan to stdout.
+Successful help, version, doctor, list, search, info, validation, and conflict-free dry-run output goes to stdout and exits `0`. Empty catalog and empty managed-installation states are successful. A search with no matches is also an informative successful result. Catalog list, search, and info identify their selected catalog source (`local cache` or `bundled metadata`) and freshness (`fresh`, `stale`, or `unknown`). Cache problems that permit bundled fallback are reported on stderr; discovery still succeeds. Installed listing reports validated receipt-backed ownership and explicitly labels current content integrity as unchecked; it does not inspect manually installed skills or open project paths. Clap usage errors, including missing required arguments, unknown commands, and invalid options, go to stderr and exit `2`. Invalid lookup identifiers, unknown IDs, corrupt or unsupported receipts, ownership conflicts, destination conflicts or inspection failures, skill validation errors, fetch failures, refresh failures, cache replacement failures, missing `--dry-run`, unsupported agents, and output I/O failures go to stderr and exit `1`. A failed operation writes no partial plan to stdout.
 
 ### Installation dry-run
 
@@ -56,9 +56,10 @@ renames, or removes existing content.
 This command is only a proposal. Its temporary stage is dropped when planning returns. M2-04 adds
 an internal session API that keeps the stage alive with the plan, rechecks source and destination
 assumptions, verifies a destination-local copy with SHA-256, and commits the complete directory
-without replacing an existing object. The CLI deliberately does not call that API: M2-05 receipts
-and M2-06 recovery remain prerequisites for public installation. The dry-run output and mandatory
-`--dry-run` behavior are unchanged.
+without replacing an existing object. M2-05 adds an internal post-commit receipt boundary and
+receipt-backed listing. The CLI deliberately does not call the commit-and-receipt API: M2-06
+coordinated rollback and recovery remain prerequisites for public installation. The dry-run output
+and mandatory `--dry-run` behavior are unchanged.
 
 ## Local skill validation
 
@@ -92,7 +93,7 @@ modify, or execute supporting files.
 
 Default `skills list`, `skills search`, and `skills info` are offline. They try the validated cache first, then the embedded catalog. Cached data is fresh through 24 hours after its successful refresh; older cache remains usable and is labeled stale. A missing, corrupt, incompatible, or invalid cache falls back to bundled metadata. The fallback does not trigger a refresh. The cache lives in the OS-standard application cache directory: Linux uses `$XDG_CACHE_HOME/thrn` or `~/.cache/thrn`, macOS uses `~/Library/Caches/im.thrn.thrn`, and Windows uses `%LOCALAPPDATA%/thrn/thrn/cache`. Set `THRN_CACHE_DIR` to an alternate absolute directory when needed; it changes only the local cache path. The file is named `catalog-v1.cache`.
 
-`skills list --installed` checks only `<application-data-directory>/receipts`, resolved by `directories::ProjectDirs::from("im", "thrn", "thrn")`. `THRN_DATA_DIR` can select an alternate absolute application-data root; THRN checks its `receipts` child and never creates it. Missing or empty storage reports that no THRN-managed installations are recorded. Any content currently fails clearly because the receipt schema and ownership model are deferred to M2-05. Skills present in agent folders outside THRN are not checked. This command does not invoke catalog discovery and does not need a catalog cache.
+`skills list --installed` reads only `<application-data-directory>/receipts`, resolved by `directories::ProjectDirs::from("im", "thrn", "thrn")`. `THRN_DATA_DIR` can select an alternate absolute application-data root; THRN checks its `receipts` child and never creates it. Missing or empty storage reports that no THRN-managed installations are recorded. Valid schema-v1 receipts display the canonical resource ID, actual skill directory name, agent, scope, project destination, pinned revision, and an explicit `current content integrity: not checked` status. Unknown, corrupt, unsupported, duplicated, conflicting, linked, or nonregular receipt storage fails closed. Skills present in agent folders outside THRN are not checked. This command does not invoke catalog discovery and does not need a catalog cache. See [receipt design](receipts.md).
 
 `thrn skills search --refresh [query]` is the catalog-refresh network path. It fetches only `https://raw.githubusercontent.com/thrns/thrn/main/src/registry/builtin-v1.json`. The request requires HTTPS certificate verification, follows no redirects, uses connection/body/overall timeouts, and reads no more than 1 MiB. The response must be UTF-8 and pass the catalog schema validator before it is persisted. A failed request, response validation, or cache commit exits nonzero on stderr. A failed commit leaves the earlier cache intact. The refresh command never fetches skill directories or executes catalog or skill content. `skills install --dry-run` separately fetches only the selected resource's pinned GitHub archive through the M2-02 source pipeline.
 

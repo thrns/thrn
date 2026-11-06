@@ -127,10 +127,36 @@ fn install_skill(
 
 fn list_skills(installed: bool) -> Result<()> {
     if installed {
-        ReceiptStore::for_system()?.require_empty()?;
-        return write_stdout(
-            "THRN-managed installations\nNo THRN-managed installations are recorded.\nSkills installed outside THRN are not included.\n",
-        );
+        let receipts = ReceiptStore::for_system()?.list()?;
+        if receipts.is_empty() {
+            return write_stdout(
+                "THRN-managed installations\nNo THRN-managed installations are recorded.\nSkills installed outside THRN are not included.\n",
+            );
+        }
+        let mut output = String::from("THRN-managed installations\n");
+        for receipt in receipts {
+            output.push_str(receipt.catalog_resource_id());
+            output.push_str("  ");
+            output.push_str(receipt.skill_name());
+            output.push('\n');
+            output.push_str(&format!("  Agent: {}\n", receipt.agent()));
+            output.push_str(&format!("  Scope: {}\n", receipt.scope()));
+            output.push_str(&format!(
+                "  Project destination: {}\n",
+                receipt.destination_path().display()
+            ));
+            output.push_str(&format!(
+                "  Pinned revision: {}/{}@{}\n",
+                receipt.source_owner(),
+                receipt.source_repository(),
+                receipt.source_commit()
+            ));
+            output.push_str(
+                "  Ownership: recorded by THRN; current content integrity: not checked.\n",
+            );
+        }
+        output.push_str("Skills installed outside THRN are not included.\n");
+        return write_stdout(&output);
     }
 
     let selection = CatalogService::for_system().discover()?;

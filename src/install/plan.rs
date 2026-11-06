@@ -6,7 +6,9 @@ use std::{
 use thiserror::Error;
 
 use crate::{
-    models::catalog::{CommitSha, GithubOwner, GithubRepository, SkillId, SkillName, SourcePath},
+    models::catalog::{
+        CommitSha, GithubOwner, GithubRepository, ResourceVersion, SkillId, SkillName, SourcePath,
+    },
     sources::staging::StagedSkill,
 };
 
@@ -92,6 +94,7 @@ impl PlannedFile {
 pub struct InstallPlan {
     resource_id: SkillId,
     skill_name: SkillName,
+    resource_version: ResourceVersion,
     source_owner: GithubOwner,
     source_repository: GithubRepository,
     source_commit: CommitSha,
@@ -114,6 +117,10 @@ impl InstallPlan {
 
     pub fn skill_name(&self) -> &SkillName {
         &self.skill_name
+    }
+
+    pub fn resource_version(&self) -> &ResourceVersion {
+        &self.resource_version
     }
 
     pub fn source_owner(&self) -> &GithubOwner {
@@ -265,6 +272,7 @@ pub fn build_install_plan(
     Ok(InstallPlan {
         resource_id: staged.catalog_id().clone(),
         skill_name: staged.skill_name().clone(),
+        resource_version: staged.resource_version().clone(),
         source_owner: source.owner().clone(),
         source_repository: source.repository().clone(),
         source_commit: staged.revision().clone(),
