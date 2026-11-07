@@ -560,7 +560,7 @@ mod install_tests {
     impl TempDirFactory for TestFactory {
         fn create_private(&self) -> io::Result<TempDir> {
             tempfile::Builder::new()
-                .prefix("thrn-cli-install-stage-")
+                .prefix("m207-stage-")
                 .tempdir_in(&self.0)
         }
     }
@@ -594,10 +594,10 @@ mod install_tests {
             // Match the receipt-store fixture's canonical temp root so no-follow checks see a
             // stable path on macOS and Windows.
             let root_path = root.path().canonicalize().expect("canonical fixture root");
-            let current = root_path.join("workspace");
+            let current = root_path.join("project");
             let project = current.clone();
             let staging = root_path.join("staging");
-            let data = root_path.join("thrn-data");
+            let data = root_path.join("data");
             fs::create_dir(&current).expect("workspace");
             fs::create_dir(&staging).expect("staging parent");
             let catalog = parse_catalog_json(include_bytes!(
