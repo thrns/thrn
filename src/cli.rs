@@ -595,10 +595,11 @@ mod install_tests {
             let current = root_path.join("workspace");
             let project = current.clone();
             let staging = root_path.join("staging");
-            let data = root_path.join("thrn-data");
+            let data_path = root_path.join("thrn-data");
             fs::create_dir(&current).expect("workspace");
             fs::create_dir(&staging).expect("staging parent");
-            fs::create_dir(&data).expect("isolated THRN application-data root");
+            fs::create_dir(&data_path).expect("isolated THRN application-data root");
+            let data = data_path.canonicalize().expect("canonical THRN data root");
             let catalog = parse_catalog_json(include_bytes!(
                 "../tests/fixtures/catalog/test-only-valid-v1.json"
             ))
