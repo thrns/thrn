@@ -21,6 +21,10 @@ use super::{
         ComponentState, DestinationSnapshot, FileIdentity, ObjectKind, inspect_destination,
     },
     inventory::{StagedInventory, inspect_staged_skill},
+    journal::{
+        JournalError, JournalFaultInjector, NoJournalFaults, OperationJournal, OperationState,
+        new_staging_name,
+    },
     plan::{InstallAgent, InstallPlan, InstallScope},
 };
 
@@ -47,6 +51,10 @@ impl InstallationSession {
         &self.plan
     }
 
+    pub(crate) fn inventory(&self) -> &StagedInventory {
+        &self.inventory
+    }
+
     pub(crate) fn into_plan(self) -> InstallPlan {
         self.plan
     }
@@ -61,6 +69,23 @@ impl InstallationSession {
         installed_at_unix_seconds: u64,
         commit_faults: &dyn InstallFaultInjector,
         receipt_faults: &dyn super::receipt_store::ReceiptFaultInjector,
+    ) -> Result<super::receipt::InstallationReceipt, InstallationCompletionError> {
+        self.commit_and_record_at_with_journal(
+            store,
+            installed_at_unix_seconds,
+            commit_faults,
+            receipt_faults,
+            &NoJournalFaults,
+        )
+    }
+
+    pub(crate) fn commit_and_record_at_with_journal(
+        &self,
+        store: &super::receipt_store::ReceiptStore,
+        installed_at_unix_seconds: u64,
+        commit_faults: &dyn InstallFaultInjector,
+        receipt_faults: &dyn super::receipt_store::ReceiptFaultInjector,
+        journal_faults: &dyn JournalFaultInjector,
     ) -> Result<super::receipt::InstallationReceipt, InstallationCompletionError> {
         let project_identity = self
             .plan
@@ -81,21 +106,69 @@ impl InstallationSession {
                 },
             )
         })?;
-        let reservation = store
+        store
+            .recover_with_faults(journal_faults, receipt_faults)
+            .map_err(InstallationCompletionError::Recovery)?;
+        let journal_receipt = receipt.clone();
+        let mut reservation = store
             .reserve(receipt, receipt_faults)
             .map_err(InstallationCompletionError::ReceiptPreflight)?;
-        let committed = match commit_session(self, commit_faults) {
-            Ok(committed) => committed,
-            Err(commit_error) => {
-                reservation
-                    .release()
-                    .map_err(InstallationCompletionError::ReceiptCleanup)?;
-                return Err(InstallationCompletionError::Commit(commit_error));
-            }
-        };
-        reservation
+        let staging_name = new_staging_name()
+            .map_err(|error| InstallationCompletionError::JournalPrepareIo(error.kind()))?;
+        let journal_store = store
+            .journal_store()
+            .map_err(InstallationCompletionError::ReceiptPreflight)?;
+        let create_agents_directory =
+            self.plan.destination_snapshot().agents_state() == ComponentState::Missing;
+        let create_skills_directory =
+            self.plan.destination_snapshot().skills_state() == ComponentState::Missing;
+        let mut journal = journal_store
+            .prepare(
+                super::journal::JournalIntent {
+                    receipt: journal_receipt,
+                    staging_name,
+                    create_agents_directory,
+                    create_skills_directory,
+                    agents_identity: self.plan.destination_snapshot().agents_identity(),
+                    skills_identity: self.plan.destination_snapshot().skills_identity(),
+                },
+                journal_faults,
+            )
+            .map_err(InstallationCompletionError::JournalBeforeCommit)?;
+        journal
+            .transition(OperationState::FilesystemCommitInProgress, journal_faults)
+            .map_err(InstallationCompletionError::JournalBeforeCommit)?;
+        let committed =
+            match commit_session_journaled(self, commit_faults, &mut journal, journal_faults) {
+                Ok(committed) => committed,
+                Err(commit_error) => return Err(InstallationCompletionError::Commit(commit_error)),
+            };
+        journal
+            .set_destination_identity(committed.destination_identity(), journal_faults)
+            .map_err(InstallationCompletionError::JournalAfterDirectoryCommit)?;
+        journal
+            .transition(OperationState::DirectoryCommitVerified, journal_faults)
+            .map_err(InstallationCompletionError::JournalAfterDirectoryCommit)?;
+        journal
+            .transition(OperationState::ReceiptPublicationPending, journal_faults)
+            .map_err(InstallationCompletionError::JournalAfterDirectoryCommit)?;
+        let published = reservation
             .publish(&committed, receipt_faults)
-            .map_err(InstallationCompletionError::ReceiptAfterCommit)
+            .map_err(InstallationCompletionError::ReceiptAfterCommit)?;
+        journal
+            .transition(OperationState::ReceiptPublished, journal_faults)
+            .map_err(InstallationCompletionError::JournalAfterReceipt)?;
+        journal
+            .transition(OperationState::Complete, journal_faults)
+            .map_err(InstallationCompletionError::JournalAfterReceipt)?;
+        let operation_id = journal.record().operation_id().to_owned();
+        journal_store
+            .cleanup_completed(&operation_id, journal_faults)
+            .map_err(InstallationCompletionError::JournalAfterReceipt)?;
+        reservation
+            .release()
+            .map_err(InstallationCompletionError::ReceiptAfterCommit)?;
+        Ok(published)
     }
 
     pub(crate) fn commit_and_record(
@@ -129,6 +202,16 @@ pub(crate) enum InstallationCompletionError {
     ReceiptAfterCommit(#[source] super::receipt_store::ReceiptStoreError),
     #[error("installation commit failed and receipt-store lock cleanup also failed: {0}")]
     ReceiptCleanup(#[source] super::receipt_store::ReceiptStoreError),
+    #[error("installation journal could not be prepared before project changes: {0}")]
+    JournalBeforeCommit(#[source] JournalError),
+    #[error("installation directory was committed but its journal could not be updated: {0}")]
+    JournalAfterDirectoryCommit(#[source] JournalError),
+    #[error("receipt was published but the operation journal could not be finalized: {0}")]
+    JournalAfterReceipt(#[source] JournalError),
+    #[error("interrupted installation recovery failed: {0}")]
+    Recovery(#[source] super::receipt_store::RecoveryError),
+    #[error("operating-system random source failed while preparing the staging name ({0})")]
+    JournalPrepareIo(io::ErrorKind),
     #[error("system clock is before the Unix epoch")]
     Clock,
 }
@@ -172,10 +255,18 @@ pub(crate) enum InstallOperation {
     CommitNoReplace,
     RemoveFile,
     RemoveDirectory,
+    SyncParentDirectory,
+    SyncStagingDirectory,
+    SyncStagedFile,
+    SyncDestinationDirectory,
 }
 
 pub(crate) trait InstallFaultInjector: Send + Sync {
     fn before(&self, _operation: InstallOperation) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn after(&self, _operation: InstallOperation) -> io::Result<()> {
         Ok(())
     }
 }
@@ -199,6 +290,8 @@ pub(crate) enum CommitError {
         "installation directory was committed but could not be reopened for receipt verification"
     )]
     CommittedButUnverified,
+    #[error("installation journal update failed: {0}")]
+    Journal(#[source] JournalError),
     #[error(
         "installation failed during {operation:?} ({kind}, os_error={raw_os_error:?}); cleanup_complete={cleanup_complete}"
     )]
@@ -214,6 +307,30 @@ pub(crate) enum CommitError {
 fn commit_session(
     session: &InstallationSession,
     faults: &dyn InstallFaultInjector,
+) -> Result<CommittedInstallation, CommitError> {
+    commit_session_inner(session, faults, None)
+}
+
+fn commit_session_journaled(
+    session: &InstallationSession,
+    faults: &dyn InstallFaultInjector,
+    journal: &mut OperationJournal,
+    journal_faults: &dyn JournalFaultInjector,
+) -> Result<CommittedInstallation, CommitError> {
+    commit_session_inner(
+        session,
+        faults,
+        Some(CommitJournal {
+            journal,
+            faults: journal_faults,
+        }),
+    )
+}
+
+fn commit_session_inner(
+    session: &InstallationSession,
+    faults: &dyn InstallFaultInjector,
+    mut journal: Option<CommitJournal<'_>>,
 ) -> Result<CommittedInstallation, CommitError> {
     validate_session_identity(session)?;
     if !session.plan.conflicts().is_empty() {
@@ -267,9 +384,10 @@ fn commit_session(
         Err(error) => {
             let mut cleanup_errors = Vec::new();
             if created_agents {
-                remove_empty_child(
+                remove_empty_child_if_identity(
                     &project,
                     ".agents",
+                    agents.identity().ok(),
                     InstallOperation::RemoveDirectory,
                     faults,
                     &mut cleanup_errors,
@@ -301,10 +419,28 @@ fn commit_session(
         created_skills,
     };
 
+    let mut recovery_cleanup_required = false;
+    if let Some(journal) = journal.as_mut() {
+        journal.set_created_parent_identities(
+            Some(agents.identity().map_err(|error| {
+                operation_error(InstallOperation::CreateParentDirectory, error, true, vec![])
+            })?),
+            Some(skills.identity().map_err(|error| {
+                operation_error(InstallOperation::CreateParentDirectory, error, true, vec![])
+            })?),
+        )?;
+        recovery_cleanup_required = true;
+    }
+
     verify_parent_names(&project, ".agents")
         .and_then(|()| verify_parent_names(&agents, "skills"))
         .map_err(|error| {
-            let cleanup = cleanup_parents(&mut created_parents, faults);
+            let cleanup = cleanup_failed_commit(
+                &mut created_parents,
+                None,
+                faults,
+                recovery_cleanup_required,
+            );
             operation_error(
                 InstallOperation::CreateParentDirectory,
                 error,
@@ -314,7 +450,12 @@ fn commit_session(
         })?;
 
     let root_identity = project.identity().map_err(|error| {
-        let cleanup = cleanup_parents(&mut created_parents, faults);
+        let cleanup = cleanup_failed_commit(
+            &mut created_parents,
+            None,
+            faults,
+            recovery_cleanup_required,
+        );
         operation_error(
             InstallOperation::CreateParentDirectory,
             error,
@@ -323,7 +464,12 @@ fn commit_session(
         )
     })?;
     let agents_identity = agents.identity().map_err(|error| {
-        let cleanup = cleanup_parents(&mut created_parents, faults);
+        let cleanup = cleanup_failed_commit(
+            &mut created_parents,
+            None,
+            faults,
+            recovery_cleanup_required,
+        );
         operation_error(
             InstallOperation::CreateParentDirectory,
             error,
@@ -332,7 +478,12 @@ fn commit_session(
         )
     })?;
     let skills_identity = skills.identity().map_err(|error| {
-        let cleanup = cleanup_parents(&mut created_parents, faults);
+        let cleanup = cleanup_failed_commit(
+            &mut created_parents,
+            None,
+            faults,
+            recovery_cleanup_required,
+        );
         operation_error(
             InstallOperation::CreateParentDirectory,
             error,
@@ -347,7 +498,12 @@ fn commit_session(
         session.plan.skill_name().as_str(),
     )
     .map_err(|_| {
-        let cleanup = cleanup_parents(&mut created_parents, faults);
+        let cleanup = cleanup_failed_commit(
+            &mut created_parents,
+            None,
+            faults,
+            recovery_cleanup_required,
+        );
         operation_error(
             InstallOperation::CreateParentDirectory,
             io::Error::other("destination revalidation failed"),
@@ -365,7 +521,12 @@ fn commit_session(
         || latest.agents_identity() != Some(agents_identity)
         || latest.skills_identity() != Some(skills_identity)
     {
-        let cleanup = cleanup_parents(&mut created_parents, faults);
+        let cleanup = cleanup_failed_commit(
+            &mut created_parents,
+            None,
+            faults,
+            recovery_cleanup_required,
+        );
         return Err(operation_error(
             InstallOperation::CreateParentDirectory,
             io::Error::other("destination assumptions changed during parent creation"),
@@ -374,7 +535,12 @@ fn commit_session(
         ));
     }
     if latest.skill_state() != ComponentState::Missing || !latest.conflicts().is_empty() {
-        let cleanup = cleanup_parents(&mut created_parents, faults);
+        let cleanup = cleanup_failed_commit(
+            &mut created_parents,
+            None,
+            faults,
+            recovery_cleanup_required,
+        );
         return Err(operation_error(
             InstallOperation::CommitNoReplace,
             io::Error::new(
@@ -386,19 +552,61 @@ fn commit_session(
         ));
     }
 
-    let mut temp = match create_temp_install(&skills, faults) {
+    let planned_temp_name = journal
+        .as_ref()
+        .map(|journal| journal.journal.record().staging_name().to_owned());
+    let mut temp = match create_temp_install(&skills, faults, planned_temp_name.as_deref()) {
         Ok(temp) => temp,
         Err(error) => {
-            let cleanup = cleanup_parents(&mut created_parents, faults);
+            let cleanup = cleanup_failed_commit(
+                &mut created_parents,
+                None,
+                faults,
+                recovery_cleanup_required,
+            );
             return Err(with_cleanup(error, cleanup));
         }
     };
 
-    let copy_result = copy_inventory(session, &skills, &mut temp, faults)
+    if let Some(journal) = journal.as_mut() {
+        let identity = temp.root.identity().map_err(|error| {
+            operation_error(
+                InstallOperation::CreateTemporaryDirectory,
+                error,
+                true,
+                vec![],
+            )
+        })?;
+        journal.set_staging_identity(identity)?;
+    }
+
+    if let Err(error) = faults
+        .before(InstallOperation::SyncStagingDirectory)
+        .and_then(|()| skills.sync_directory())
+    {
+        let cleanup_errors = cleanup_failed_commit(
+            &mut created_parents,
+            Some(&mut temp),
+            faults,
+            recovery_cleanup_required,
+        );
+        return Err(operation_error(
+            InstallOperation::SyncStagingDirectory,
+            error,
+            cleanup_errors.is_empty(),
+            cleanup_errors,
+        ));
+    }
+
+    let copy_result = copy_inventory(session, &skills, &mut temp, faults, journal.as_mut())
         .and_then(|()| verify_prepared_tree(session, &temp));
     if let Err(error) = copy_result {
-        let mut cleanup_errors = temp.cleanup(faults);
-        cleanup_errors.extend(cleanup_parents(&mut created_parents, faults));
+        let cleanup_errors = cleanup_failed_commit(
+            &mut created_parents,
+            Some(&mut temp),
+            faults,
+            recovery_cleanup_required,
+        );
         return Err(with_cleanup(error, cleanup_errors));
     }
 
@@ -408,8 +616,12 @@ fn commit_session(
         session.plan.skill_name().as_str(),
     )
     .map_err(|_| {
-        let mut cleanup_errors = temp.cleanup(faults);
-        cleanup_errors.extend(cleanup_parents(&mut created_parents, faults));
+        let cleanup_errors = cleanup_failed_commit(
+            &mut created_parents,
+            Some(&mut temp),
+            faults,
+            recovery_cleanup_required,
+        );
         operation_error(
             InstallOperation::CommitNoReplace,
             io::Error::other("destination revalidation failed"),
@@ -429,8 +641,12 @@ fn commit_session(
         || latest.skill_state() != ComponentState::Missing
         || !latest.conflicts().is_empty()
     {
-        let mut cleanup_errors = temp.cleanup(faults);
-        cleanup_errors.extend(cleanup_parents(&mut created_parents, faults));
+        let cleanup_errors = cleanup_failed_commit(
+            &mut created_parents,
+            Some(&mut temp),
+            faults,
+            recovery_cleanup_required,
+        );
         return Err(operation_error(
             InstallOperation::CommitNoReplace,
             io::Error::new(
@@ -456,11 +672,16 @@ fn commit_session(
                 &temp.name,
                 session.plan.skill_name().as_str(),
                 &temp.root,
-            )
+            )?;
+            faults.after(InstallOperation::CommitNoReplace)
         })
     {
-        let mut cleanup_errors = temp.cleanup(faults);
-        cleanup_errors.extend(cleanup_parents(&mut created_parents, faults));
+        let cleanup_errors = cleanup_failed_commit(
+            &mut created_parents,
+            Some(&mut temp),
+            faults,
+            recovery_cleanup_required,
+        );
         return Err(operation_error(
             InstallOperation::CommitNoReplace,
             error,
@@ -469,6 +690,17 @@ fn commit_session(
         ));
     }
     temp.disarm();
+    faults
+        .before(InstallOperation::SyncDestinationDirectory)
+        .and_then(|()| skills.sync_directory())
+        .map_err(|error| {
+            operation_error(
+                InstallOperation::SyncDestinationDirectory,
+                error,
+                false,
+                vec![],
+            )
+        })?;
     let committed_destination = skills
         .open_directory(std::ffi::OsStr::new(session.plan.skill_name().as_str()))
         .map_err(|_| CommitError::CommittedButUnverified)?;
@@ -605,25 +837,53 @@ fn open_or_create_parent(
                 .before(operation)
                 .map_err(|error| operation_error(operation, error, true, vec![]))?;
             match parent.create_directory(name) {
-                Ok(()) => match parent.open_directory(std::ffi::OsStr::new(name)) {
-                    Ok(directory) => Ok((directory, true)),
-                    Err(error) => {
-                        let mut cleanup_errors = Vec::new();
-                        remove_empty_child(
-                            parent,
-                            name,
-                            InstallOperation::RemoveDirectory,
-                            faults,
-                            &mut cleanup_errors,
-                        );
-                        Err(operation_error(
+                Ok(()) => {
+                    faults.after(operation).map_err(|error| {
+                        operation_error(
                             operation,
                             error,
-                            cleanup_errors.is_empty(),
-                            cleanup_errors,
-                        ))
+                            false,
+                            vec![(
+                                InstallOperation::RemoveDirectory,
+                                io::ErrorKind::PermissionDenied,
+                            )],
+                        )
+                    })?;
+                    match parent.open_directory(std::ffi::OsStr::new(name)) {
+                        Ok(directory) => {
+                            if let Err(error) = faults
+                                .before(InstallOperation::SyncParentDirectory)
+                                .and_then(|()| parent.sync_directory())
+                            {
+                                let mut cleanup_errors = Vec::new();
+                                remove_empty_child_if_identity(
+                                    parent,
+                                    name,
+                                    directory.identity().ok(),
+                                    InstallOperation::RemoveDirectory,
+                                    faults,
+                                    &mut cleanup_errors,
+                                );
+                                return Err(operation_error(
+                                    InstallOperation::SyncParentDirectory,
+                                    error,
+                                    cleanup_errors.is_empty(),
+                                    cleanup_errors,
+                                ));
+                            }
+                            Ok((directory, true))
+                        }
+                        Err(error) => Err(operation_error(
+                            operation,
+                            error,
+                            false,
+                            vec![(
+                                InstallOperation::RemoveDirectory,
+                                io::ErrorKind::PermissionDenied,
+                            )],
+                        )),
                     }
-                },
+                }
                 Err(error) => Err(operation_error(operation, error, true, vec![])),
             }
         }
@@ -729,24 +989,78 @@ struct CreatedParents<'a> {
     created_skills: bool,
 }
 
+struct CommitJournal<'a> {
+    journal: &'a mut OperationJournal,
+    faults: &'a dyn JournalFaultInjector,
+}
+
+impl CommitJournal<'_> {
+    fn set_created_parent_identities(
+        &mut self,
+        agents: Option<FileIdentity>,
+        skills: Option<FileIdentity>,
+    ) -> Result<(), CommitError> {
+        self.journal
+            .set_created_parent_identities(agents, skills, self.faults)
+            .map_err(CommitError::Journal)
+    }
+
+    fn set_staging_identity(&mut self, identity: FileIdentity) -> Result<(), CommitError> {
+        self.journal
+            .set_staging_identity(identity, self.faults)
+            .map_err(CommitError::Journal)
+    }
+
+    fn record_file(
+        &mut self,
+        path: &Path,
+        identity: FileIdentity,
+        verified: bool,
+    ) -> Result<(), CommitError> {
+        let path = path
+            .to_str()
+            .ok_or(CommitError::IdentityMismatch)?
+            .replace('\\', "/");
+        self.journal
+            .record_file(&path, identity, verified, self.faults)
+            .map_err(CommitError::Journal)
+    }
+
+    fn record_directory(&mut self, path: &Path, identity: FileIdentity) -> Result<(), CommitError> {
+        let path = path
+            .to_str()
+            .ok_or(CommitError::IdentityMismatch)?
+            .replace('\\', "/");
+        self.journal
+            .record_directory(&path, identity, self.faults)
+            .map_err(CommitError::Journal)
+    }
+}
+
 fn cleanup_parents(
     created: &mut CreatedParents<'_>,
     faults: &dyn InstallFaultInjector,
 ) -> Vec<(InstallOperation, io::ErrorKind)> {
     let mut errors = Vec::new();
     if created.created_skills {
-        remove_empty_child(
+        remove_empty_child_if_identity(
             created.agents,
             "skills",
+            created
+                .agents
+                .open_directory(std::ffi::OsStr::new("skills"))
+                .and_then(|directory| directory.identity())
+                .ok(),
             InstallOperation::RemoveDirectory,
             faults,
             &mut errors,
         );
     }
     if created.created_agents {
-        remove_empty_child(
+        remove_empty_child_if_identity(
             created.project,
             ".agents",
+            created.agents.identity().ok(),
             InstallOperation::RemoveDirectory,
             faults,
             &mut errors,
@@ -755,17 +1069,46 @@ fn cleanup_parents(
     errors
 }
 
-fn remove_empty_child(
+fn cleanup_failed_commit(
+    created: &mut CreatedParents<'_>,
+    temp: Option<&mut TempInstall>,
+    faults: &dyn InstallFaultInjector,
+    recovery_cleanup_required: bool,
+) -> Vec<(InstallOperation, io::ErrorKind)> {
+    if recovery_cleanup_required {
+        // Leave journal-owned objects in place. Recovery can revalidate the full inventory and
+        // persist per-object cleanup intent before removing each one.
+        return vec![(
+            InstallOperation::RemoveDirectory,
+            io::ErrorKind::Interrupted,
+        )];
+    }
+    let mut errors = temp.map_or_else(Vec::new, |temp| temp.cleanup(faults));
+    errors.extend(cleanup_parents(created, faults));
+    errors
+}
+
+fn remove_empty_child_if_identity(
     parent: &SecureDir,
     name: &str,
+    expected_identity: Option<FileIdentity>,
     operation: InstallOperation,
     faults: &dyn InstallFaultInjector,
     errors: &mut Vec<(InstallOperation, io::ErrorKind)>,
 ) {
-    if let Err(error) = faults
-        .before(operation)
-        .and_then(|()| parent.remove_directory(name))
-    {
+    let result = parent
+        .open_directory(std::ffi::OsStr::new(name))
+        .and_then(|child| {
+            if expected_identity != Some(child.identity()?) || !child.entries()?.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "directory identity changed or directory is not empty",
+                ));
+            }
+            faults.before(operation)?;
+            parent.remove_directory(name)
+        });
+    if let Err(error) = result {
         errors.push((operation, error.kind()));
     }
 }
@@ -774,9 +1117,15 @@ struct TempInstall {
     parent: SecureDir,
     name: String,
     root: SecureDir,
-    created_files: Vec<PathBuf>,
-    created_directories: Vec<PathBuf>,
+    created_files: Vec<CreatedTempObject>,
+    created_directories: Vec<CreatedTempObject>,
     armed: bool,
+}
+
+struct CreatedTempObject {
+    relative: PathBuf,
+    identity: FileIdentity,
+    expected_file: Option<(u64, [u8; 32])>,
 }
 
 impl TempInstall {
@@ -788,36 +1137,72 @@ impl TempInstall {
             return Vec::new();
         }
         let mut errors = Vec::new();
-        for relative in self.created_files.iter().rev() {
-            match self.relative_parent(relative) {
+        for object in self.created_files.iter().rev() {
+            match self.relative_parent(&object.relative) {
                 Ok((parent, name)) => {
-                    if let Err(error) = faults
-                        .before(InstallOperation::RemoveFile)
-                        .and_then(|()| parent.remove_file(&name))
-                    {
+                    let result = parent.open_regular_file(&name).and_then(|mut file| {
+                        if SecureDir::file_identity(&file)? != object.identity {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "temporary file identity changed",
+                            ));
+                        }
+                        if let Some((expected_bytes, expected_sha256)) = object.expected_file
+                            && digest_file(&mut file, expected_bytes)? != expected_sha256
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "temporary file hash changed before cleanup",
+                            ));
+                        }
+                        faults.before(InstallOperation::RemoveFile)?;
+                        parent.remove_file(&name)
+                    });
+                    if let Err(error) = result {
                         errors.push((InstallOperation::RemoveFile, error.kind()));
                     }
                 }
                 Err(error) => errors.push((InstallOperation::RemoveFile, error.kind())),
             }
         }
-        for relative in self.created_directories.iter().rev() {
-            match self.relative_parent(relative) {
+        for object in self.created_directories.iter().rev() {
+            match self.relative_parent(&object.relative) {
                 Ok((parent, name)) => {
-                    if let Err(error) = faults
-                        .before(InstallOperation::RemoveDirectory)
-                        .and_then(|()| parent.remove_directory(&name))
-                    {
+                    let result =
+                        parent
+                            .open_directory(std::ffi::OsStr::new(&name))
+                            .and_then(|directory| {
+                                if directory.identity()? != object.identity {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::PermissionDenied,
+                                        "temporary directory identity changed",
+                                    ));
+                                }
+                                faults.before(InstallOperation::RemoveDirectory)?;
+                                parent.remove_directory(&name)
+                            });
+                    if let Err(error) = result {
                         errors.push((InstallOperation::RemoveDirectory, error.kind()));
                     }
                 }
                 Err(error) => errors.push((InstallOperation::RemoveDirectory, error.kind())),
             }
         }
-        if let Err(error) = faults
-            .before(InstallOperation::RemoveDirectory)
-            .and_then(|()| self.parent.remove_directory(&self.name))
-        {
+        let root_identity = self.root.identity();
+        let result = self
+            .parent
+            .open_directory(std::ffi::OsStr::new(&self.name))
+            .and_then(|current| {
+                if Some(current.identity()?) != root_identity.ok() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "temporary root identity changed",
+                    ));
+                }
+                faults.before(InstallOperation::RemoveDirectory)?;
+                self.parent.remove_directory(&self.name)
+            });
+        if let Err(error) = result {
             errors.push((InstallOperation::RemoveDirectory, error.kind()));
         } else {
             self.armed = false;
@@ -854,16 +1239,21 @@ impl TempInstall {
 fn create_temp_install(
     parent: &SecureDir,
     faults: &dyn InstallFaultInjector,
+    preferred_name: Option<&str>,
 ) -> Result<TempInstall, CommitError> {
-    for _ in 0..TEMP_NAME_ATTEMPTS {
-        let name = random_temp_name().map_err(|error| {
-            operation_error(
-                InstallOperation::CreateTemporaryDirectory,
-                error,
-                true,
-                vec![],
-            )
-        })?;
+    for attempt in 0..TEMP_NAME_ATTEMPTS {
+        let name = match preferred_name {
+            Some(name) if attempt == 0 => name.to_owned(),
+            Some(_) => break,
+            None => random_temp_name().map_err(|error| {
+                operation_error(
+                    InstallOperation::CreateTemporaryDirectory,
+                    error,
+                    true,
+                    vec![],
+                )
+            })?,
+        };
         faults
             .before(InstallOperation::CreateTemporaryDirectory)
             .map_err(|error| {
@@ -876,22 +1266,30 @@ fn create_temp_install(
             })?;
         match parent.create_directory(&name) {
             Ok(()) => {
+                faults
+                    .after(InstallOperation::CreateTemporaryDirectory)
+                    .map_err(|error| {
+                        operation_error(
+                            InstallOperation::CreateTemporaryDirectory,
+                            error,
+                            false,
+                            vec![(
+                                InstallOperation::RemoveDirectory,
+                                io::ErrorKind::PermissionDenied,
+                            )],
+                        )
+                    })?;
                 let root = match parent.open_directory(std::ffi::OsStr::new(&name)) {
                     Ok(root) => root,
                     Err(error) => {
-                        let mut cleanup_errors = Vec::new();
-                        remove_empty_child(
-                            parent,
-                            &name,
-                            InstallOperation::RemoveDirectory,
-                            faults,
-                            &mut cleanup_errors,
-                        );
                         return Err(operation_error(
                             InstallOperation::CreateTemporaryDirectory,
                             error,
-                            cleanup_errors.is_empty(),
-                            cleanup_errors,
+                            false,
+                            vec![(
+                                InstallOperation::RemoveDirectory,
+                                io::ErrorKind::PermissionDenied,
+                            )],
                         ));
                     }
                 };
@@ -904,7 +1302,11 @@ fn create_temp_install(
                     armed: true,
                 });
             }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error)
+                if error.kind() == io::ErrorKind::AlreadyExists && preferred_name.is_none() =>
+            {
+                continue;
+            }
             Err(error) => {
                 return Err(operation_error(
                     InstallOperation::CreateTemporaryDirectory,
@@ -944,6 +1346,7 @@ fn copy_inventory(
     _skills: &SecureDir,
     temp: &mut TempInstall,
     faults: &dyn InstallFaultInjector,
+    mut journal: Option<&mut CommitJournal<'_>>,
 ) -> Result<(), CommitError> {
     for directory in session.inventory.directories() {
         let (parent, name) = temp_parent_for(directory, &temp.root).map_err(|error| {
@@ -957,7 +1360,33 @@ fn copy_inventory(
         parent.create_directory(name).map_err(|error| {
             operation_error(InstallOperation::CreateDirectory, error, true, vec![])
         })?;
-        temp.created_directories.push(directory.clone());
+        faults
+            .after(InstallOperation::CreateDirectory)
+            .map_err(|error| {
+                operation_error(InstallOperation::CreateDirectory, error, false, vec![])
+            })?;
+        let created = parent
+            .open_directory(std::ffi::OsStr::new(name))
+            .map_err(|error| {
+                operation_error(InstallOperation::CreateDirectory, error, true, vec![])
+            })?;
+        let identity = created.identity().map_err(|error| {
+            operation_error(InstallOperation::CreateDirectory, error, true, vec![])
+        })?;
+        faults
+            .before(InstallOperation::SyncStagingDirectory)
+            .and_then(|()| parent.sync_directory())
+            .map_err(|error| {
+                operation_error(InstallOperation::SyncStagingDirectory, error, true, vec![])
+            })?;
+        temp.created_directories.push(CreatedTempObject {
+            relative: directory.clone(),
+            identity,
+            expected_file: None,
+        });
+        if let Some(journal) = journal.as_mut() {
+            journal.record_directory(directory, identity)?;
+        }
     }
 
     let source_root = fs::canonicalize(session.staged.content_directory())
@@ -983,7 +1412,21 @@ fn copy_inventory(
         let mut output = destination_parent
             .create_regular_file(destination_name)
             .map_err(|error| operation_error(InstallOperation::CreateFile, error, true, vec![]))?;
-        temp.created_files.push(file.relative_path().to_path_buf());
+        faults
+            .after(InstallOperation::CreateFile)
+            .map_err(|error| operation_error(InstallOperation::CreateFile, error, false, vec![]))?;
+        let file_identity = SecureDir::file_identity(&output)
+            .map_err(|error| operation_error(InstallOperation::CreateFile, error, true, vec![]))?;
+        let mut expected_sha256 = [0_u8; 32];
+        expected_sha256.copy_from_slice(file.expected_sha256());
+        temp.created_files.push(CreatedTempObject {
+            relative: file.relative_path().to_path_buf(),
+            identity: file_identity,
+            expected_file: Some((file.expected_bytes(), expected_sha256)),
+        });
+        if let Some(journal) = journal.as_mut() {
+            journal.record_file(file.relative_path(), file_identity, false)?;
+        }
 
         let mut sha = Context::new(&SHA256);
         let mut crc = crc32fast::Hasher::new();
@@ -1020,6 +1463,11 @@ fn copy_inventory(
             output.write_all(&buffer[..read]).map_err(|error| {
                 operation_error(InstallOperation::WriteDestination, error, true, vec![])
             })?;
+            faults
+                .after(InstallOperation::WriteDestination)
+                .map_err(|error| {
+                    operation_error(InstallOperation::WriteDestination, error, false, vec![])
+                })?;
         }
         if total != file.expected_bytes() || crc.finalize() != file.expected_crc32() {
             return Err(operation_error(
@@ -1047,7 +1495,24 @@ fn copy_inventory(
         output.flush().map_err(|error| {
             operation_error(InstallOperation::WriteDestination, error, true, vec![])
         })?;
+        faults
+            .before(InstallOperation::SyncStagedFile)
+            .and_then(|()| output.sync_all())
+            .map_err(|error| {
+                operation_error(InstallOperation::SyncStagedFile, error, true, vec![])
+            })?;
+        faults
+            .after(InstallOperation::SyncStagedFile)
+            .map_err(|error| {
+                operation_error(InstallOperation::SyncStagedFile, error, false, vec![])
+            })?;
         drop(output);
+        faults
+            .before(InstallOperation::SyncStagingDirectory)
+            .and_then(|()| destination_parent.sync_directory())
+            .map_err(|error| {
+                operation_error(InstallOperation::SyncStagingDirectory, error, true, vec![])
+            })?;
 
         faults
             .before(InstallOperation::ReadSource)
@@ -1093,6 +1558,9 @@ fn copy_inventory(
                 true,
                 vec![],
             ));
+        }
+        if let Some(journal) = journal.as_mut() {
+            journal.record_file(file.relative_path(), file_identity, true)?;
         }
     }
     Ok(())
@@ -1391,6 +1859,53 @@ impl SecureDir {
         Ok(file)
     }
 
+    pub(super) fn open_or_create_lock_file(&self, name: &str) -> io::Result<fs::File> {
+        self.ensure_current_path()?;
+        use rustix::fs::{Mode, OFlags, openat};
+        let open = |flags| {
+            openat(
+                &self.file,
+                name,
+                flags | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .map(fs::File::from)
+            .map_err(rustix_error)
+        };
+        let file = match open(OFlags::RDWR | OFlags::CREATE | OFlags::EXCL) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => open(OFlags::RDWR)?,
+            Err(error) => return Err(error),
+        };
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "lock object is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+
+    pub(super) fn open_lock_file(&self, name: &str) -> io::Result<fs::File> {
+        self.ensure_current_path()?;
+        use rustix::fs::{Mode, OFlags, openat};
+        let fd = openat(
+            &self.file,
+            name,
+            OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(rustix_error)?;
+        let file: fs::File = fd.into();
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "lock object is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+
     pub(super) fn open_regular_file(&self, name: &str) -> io::Result<fs::File> {
         self.ensure_current_path()?;
         use rustix::fs::{Mode, OFlags, openat};
@@ -1409,6 +1924,10 @@ impl SecureDir {
             ));
         }
         Ok(file)
+    }
+
+    pub(super) fn open_regular_file_for_rename(&self, name: &str) -> io::Result<fs::File> {
+        self.open_regular_file(name)
     }
 
     pub(super) fn entries(&self) -> io::Result<Vec<(std::ffi::OsString, NodeKind)>> {
@@ -1491,7 +2010,7 @@ impl SecureDir {
         unlinkat(&self.file, name, AtFlags::empty()).map_err(rustix_error)
     }
 
-    fn remove_directory(&self, name: &str) -> io::Result<()> {
+    pub(super) fn remove_directory(&self, name: &str) -> io::Result<()> {
         self.ensure_current_path()?;
         use rustix::fs::{AtFlags, unlinkat};
         unlinkat(&self.file, name, AtFlags::REMOVEDIR).map_err(rustix_error)
@@ -1670,6 +2189,56 @@ impl SecureDir {
         Ok(file)
     }
 
+    pub(super) fn open_or_create_lock_file(&self, name: &str) -> io::Result<fs::File> {
+        self.ensure_current_path()?;
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        let mut options = fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let file = match options.open(self.path.join(name)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let mut existing = fs::OpenOptions::new();
+                existing
+                    .read(true)
+                    .write(true)
+                    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+                existing.open(self.path.join(name))?
+            }
+            Err(error) => return Err(error),
+        };
+        if !file.metadata()?.is_file() || windows_reparse(&file.metadata()?) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "lock object is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+
+    pub(super) fn open_lock_file(&self, name: &str) -> io::Result<fs::File> {
+        self.ensure_current_path()?;
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        let mut options = fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let file = options.open(self.path.join(name))?;
+        if !file.metadata()?.is_file() || windows_reparse(&file.metadata()?) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "lock object is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+
     pub(super) fn open_regular_file(&self, name: &str) -> io::Result<fs::File> {
         self.ensure_current_path()?;
         use std::os::windows::fs::OpenOptionsExt;
@@ -1683,6 +2252,29 @@ impl SecureDir {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "opened object is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+
+    pub(super) fn open_regular_file_for_rename(&self, name: &str) -> io::Result<fs::File> {
+        self.ensure_current_path()?;
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
+        };
+        let mut options = fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .access_mode(DELETE | FILE_READ_ATTRIBUTES | FILE_READ_DATA | SYNCHRONIZE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+        let file = options.open(self.path.join(name))?;
+        if !file.metadata()?.is_file() || windows_reparse(&file.metadata()?) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "opened rename source is not a regular file",
             ));
         }
         Ok(file)
@@ -1750,7 +2342,7 @@ impl SecureDir {
         self.ensure_current_path()?;
         fs::remove_file(self.path.join(name))
     }
-    fn remove_directory(&self, name: &str) -> io::Result<()> {
+    pub(super) fn remove_directory(&self, name: &str) -> io::Result<()> {
         self.ensure_current_path()?;
         fs::remove_dir(self.path.join(name))
     }
@@ -1969,7 +2561,27 @@ impl SecureDir {
             "unsupported platform",
         ))
     }
+
+    pub(super) fn open_or_create_lock_file(&self, _name: &str) -> io::Result<fs::File> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "secure lock files are unsupported on this platform",
+        ))
+    }
+
+    pub(super) fn open_lock_file(&self, _name: &str) -> io::Result<fs::File> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "secure lock files are unsupported on this platform",
+        ))
+    }
     pub(super) fn open_regular_file(&self, _name: &str) -> io::Result<fs::File> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unsupported platform",
+        ))
+    }
+    pub(super) fn open_regular_file_for_rename(&self, _name: &str) -> io::Result<fs::File> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "unsupported platform",
@@ -1993,7 +2605,7 @@ impl SecureDir {
             "unsupported platform",
         ))
     }
-    fn remove_directory(&self, _name: &str) -> io::Result<()> {
+    pub(super) fn remove_directory(&self, _name: &str) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "unsupported platform",
