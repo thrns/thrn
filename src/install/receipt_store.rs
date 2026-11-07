@@ -105,6 +105,18 @@ impl ReceiptStore {
             lock,
             released: false,
         };
+        let journal_store = self.journal_store()?;
+        let journal_records =
+            journal_store
+                .read_all()
+                .map_err(|error| ReceiptStoreError::Journal {
+                    detail: error.to_string(),
+                })?;
+        if !journal_records.is_empty() {
+            return Err(ReceiptStoreError::RecoveryRequired {
+                operation_count: journal_records.len(),
+            });
+        }
         let existing = read_receipts(&reservation.directory, true);
         match existing {
             Ok(receipts) => {
@@ -147,29 +159,39 @@ impl ReceiptStore {
         if !self.directory.is_absolute() {
             return Err(RecoveryError::UnsafeStore);
         }
-        let journal_store = self.journal_store().map_err(RecoveryError::Store)?;
-        let records = journal_store.read_all().map_err(RecoveryError::Journal)?;
-        if records.is_empty() {
-            return Ok(Vec::new());
-        }
         let directory = SecureDir::open_or_create_absolute(&self.directory).map_err(|error| {
             RecoveryError::Store(map_directory_error("open recovery store", error))
         })?;
-        let lock =
+        let mut lock =
             WriterLock::acquire(directory.clone(), receipt_faults).map_err(RecoveryError::Store)?;
-        let mut outcomes = Vec::new();
-        for record in records {
-            lock.validate().map_err(RecoveryError::Store)?;
-            outcomes.push(recover_operation(
-                &journal_store,
-                &record,
-                &directory,
-                install_faults,
-                journal_faults,
-                receipt_faults,
-            )?);
+        lock.validate().map_err(RecoveryError::Store)?;
+        let journal_store = self.journal_store().map_err(RecoveryError::Store)?;
+        let result = (|| {
+            let records = journal_store.read_all().map_err(RecoveryError::Journal)?;
+            let mut outcomes = Vec::new();
+            for record in records {
+                lock.validate().map_err(RecoveryError::Store)?;
+                outcomes.push(recover_operation(
+                    &journal_store,
+                    &record,
+                    &directory,
+                    install_faults,
+                    journal_faults,
+                    receipt_faults,
+                )?);
+            }
+            Ok(outcomes)
+        })();
+        match result {
+            Ok(outcomes) => {
+                lock.release().map_err(RecoveryError::Store)?;
+                Ok(outcomes)
+            }
+            Err(error) => {
+                let _ = lock.release();
+                Err(error)
+            }
         }
-        Ok(outcomes)
     }
 
     /// Rehash the exact current Codex project tree. Receipt paths are fully validated before
@@ -471,12 +493,14 @@ impl WriterLock {
             .map_err(|error| map_io("synchronize receipt-store lock", error))?;
         let identity = SecureDir::file_identity(&file)
             .map_err(|error| map_io("identify receipt-store lock", error))?;
-        Ok(Self {
+        let lock = Self {
             directory,
             file,
             identity,
             released: false,
-        })
+        };
+        lock.validate()?;
+        Ok(lock)
     }
 
     fn validate(&self) -> Result<(), ReceiptStoreError> {
@@ -2122,6 +2146,12 @@ pub enum ReceiptStoreError {
     #[error("receipt storage contains conflicting claims for the same Codex project destination")]
     DestinationConflict,
     #[error(
+        "installation recovery is required before project changes can proceed; {operation_count} journal operation(s) remain"
+    )]
+    RecoveryRequired { operation_count: usize },
+    #[error("installation recovery is required before project changes can proceed: {detail}")]
+    Journal { detail: String },
+    #[error(
         "receipt storage has an existing writer lock; it may be busy or left by an interrupted write"
     )]
     BusyOrInterrupted,
@@ -2615,7 +2645,7 @@ mod tests {
         fs, io,
         path::{Path, PathBuf},
         process::Command,
-        sync::Mutex,
+        sync::{Mutex, mpsc},
     };
 
     use std::io::{Cursor, Write};
@@ -2626,7 +2656,11 @@ mod tests {
         install::{
             command::prepare_install_session,
             commit::{InstallFaultInjector, InstallOperation, InstallationSession},
-            journal::{JournalError, JournalFaultInjector, JournalOperation, MAX_JOURNAL_BYTES},
+            destination::ComponentState,
+            journal::{
+                JournalError, JournalFaultInjector, JournalIntent, JournalOperation, JournalStore,
+                MAX_JOURNAL_BYTES, OperationState,
+            },
             receipt::InstallationReceipt,
         },
         registry::catalog::parse_catalog_json,
@@ -2718,6 +2752,28 @@ mod tests {
         .expect("validated session")
     }
 
+    fn prepared_journal_intent(
+        session: &InstallationSession,
+        installed_at_unix_seconds: u64,
+    ) -> JournalIntent {
+        let snapshot = session.plan().destination_snapshot();
+        let project_identity = snapshot.project_identity().expect("project identity");
+        JournalIntent {
+            receipt: InstallationReceipt::from_committed_plan(
+                session.plan(),
+                session.inventory(),
+                project_identity,
+                installed_at_unix_seconds,
+            )
+            .expect("prepared receipt"),
+            staging_name: crate::install::journal::new_staging_name().expect("staging name"),
+            create_agents_directory: snapshot.agents_state() == ComponentState::Missing,
+            create_skills_directory: snapshot.skills_state() == ComponentState::Missing,
+            agents_identity: snapshot.agents_identity(),
+            skills_identity: snapshot.skills_identity(),
+        }
+    }
+
     fn copy_directory_tree(source: &Path, destination: &Path) {
         fs::create_dir(destination).expect("create replacement directory");
         for entry in fs::read_dir(source).expect("read source directory") {
@@ -2750,6 +2806,89 @@ mod tests {
         operation: ReceiptOperation,
         occurrence: usize,
         seen: Mutex<HashMap<ReceiptOperation, usize>>,
+    }
+
+    struct PauseBeforeWriterLock {
+        entered: mpsc::Sender<()>,
+        resume: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl ReceiptFaultInjector for PauseBeforeWriterLock {
+        fn before(&self, operation: ReceiptOperation) -> io::Result<()> {
+            if operation == ReceiptOperation::CreateWriterLock {
+                self.entered
+                    .send(())
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                self.resume
+                    .lock()
+                    .map_err(|_| io::Error::other("writer-lock barrier poisoned"))?
+                    .recv()
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+            }
+            Ok(())
+        }
+    }
+
+    struct PauseAfterPreparedJournal {
+        journal_directory: PathBuf,
+        prepared: mpsc::Sender<()>,
+        resume: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl JournalFaultInjector for PauseAfterPreparedJournal {
+        fn after(&self, operation: JournalOperation) -> io::Result<()> {
+            if operation != JournalOperation::SyncStore {
+                return Ok(());
+            }
+            let records = JournalStore::new(self.journal_directory.clone())
+                .read_all()
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            if records
+                .iter()
+                .any(|record| record.state() == OperationState::Prepared)
+            {
+                self.prepared
+                    .send(())
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                self.resume
+                    .lock()
+                    .map_err(|_| io::Error::other("prepared-journal barrier poisoned"))?
+                    .recv()
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+            }
+            Ok(())
+        }
+    }
+
+    struct IntroduceJournalBeforeReservation {
+        seen_writer_locks: Mutex<usize>,
+        journal_store: JournalStore,
+        intent: Mutex<Option<JournalIntent>>,
+    }
+
+    impl ReceiptFaultInjector for IntroduceJournalBeforeReservation {
+        fn before(&self, operation: ReceiptOperation) -> io::Result<()> {
+            if operation != ReceiptOperation::CreateWriterLock {
+                return Ok(());
+            }
+            let mut seen = self
+                .seen_writer_locks
+                .lock()
+                .map_err(|_| io::Error::other("writer-lock counter poisoned"))?;
+            *seen += 1;
+            if *seen == 2 {
+                let intent = self
+                    .intent
+                    .lock()
+                    .map_err(|_| io::Error::other("journal-intent lock poisoned"))?
+                    .take()
+                    .ok_or_else(|| io::Error::other("journal intent already used"))?;
+                self.journal_store
+                    .prepare(intent, &NoJournalFaultsForTest)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+            }
+            Ok(())
+        }
     }
 
     impl ReceiptFaultInjector for FailReceiptAt {
@@ -3051,6 +3190,162 @@ mod tests {
             store.verify_current_content(&receipt).expect("verify"),
             ReceiptContentState::Verified
         );
+    }
+
+    #[test]
+    fn recovery_reads_journal_only_after_the_active_install_releases_its_lock() {
+        let (_parent, project, staging, data) = setup();
+        let receipt_directory = data.join("receipts");
+        let store = ReceiptStore::new(receipt_directory.clone());
+        let install_session = session(&project, &staging);
+
+        let (prepared_tx, prepared_rx) = mpsc::channel();
+        let (resume_install_tx, resume_install_rx) = mpsc::channel();
+        let journal_faults = std::sync::Arc::new(PauseAfterPreparedJournal {
+            journal_directory: data.join("operations"),
+            prepared: prepared_tx,
+            resume: Mutex::new(resume_install_rx),
+        });
+        let install_faults_for_thread = journal_faults.clone();
+        let install_receipt_directory = receipt_directory.clone();
+        let installer = std::thread::spawn(move || {
+            install_session.commit_and_record_at_with_journal(
+                &ReceiptStore::new(install_receipt_directory),
+                1,
+                &NoInstallFaults,
+                &NoReceiptFaults,
+                install_faults_for_thread.as_ref(),
+            )
+        });
+        prepared_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("installer paused with durable Prepared journal while holding the lock");
+
+        let (recovery_entered_tx, recovery_entered_rx) = mpsc::channel();
+        let (resume_recovery_tx, resume_recovery_rx) = mpsc::channel();
+        let receipt_faults = std::sync::Arc::new(PauseBeforeWriterLock {
+            entered: recovery_entered_tx,
+            resume: Mutex::new(resume_recovery_rx),
+        });
+        let receipt_faults_for_thread = receipt_faults.clone();
+        let recovery_receipt_directory = receipt_directory.clone();
+        let recovery = std::thread::spawn(move || {
+            ReceiptStore::new(recovery_receipt_directory)
+                .recover_with_faults(&NoJournalFaultsForTest, receipt_faults_for_thread.as_ref())
+        });
+        recovery_entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("recovery reached the lock boundary before reading snapshots");
+
+        resume_install_tx.send(()).expect("resume installation");
+        let installed_receipt = installer
+            .join()
+            .expect("installer thread")
+            .expect("installation completes and cleans its journal");
+        let installed_skill = project.join(".agents/skills/uncharted-ideation");
+        let installed_content = fs::read(installed_skill.join("SKILL.md")).expect("installed file");
+        assert_eq!(
+            store.list().expect("valid receipt remains"),
+            vec![installed_receipt.clone()]
+        );
+
+        resume_recovery_tx.send(()).expect("resume recovery");
+        assert!(
+            recovery
+                .join()
+                .expect("recovery thread")
+                .expect("recovery after install")
+                .is_empty()
+        );
+
+        assert_eq!(
+            store.list().expect("receipt remains unchanged"),
+            vec![installed_receipt.clone()]
+        );
+        assert!(matches!(
+            store.verify_current_content(&installed_receipt),
+            Ok(ReceiptContentState::Verified)
+        ));
+        assert_eq!(
+            fs::read(installed_skill.join("SKILL.md")).expect("installed file remains"),
+            installed_content
+        );
+    }
+
+    #[test]
+    fn reservation_rejects_a_journal_operation_introduced_after_initial_recovery() {
+        let (_parent, project, staging, data) = setup();
+        let store = ReceiptStore::new(data.join("receipts"));
+        let install_session = session(&project, &staging);
+        let fault = IntroduceJournalBeforeReservation {
+            seen_writer_locks: Mutex::new(0),
+            journal_store: JournalStore::new(data.join("operations")),
+            intent: Mutex::new(Some(prepared_journal_intent(&install_session, 1))),
+        };
+
+        let error = install_session
+            .commit_and_record_at(&store, 1, &NoInstallFaults, &fault)
+            .expect_err("unresolved journal must block project mutation");
+        assert!(matches!(
+            error,
+            crate::install::commit::InstallationCompletionError::ReceiptPreflight(
+                ReceiptStoreError::RecoveryRequired { operation_count: 1 }
+            )
+        ));
+        assert!(error.to_string().contains("recovery is required"));
+        assert!(!project.join(".agents").exists());
+        assert!(store.list().expect("no receipt published").is_empty());
+        assert_eq!(
+            store
+                .journal_store()
+                .expect("journal store")
+                .read_all()
+                .expect("unresolved journal retained")[0]
+                .state(),
+            OperationState::Prepared
+        );
+    }
+
+    #[test]
+    fn subprocess_recovery_observes_active_writer_before_reading_interrupted_journal() {
+        let test_name = "install::receipt_store::tests::subprocess_recovery_observes_active_writer_before_reading_interrupted_journal";
+        if let Some(data) = std::env::var_os("THRN_M2_06_ACTIVE_WRITER_DATA") {
+            let store = ReceiptStore::new(PathBuf::from(data).join("receipts"));
+            match store.recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults) {
+                Err(super::RecoveryError::Store(ReceiptStoreError::BusyOrInterrupted)) => {
+                    std::process::exit(0)
+                }
+                _ => std::process::exit(91),
+            }
+        }
+
+        let (_parent, project, staging, data) = setup();
+        let store = ReceiptStore::new(data.join("receipts"));
+        let install_session = session(&project, &staging);
+        let intent = prepared_journal_intent(&install_session, 1);
+        let reservation = store
+            .reserve(intent.receipt, &NoReceiptFaults)
+            .expect("active writer reservation");
+        let operations = data.join("operations");
+        fs::create_dir(&operations).expect("operations directory");
+        fs::write(operations.join(".pending-interrupted"), b"partial journal")
+            .expect("interrupted journal publication");
+
+        assert!(matches!(
+            store.recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults),
+            Err(super::RecoveryError::Store(
+                ReceiptStoreError::BusyOrInterrupted
+            ))
+        ));
+        let status = Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env("THRN_M2_06_ACTIVE_WRITER_DATA", &data)
+            .status()
+            .expect("launch active-writer recovery probe");
+        assert_eq!(status.code(), Some(0));
+        drop(reservation);
     }
 
     #[test]
@@ -4079,7 +4374,11 @@ mod tests {
             let store = ReceiptStore::new(data.join("receipts"));
             let fail = FailReceiptAt {
                 operation,
-                occurrence: 1,
+                occurrence: if operation == ReceiptOperation::CreateWriterLock {
+                    2 // Recovery acquires the lock once before reservation.
+                } else {
+                    1
+                },
                 seen: Mutex::new(HashMap::new()),
             };
             let result = session(&project, &staging).commit_and_record_at(

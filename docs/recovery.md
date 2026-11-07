@@ -49,9 +49,12 @@ stateDiagram-v2
     RolledBack --> [*]: checked journal cleanup
 ```
 
-The receipt store's exclusive OS file lock is acquired before preparation, held across directory
-commit, receipt publication, recovery, and cleanup. `Prepared` is durably published before any
-project mutation. `FilesystemCommitInProgress` is durably published before creating destination
+Recovery opens or safely creates the receipt-store directory, acquires and validates its exclusive
+OS file lock, and only then reads and validates bounded journal snapshots. The same lock remains
+held through recovery mutations, receipt publication, journal cleanup, and result determination.
+On an error, the implementation attempts an explicit release and the lock owner retries on drop if
+needed. `Prepared` is durably published before any project mutation.
+`FilesystemCommitInProgress` is durably published before creating destination
 parents or staging content. Directory and file identities are journaled as each operation-owned
 object is created. Copied files are synchronized and hashed before being marked verified. The final
 directory is committed with Linux `renameat2(RENAME_NOREPLACE)`, macOS `renameatx_np(RENAME_EXCL)`,
@@ -69,7 +72,7 @@ retries cleanup.
 
 ## Recovery decisions and rollback limits
 
-Recovery first strictly reads the bounded journal, then acquires the same OS writer lock as install.
+Recovery acquires the same OS writer lock as install before strictly reading the bounded journal.
 Before each action it opens project components without following links, checks project and parent
 directory identities, verifies the operation's staging/final identity, inventories every current
 file and directory, hashes files, validates receipt identity and contents, and checks for other
@@ -112,8 +115,17 @@ age or stored PID. A lock that another process still holds blocks both install a
 process termination the OS releases the lock; the lock file remains and can be reacquired after its
 type, contents, and identity are checked. THRN never removes a stale-looking lock based only on age
 or PID. OS/filesystem lock semantics must be honored by the underlying filesystem; errors fail
-closed. The single receipt store lock serializes internal operations using the same THRN data
-directory, including operations for different projects.
+closed. Recovery reads journal snapshots only after acquiring and validating this lock, so it cannot
+act on a snapshot captured before a completed writer released its lock. The single receipt store lock
+serializes internal operations using the same THRN data directory, including operations for
+different projects.
+
+An installation first runs recovery, then obtains a new receipt reservation lock. Before it can
+prepare its own journal or mutate project files, that reservation re-reads and validates the
+journal. Any remaining operation, including terminal state awaiting cleanup, fails admission with
+an actionable recovery-required error; malformed or interrupted journal publication also fails
+closed. This closes the gap between recovery and reservation. The reservation remains held through
+journal preparation, project commit, receipt publication, journal cleanup, and result determination.
 
 Process-interruption recovery is stronger than power-loss guarantees. On Linux and macOS, the
 implementation synchronizes journal and receipt files, destination files, and containing directory
