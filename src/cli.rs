@@ -584,7 +584,14 @@ mod install_tests {
     impl InstallFixture {
         fn new() -> Self {
             let root = tempdir().expect("isolated fixture root");
-            let root_path = root.path().canonicalize().expect("canonical fixture root");
+            // macOS temp paths can pass through `/var`'s alias; resolve that before the receipt
+            // store's no-follow checks. Keep Windows paths in their ordinary form because
+            // canonicalize adds the extended `\\?\` prefix, unlike CLI `current_dir()` input.
+            let root_path = if cfg!(windows) {
+                root.path().to_path_buf()
+            } else {
+                root.path().canonicalize().expect("canonical fixture root")
+            };
             let current = root_path.join("workspace");
             let project = current.clone();
             let staging = root_path.join("staging");
