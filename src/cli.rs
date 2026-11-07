@@ -219,12 +219,7 @@ where
 }
 
 fn format_install_success(receipt: &InstallationReceipt) -> String {
-    let destination = receipt.destination_path();
-    let destination = destination
-        .to_string_lossy()
-        .chars()
-        .flat_map(char::escape_debug)
-        .collect::<String>();
+    let destination = safe_path_display(&receipt.destination_path());
     format!(
         "Installed THRN skill\nResource: {}\nSkill name: {}\nAgent: {}\nScope: {}\nDestination: {}\nPinned revision: {}/{}@{}\nFiles installed: {}\nBytes installed: {}\nOwnership receipt: recorded\n",
         receipt.catalog_resource_id(),
@@ -238,6 +233,18 @@ fn format_install_success(receipt: &InstallationReceipt) -> String {
         receipt.file_count(),
         receipt.byte_count(),
     )
+}
+
+fn safe_path_display(path: &Path) -> String {
+    let mut output = String::new();
+    for character in path.to_string_lossy().chars() {
+        if character.is_control() {
+            output.extend(character.escape_default());
+        } else {
+            output.push(character);
+        }
+    }
+    output
 }
 
 fn list_skills(installed: bool) -> Result<()> {
