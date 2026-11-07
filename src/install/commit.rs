@@ -2364,12 +2364,8 @@ impl SecureDir {
         };
         self.ensure_current_path()?;
         source.ensure_current_path()?;
-        // Root the relative target in the already-validated parent handle. This avoids relying
-        // on the process working directory and keeps the rename independent of long absolute
-        // path spellings such as Windows extended-length prefixes.
-        let wide = std::ffi::OsStr::new(new_name)
-            .encode_wide()
-            .collect::<Vec<_>>();
+        let destination = self.path.join(new_name);
+        let wide = destination.as_os_str().encode_wide().collect::<Vec<_>>();
         let name_bytes = u32::try_from(wide.len().saturating_mul(size_of::<u16>()))
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target name too long"))?;
         let header_size = offset_of!(FILE_RENAME_INFO, FileName);
@@ -2391,9 +2387,9 @@ impl SecureDir {
                     Anonymous: windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO_0 {
                         Flags: 0,
                     },
-                    // `self.file` is the validated destination parent, so this simple name is
-                    // resolved relative to that directory and never through the process CWD.
-                    RootDirectory: self.file.as_raw_handle() as HANDLE,
+                    // Use a fully qualified name with no root handle, so Windows cannot resolve a
+                    // simple name against the process working directory.
+                    RootDirectory: ptr::null_mut::<std::ffi::c_void>() as HANDLE,
                     FileNameLength: name_bytes,
                     FileName: [0],
                 },
