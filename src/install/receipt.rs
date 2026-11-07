@@ -339,6 +339,14 @@ impl InstallationReceipt {
         &self.files
     }
 
+    pub(crate) fn file_count(&self) -> u64 {
+        self.file_count
+    }
+
+    pub(crate) fn byte_count(&self) -> u64 {
+        self.byte_count
+    }
+
     pub(crate) fn directories(&self) -> &[String] {
         &self.directories
     }

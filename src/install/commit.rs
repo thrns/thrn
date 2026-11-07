@@ -1,5 +1,5 @@
-//! Internal M2-04 commit engine. The CLI deliberately does not call this module.
-#![allow(dead_code)] // Kept internal until M2-05 receipts and M2-06 recovery authorize public installs.
+//! Internal Codex project commit engine, reached by the CLI through a retained install session.
+#![allow(dead_code)] // Low-level fault-injection and recovery helpers remain internal.
 
 use std::{
     collections::{BTreeMap, BTreeSet},

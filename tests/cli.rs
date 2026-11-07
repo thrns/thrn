@@ -561,22 +561,18 @@ fn install_requires_agent_and_identifier_arguments() {
 }
 
 #[test]
-fn install_without_dry_run_fails_before_network_or_filesystem_changes() {
+fn install_without_dry_run_resolves_unknown_resource_without_writes() {
     let directory = TestDir::new();
     let output = command_in(
         &directory,
-        &["skills", "install", "frontend", "--agent", "codex"],
+        &["skills", "install", "unknown-resource", "--agent", "codex"],
     )
     .output()
     .expect("CLI process starts");
 
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("actual installation is not implemented yet")
-    );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("include --dry-run"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no catalog entry matches"));
     assert!(!directory.path().join(".agents").exists());
     assert!(!receipt_directory(&directory).exists());
 }
@@ -624,14 +620,39 @@ fn unsupported_agent_and_invalid_id_fail_without_success_output_or_project_write
 }
 
 #[test]
-fn install_help_explains_required_read_only_mode_and_project_option() {
+fn install_help_distinguishes_planning_from_installation() {
     let output = run_cli(&["skills", "install", "--help"]);
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--agent <AGENT>"));
     assert!(stdout.contains("--project <PATH>"));
     assert!(stdout.contains("--dry-run"));
+    assert!(stdout.contains("without changing the project"));
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn install_does_not_accept_overwrite_or_other_unlisted_options() {
+    let directory = TestDir::new();
+    let output = command_in(
+        &directory,
+        &[
+            "skills",
+            "install",
+            "frontend-design",
+            "--agent",
+            "codex",
+            "--force",
+        ],
+    )
+    .output()
+    .expect("CLI process starts");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Usage:"));
+    assert!(!directory.path().join(".agents").exists());
+    assert!(!receipt_directory(&directory).exists());
 }
 
 #[test]

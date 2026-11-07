@@ -2,23 +2,23 @@
 
 ## Current exposure
 
-THRN is under development and has no supported installer release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, reads validated local catalog data, offers an explicit HTTPS catalog refresh, performs read-only local `SKILL.md` validation, lists validated receipt-backed installations, and provides a read-only Codex project install dry-run. Default discovery and both `skills list` modes never use the network. Explicit refresh contacts one fixed THRN-operated HTTPS endpoint, validates the response, and writes only the catalog cache. An install dry-run reads the local catalog without refreshing it, fetches the selected skill at its pinned public GitHub commit, validates and stages it privately, then prints a plan without changing the project. The internal M2-04/M2-05/M2-06 boundary can commit a Codex project skill, publish its ownership receipt, and recover interrupted transactions in isolated tests, but the CLI does not call it and still rejects installation without `--dry-run` pending independent architectural review. No retrieved content or subprocess is executed. Installed listing reads only THRN's application-data receipt directory: it does not inspect agent skill folders, create receipt storage, fetch the catalog, open receipt-referenced project paths, or mutate recovery state. It labels current content integrity as unchecked. See [the recovery protocol](recovery.md) for transaction and durability limits.
+THRN is under development and has no supported package-manager release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, reads validated local catalog data, offers an explicit HTTPS catalog refresh, performs read-only local `SKILL.md` validation, lists validated receipt-backed installations, plans Codex project installs, and installs validated Codex project skills with durable receipts. Default discovery and both `skills list` modes never use the network. Explicit refresh contacts one fixed THRN-operated HTTPS endpoint, validates the response, and writes only the catalog cache. Install commands read the local catalog without refreshing it, then fetch the selected skill at its pinned public GitHub commit and validate it privately. Dry-run prints a plan without changing the project. A real install uses the M2-04/M2-05/M2-06 commit, receipt, and recovery boundary, and prints success only after the full journaled operation completes. No retrieved content or subprocess is executed. Installed listing reads only THRN's application-data receipt directory: it does not inspect agent skill folders, create receipt storage, fetch the catalog, open receipt-referenced project paths, or mutate recovery state. It labels current content integrity as unchecked. See [the recovery protocol](recovery.md) for transaction and durability limits.
 
-## Boundaries required before public installation
+## Current installation security boundaries
 
 Registry metadata, GitHub responses, archives, skill files, and instructions inside `SKILL.md` must be treated as untrusted input. A skill is content for a compatible agent, not an instruction source for THRN. Installing or inspecting one must never implicitly invoke scripts, hooks, shells, package managers, or other retrieved code.
 
-Before the CLI enables installation, source and filesystem handling must:
+The enabled installation path follows these source and filesystem boundaries:
 
-- Catalog refresh is limited to `https://raw.githubusercontent.com/thrns/thrn/main/src/registry/builtin-v1.json`; require HTTPS certificate verification, reject redirects, use explicit timeouts, and enforce the 1 MiB limit while streaming. Validate UTF-8 and the full catalog schema before caching. This endpoint is curated by THRN, but HTTPS and catalog inclusion do not authenticate or establish the safety of individual skill publishers. For later skill fetching, use public GitHub sources at exact, full commit hashes and independently validate source origin and immutable revision. A checksum from the same registry can detect accidental changes but does not prove publisher identity if that registry is compromised.
+- Catalog refresh is limited to `https://raw.githubusercontent.com/thrns/thrn/main/src/registry/builtin-v1.json`; require HTTPS certificate verification, reject redirects, use explicit timeouts, and enforce the 1 MiB limit while streaming. Validate UTF-8 and the full catalog schema before caching. This endpoint is curated by THRN, but HTTPS and catalog inclusion do not authenticate or establish the safety of individual skill publishers. Skill fetching uses public GitHub sources at exact, full commit hashes and independently validates source origin and immutable revision. A checksum from the same registry can detect accidental changes but does not prove publisher identity if that registry is compromised.
 - Bound network time, response size, archive size, expanded bytes, file count, per-file size, and path depth. Reject malformed metadata, absolute or traversal paths, drive/UNC prefixes, unsupported file types, case-fold collisions, and symlinks or hardlinks that escape the staging or target root.
 - Validate Agent Skills frontmatter and the skill directory/name relationship before installation, while preserving legitimate supporting files.
-- Treat an existing unreceipted target as externally managed. Never overwrite or recursively remove unrelated or user-modified paths. Require explicit scope and conflict choices; project scope is the default, user scope must be selected, and ambiguous noninteractive agent selection must fail.
+- Treat an existing unreceipted target as externally managed. Never overwrite or recursively remove unrelated or user-modified paths. The current installer requires explicit `--agent codex`, supports project scope only, and requires an existing project root; destination conflicts fail without overwrite.
 - Stage complete content near each destination and use atomic rename where the filesystem supports it. Multiple destinations are a recoverable sequence, not one cross-target atomic transaction. Write durable ownership receipts only after successful commits; preserve recovery state and report incomplete rollback.
 - Avoid logging credentials, tokens, environment secrets, private skill content, or unnecessary personal paths. The v1 public-source workflow should not require a GitHub token. Any future credential support needs an explicit design and redaction tests.
 - Make supply-chain claims proportionate to evidence. Pinned commits identify source revisions, not author identity. Stronger publisher authenticity requires a separately reviewed signing or attestation design; do not imply that TLS or a same-origin digest provides it.
 
-M2-03 implements read-only destination checks and an immutable proposal. M2-04 adds an internal Codex project directory commit; M2-05 adds post-commit ownership receipts and receipt-backed listing; M2-06 adds an internal journaled recovery path. These APIs are deliberately not connected to the CLI. `--dry-run` remains mandatory until recovery has passed independent architectural review.
+M2-03 implements read-only destination checks and an immutable proposal. M2-04 adds the Codex project directory commit; M2-05 adds post-commit ownership receipts and receipt-backed listing; M2-06 adds journaled recovery; M2-07 connects the explicit Codex project install command to `prepare_install_session()` and `commit_and_record()`. The command preserves the dry-run path, rejects conflicts before the ordinary commit flow, and reports incomplete post-commit failures without printing success. There is no public remove or update command, user scope, global scope, or other-agent adapter. The M2-07 implementation is prepared for independent architectural review; it is not a claim of a supported package release.
 
 ## Milestone status
 
@@ -122,7 +122,7 @@ Unix entries without type bits, ambiguous DOS directories, Unix symlinks, and sp
 M1-04's deferred cache path-component/concurrent-replacement review and recovery-message refinement
 remain tracked below. M2-02 does not change the cache and does not expand that follow-up.
 
-Current implementation boundaries through M2-03:
+Current implementation boundaries through M2-07:
 
 - **Catalog boundary:** version-1 JSON is size- and count-bounded; required fields, identifiers,
   case-insensitive ID/alias collisions, GitHub metadata, full commit hashes, and source-path
@@ -193,7 +193,7 @@ Current implementation boundaries through M2-03:
 
 ### M2-04 internal prepared and committed directory installation
 
-The CLI remains dry-run-only. `src/install/command.rs` has an internal session path that retains the
+At M2-04, the CLI remained dry-run-only. `src/install/command.rs` has a session path that retains the
 validated `StagedSkill`, its staged inventory and digests, and the corresponding immutable plan for
 the full commit operation. The session rejects mismatched catalog resource, skill name, source
 owner/repository/path/revision, target agent/scope, inventory, file list, or destination identity.
@@ -232,8 +232,9 @@ recursively deleted. After a successful rename, the complete skill directory is 
 does not guarantee disk durability or make receipt creation atomic with the directory. M2-06 adds
 a separate durable operation journal and coordinated internal recovery; see [the recovery
 protocol](recovery.md). Filesystem and receipt state still cannot be made one power-loss-atomic
-transaction across independent storage locations. The CLI remains dry-run-only pending independent
-architectural review.
+transaction across independent storage locations. M2-07 connects this engine to the real install
+command while preserving these limits; the implementation is pending independent architectural
+review before merge.
 
 ## Non-blocking M1-04 follow-up review
 
@@ -257,9 +258,9 @@ M2-02 network boundary.
 
 Remaining requirements:
 
-- **M2-04/M2-05/M2-06:** internal committed installation, durable ownership receipts, and coordinated
-  recovery are implemented. The API is not exposed through the CLI pending independent architectural
-  review.
+- **M2-07:** installation currently supports only Codex project scope. THRN does not yet expose
+  public remove or update commands, other agents, or user scope. The connected CLI path is pending
+  independent architectural review before merge.
 - **M3:** safe user-scope support and receipt-backed update/remove behavior that detects modified content and reports partial failure.
 
 Security-sensitive parsing and writes require negative tests with hostile fixtures, isolated temporary directories, and deterministic network mocks. See the [roadmap](ROADMAP.md) and [repository security policy](../SECURITY.md) for project status.
