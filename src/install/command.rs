@@ -19,11 +19,7 @@ use super::{
 };
 
 #[derive(Debug, Error)]
-pub enum InstallCommandError {
-    #[error(
-        "actual installation is not implemented yet; include --dry-run to inspect a read-only plan"
-    )]
-    DryRunRequired,
+pub(crate) enum InstallCommandError {
     #[error("M2-03 supports only --agent codex")]
     UnsupportedAgent,
     #[error("could not determine the current project directory ({kind})")]
@@ -42,13 +38,29 @@ pub enum InstallCommandError {
     Plan(#[from] PlanError),
     #[error("installation dry-run is blocked by destination conflicts")]
     Conflicts { conflicts: Vec<DestinationConflict> },
+    #[error("installation is blocked by destination conflicts")]
+    InstallConflicts { conflicts: Vec<DestinationConflict> },
+    #[error(
+        "a THRN-managed installation already exists at this destination; it was left unchanged"
+    )]
+    DuplicateManagedInstallation,
+    #[error(
+        "an existing skill at this destination is not recorded as THRN-managed; it was left unchanged"
+    )]
+    ExistingUnmanagedSkill,
+    #[error("THRN receipt store operation failed: {0}")]
+    ReceiptStore(#[source] super::receipt_store::ReceiptStoreError),
+    #[error(transparent)]
+    Recovery(#[from] super::receipt_store::RecoveryError),
+    #[error(transparent)]
+    Completion(#[from] super::commit::InstallationCompletionError),
     #[error("could not write command output: {0}")]
     Output(#[from] io::Error),
 }
 
 /// Build a plan through the existing validated catalog and source pipeline. Transport and
 /// temporary-directory creation are injected so all orchestration tests remain offline.
-pub fn prepare_install_plan<T: GithubTransport + ?Sized>(
+pub(crate) fn prepare_install_plan<T: GithubTransport + ?Sized>(
     catalog: &Catalog,
     identifier: &str,
     agent: &str,
@@ -70,8 +82,8 @@ pub fn prepare_install_plan<T: GithubTransport + ?Sized>(
 }
 
 /// Prepare a commit-capable internal session that keeps the validated source alive alongside
-/// its immutable plan and inventory. The CLI continues to use `prepare_install_plan` for its
-/// read-only dry-run contract.
+/// its immutable plan and inventory. Real installation keeps this session through receipt-backed
+/// completion; dry-run callers convert it into a read-only plan.
 pub(crate) fn prepare_install_session<T: GithubTransport + ?Sized>(
     catalog: &Catalog,
     identifier: &str,
@@ -95,7 +107,7 @@ pub(crate) fn prepare_install_session<T: GithubTransport + ?Sized>(
 }
 
 /// Render a complete successful plan into memory before the CLI writes one byte to stdout.
-pub fn format_dry_run(plan: &InstallPlan) -> Result<String, InstallCommandError> {
+pub(crate) fn format_dry_run(plan: &InstallPlan) -> Result<String, InstallCommandError> {
     if !plan.conflicts().is_empty() {
         return Err(InstallCommandError::Conflicts {
             conflicts: plan.conflicts().to_vec(),
@@ -164,7 +176,7 @@ pub fn format_dry_run(plan: &InstallPlan) -> Result<String, InstallCommandError>
     Ok(output)
 }
 
-pub fn format_conflicts(conflicts: &[DestinationConflict]) -> String {
+pub(crate) fn format_conflicts(conflicts: &[DestinationConflict]) -> String {
     let mut output = String::from("thrn: safe installation plan could not be built:\n");
     for conflict in conflicts {
         output.push_str(&format!(
@@ -366,7 +378,10 @@ mod tests {
         .expect("conflicting plan retains conflict data");
         let error =
             format_dry_run(&plan).expect_err("conflicts cannot produce successful plan text");
-        assert!(error.to_string().contains("destination conflicts"));
+        assert_eq!(
+            error.to_string(),
+            "installation dry-run is blocked by destination conflicts"
+        );
         assert_eq!(
             fs::read_dir(existing)
                 .expect("existing skill untouched")
@@ -388,7 +403,7 @@ mod tests {
         ))
         .expect("catalog");
         for (id, agent, expected) in [
-            ("uncharted", "cursor", "M2-03 supports only --agent codex"),
+            ("uncharted", "cursor", "only --agent codex"),
             ("bad--id", "codex", "invalid skill identifier"),
         ] {
             let error = prepare_install_plan(

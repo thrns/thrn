@@ -46,9 +46,10 @@ pub fn report(error: ThrnError) -> ExitCode {
                 .join("\n");
             write_diagnostic(&format!("thrn: skill validation failed\n{diagnostics}"))
         }
-        ThrnError::Install(crate::install::command::InstallCommandError::Conflicts {
-            conflicts,
-        }) => write_diagnostic(&crate::install::command::format_conflicts(&conflicts)),
+        ThrnError::Install(
+            crate::install::command::InstallCommandError::Conflicts { conflicts }
+            | crate::install::command::InstallCommandError::InstallConflicts { conflicts },
+        ) => write_diagnostic(&crate::install::command::format_conflicts(&conflicts)),
         error => write_diagnostic(&format!("thrn: {error}")),
     }
 }

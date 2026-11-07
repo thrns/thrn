@@ -1,9 +1,8 @@
 # Installation recovery
 
-M2-06 adds an internal recovery protocol for Codex project skills. The CLI still requires
-`skills install --dry-run`; public writes remain disabled until independent architectural review.
-The recovery implementation has no network dependency and tests use isolated application-data
-and project directories.
+M2-06 adds the recovery protocol used by Codex project installation. `thrn skills install` enters
+it through `InstallationSession::commit_and_record`; the recovery implementation itself has no
+network dependency and tests use isolated application-data and project directories.
 
 ## Journal storage and schema
 
@@ -141,12 +140,17 @@ operations fail closed.
 
 `skills list --installed` remains offline and read-only. It lists validated receipts only and does
 not invoke recovery, delete journal files, repair receipt storage, or claim ownership of an
-unreceipted directory. It does not validate current project contents. Internal recovery status is
-not currently exposed as a public command.
+unreceipted directory. It does not validate current project contents. There is no standalone public
+recovery command. A later explicit install attempt runs recovery before it can make a new project
+change; when destination inspection finds an existing skill, the CLI also reconciles pending
+operation records before reporting a managed duplicate or an unreceipted conflict.
 
-When an internal recovery attempt reports a conflict, preserve the project tree, receipt store, and
-`operations` directory as found. Record the operation ID and actionable error for the architect or
-maintainer. Do not delete a skill directory, `.writer.lock`, `.pending-*` file, receipt, or journal
-because its name looks temporary or stale. Do not copy an unreceipted directory into the managed
-list. A retry is safe only through THRN's recovery API after the underlying cause is understood;
-conflicts require inspection and an explicit recovery decision.
+When recovery reports a conflict, preserve the project tree, receipt store, and `operations`
+directory as found. Record the operation ID and actionable error for the architect or maintainer.
+Do not delete a skill directory, `.writer.lock`, `.pending-*` file, receipt, or journal because its
+name looks temporary or stale. Do not copy an unreceipted directory into the managed list. A retry
+through `thrn skills install` is safe only when recovery can verify and resolve the journal state;
+conflicts require inspection and an explicit recovery decision. An install failure after directory
+commitment is partial: installed content may remain while a receipt is pending, or a receipt may
+already be published while final journal cleanup is incomplete. THRN returns nonzero in either
+case and does not print its installation success message.
