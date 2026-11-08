@@ -128,7 +128,10 @@ impl ReceiptStore {
 
         let mut inspections = Vec::new();
         for (_, receipt) in receipts {
-            if receipt.scope() != scope.scope().as_str() || receipt.root_path() != scope.root() {
+            if receipt.agent() != scope.agent().as_str()
+                || receipt.scope() != scope.scope().as_str()
+                || receipt.root_path() != scope.root()
+            {
                 continue;
             }
             let content = if super::removal::verify_receipt_for_check(&receipt).is_ok() {
@@ -176,6 +179,7 @@ impl ReceiptStore {
         let project_root = super::removal::resolve_project_root(project, current_directory)?;
         self.plan_removal_at(
             resource_id,
+            super::plan::InstallAgent::Codex,
             super::plan::InstallScope::Project,
             &project_root,
         )
@@ -186,12 +190,13 @@ impl ReceiptStore {
         resource_id: &str,
         scope: &super::scope::ResolvedScope,
     ) -> Result<RemovalPlan, RemovalError> {
-        self.plan_removal_at(resource_id, scope.scope(), scope.root())
+        self.plan_removal_at(resource_id, scope.agent(), scope.scope(), scope.root())
     }
 
     fn plan_removal_at(
         &self,
         resource_id: &str,
+        agent: super::plan::InstallAgent,
         scope: super::plan::InstallScope,
         scope_root: &std::path::Path,
     ) -> Result<RemovalPlan, RemovalError> {
@@ -205,7 +210,7 @@ impl ReceiptStore {
             .map_err(|error| RemovalError::Store(error.to_string()))?;
         let receipts = read_receipts(&directory, true)
             .map_err(|error| RemovalError::Store(error.to_string()))?;
-        build_removal_plan(&directory, &receipts, resource_id, scope, scope_root)
+        build_removal_plan(&directory, &receipts, resource_id, agent, scope, scope_root)
     }
 
     pub(crate) fn plan_update_target_in_scope(
@@ -213,12 +218,13 @@ impl ReceiptStore {
         resource_id: &str,
         scope: &super::scope::ResolvedScope,
     ) -> Result<RemovalPlan, RemovalError> {
-        self.plan_update_target_at(resource_id, scope.scope(), scope.root())
+        self.plan_update_target_at(resource_id, scope.agent(), scope.scope(), scope.root())
     }
 
     fn plan_update_target_at(
         &self,
         resource_id: &str,
+        agent: super::plan::InstallAgent,
         scope: super::plan::InstallScope,
         scope_root: &std::path::Path,
     ) -> Result<RemovalPlan, RemovalError> {
@@ -232,7 +238,7 @@ impl ReceiptStore {
             .map_err(|error| RemovalError::Store(error.to_string()))?;
         let receipts = read_receipts(&directory, true)
             .map_err(|error| RemovalError::Store(error.to_string()))?;
-        build_removal_plan(&directory, &receipts, resource_id, scope, scope_root)
+        build_removal_plan(&directory, &receipts, resource_id, agent, scope, scope_root)
     }
 
     pub(crate) fn update_receipt_digest(
@@ -264,6 +270,7 @@ impl ReceiptStore {
         let project_root = super::removal::resolve_project_root(project, current_directory)?;
         self.remove_by_id_at(
             resource_id,
+            super::plan::InstallAgent::Codex,
             super::plan::InstallScope::Project,
             &project_root,
             faults,
@@ -276,12 +283,19 @@ impl ReceiptStore {
         scope: &super::scope::ResolvedScope,
         faults: &dyn RemovalFaultInjector,
     ) -> Result<RemovalSummary, RemovalError> {
-        self.remove_by_id_at(resource_id, scope.scope(), scope.root(), faults)
+        self.remove_by_id_at(
+            resource_id,
+            scope.agent(),
+            scope.scope(),
+            scope.root(),
+            faults,
+        )
     }
 
     fn remove_by_id_at(
         &self,
         resource_id: &str,
+        agent: super::plan::InstallAgent,
         scope: super::plan::InstallScope,
         scope_root: &std::path::Path,
         faults: &dyn RemovalFaultInjector,
@@ -312,15 +326,28 @@ impl ReceiptStore {
         let update_store = self
             .update_journal_store()
             .map_err(|error| RemovalError::Store(error.to_string()))?;
-        let removal_count = removal_store
-            .pending_count()
+        let removal_records = removal_store
+            .read_all()
             .map_err(|error| RemovalError::Journal(error.to_string()))?;
-        let update_count = update_store
-            .pending_count()
+        let update_records = update_store
+            .read_all()
             .map_err(|error| RemovalError::Journal(error.to_string()))?;
-        if removal_count != 0 && update_count != 0 {
+        if !removal_records.is_empty() && !update_records.is_empty() {
             return Err(RemovalError::Store(
                 "conflicting removal and update journals require manual recovery".to_owned(),
+            ));
+        }
+        if removal_records.iter().any(|record| {
+            record.receipt().agent() != agent.as_str()
+                || record.receipt().scope() != scope.as_str()
+                || record.receipt().root_path() != scope_root
+        }) || update_records.iter().any(|record| {
+            record.receipt().agent() != agent.as_str()
+                || record.receipt().scope() != scope.as_str()
+                || record.receipt().root_path() != scope_root
+        }) {
+            return Err(RemovalError::Store(
+                "a pending lifecycle operation belongs to a different agent or scope; recover that exact target first".to_owned(),
             ));
         }
         super::update::recover_all(
@@ -336,7 +363,8 @@ impl ReceiptStore {
             .map_err(|error| RemovalError::Store(error.to_string()))?;
         let receipts = read_receipts(&directory, true)
             .map_err(|error| RemovalError::Store(error.to_string()))?;
-        let plan = build_removal_plan(&directory, &receipts, resource_id, scope, scope_root)?;
+        let plan =
+            build_removal_plan(&directory, &receipts, resource_id, agent, scope, scope_root)?;
         let summary = super::removal::remove_plan(&plan, &removal_store, directory, &lock, faults)?;
         lock.release()
             .map_err(|error| RemovalError::Store(error.to_string()))?;
@@ -454,6 +482,34 @@ impl ReceiptStore {
             let install_records = install_store
                 .read_all()
                 .map_err(|error| UpdateError::RecoveryRequired(error.to_string()))?;
+            let removal_store = self
+                .removal_journal_store()
+                .map_err(|error| UpdateError::Store(error.to_string()))?;
+            let removal_records = removal_store
+                .read_all()
+                .map_err(|error| UpdateError::RecoveryRequired(error.to_string()))?;
+            let update_store = self
+                .update_journal_store()
+                .map_err(|error| UpdateError::Store(error.to_string()))?;
+            let update_records = update_store
+                .read_all()
+                .map_err(|error| UpdateError::RecoveryRequired(error.to_string()))?;
+            let target_receipt = plan.receipt();
+            if install_records
+                .iter()
+                .any(|record| !same_operation_scope(record.receipt(), target_receipt))
+                || removal_records
+                    .iter()
+                    .any(|record| !same_operation_scope(record.receipt(), target_receipt))
+                || update_records
+                    .iter()
+                    .any(|record| !same_operation_scope(record.receipt(), target_receipt))
+            {
+                return Err(UpdateError::RecoveryRequired(
+                    "a pending lifecycle operation belongs to a different agent or scope"
+                        .to_owned(),
+                ));
+            }
             for record in install_records {
                 lock.validate()
                     .map_err(|error| UpdateError::RecoveryRequired(error.to_string()))?;
@@ -467,14 +523,8 @@ impl ReceiptStore {
                 )
                 .map_err(|error| UpdateError::RecoveryRequired(error.to_string()))?;
             }
-            let removal_store = self
-                .removal_journal_store()
-                .map_err(|error| UpdateError::Store(error.to_string()))?;
             super::removal::recover_all(&removal_store, &directory, &lock, &NoRemovalFaults)
                 .map_err(|error| UpdateError::RecoveryRequired(error.to_string()))?;
-            let update_store = self
-                .update_journal_store()
-                .map_err(|error| UpdateError::Store(error.to_string()))?;
             super::update::recover_all(&update_store, &directory, &lock, &NoReceiptFaults, faults)
                 .map_err(UpdateError::RecoveryRequired)?;
             lock.validate()
@@ -550,6 +600,7 @@ impl ReceiptStore {
     }
 
     /// Internal startup/retry API. Recovery and installation share the same OS-backed writer lock.
+    #[cfg(test)]
     pub(crate) fn recover_with_faults(
         &self,
         journal_faults: &dyn JournalFaultInjector,
@@ -558,8 +609,33 @@ impl ReceiptStore {
         self.recover_with_all_faults(&NoRecoveryInstallFaults, journal_faults, receipt_faults)
     }
 
+    #[cfg(test)]
     pub(crate) fn recover_with_all_faults(
         &self,
+        install_faults: &dyn InstallFaultInjector,
+        journal_faults: &dyn JournalFaultInjector,
+        receipt_faults: &dyn ReceiptFaultInjector,
+    ) -> Result<Vec<RecoveryOutcome>, RecoveryError> {
+        self.recover_with_scope_filter(None, install_faults, journal_faults, receipt_faults)
+    }
+
+    pub(crate) fn recover_scope_with_faults(
+        &self,
+        scope: &super::scope::ResolvedScope,
+        journal_faults: &dyn JournalFaultInjector,
+        receipt_faults: &dyn ReceiptFaultInjector,
+    ) -> Result<Vec<RecoveryOutcome>, RecoveryError> {
+        self.recover_with_scope_filter(
+            Some(scope),
+            &NoRecoveryInstallFaults,
+            journal_faults,
+            receipt_faults,
+        )
+    }
+
+    fn recover_with_scope_filter(
+        &self,
+        selected_scope: Option<&super::scope::ResolvedScope>,
         install_faults: &dyn InstallFaultInjector,
         journal_faults: &dyn JournalFaultInjector,
         receipt_faults: &dyn ReceiptFaultInjector,
@@ -578,12 +654,27 @@ impl ReceiptStore {
             let records = journal_store.read_all().map_err(RecoveryError::Journal)?;
             let removal_store = self.removal_journal_store().map_err(RecoveryError::Store)?;
             let update_store = self.update_journal_store().map_err(RecoveryError::Store)?;
-            let removal_count = removal_store
-                .pending_count()
+            let removal_records = removal_store
+                .read_all()
                 .map_err(|error| RecoveryError::Removal(error.to_string()))?;
-            let update_count = update_store
-                .pending_count()
+            let update_records = update_store
+                .read_all()
                 .map_err(|error| RecoveryError::Update(error.to_string()))?;
+            if selected_scope.is_some_and(|scope| {
+                records
+                    .iter()
+                    .any(|record| !receipt_matches_scope(record.receipt(), scope))
+                    || removal_records
+                        .iter()
+                        .any(|record| !receipt_matches_scope(record.receipt(), scope))
+                    || update_records
+                        .iter()
+                        .any(|record| !receipt_matches_scope(record.receipt(), scope))
+            }) {
+                return Err(RecoveryError::ForeignOperation);
+            }
+            let removal_count = removal_records.len();
+            let update_count = update_records.len();
             if (!records.is_empty() && (removal_count != 0 || update_count != 0))
                 || (removal_count != 0 && update_count != 0)
             {
@@ -625,7 +716,7 @@ impl ReceiptStore {
         }
     }
 
-    /// Rehash the exact current Codex project tree. Receipt paths are fully validated before
+    /// Rehash the exact current selected-agent tree. Receipt paths are validated before
     /// any referenced project location is opened. Listing deliberately does not call this.
     #[cfg(test)]
     pub(crate) fn verify_current_content(
@@ -697,6 +788,7 @@ fn build_removal_plan(
     directory: &SecureDir,
     receipts: &[(String, InstallationReceipt)],
     resource_id: &str,
+    agent: super::plan::InstallAgent,
     scope: super::plan::InstallScope,
     scope_root: &std::path::Path,
 ) -> Result<RemovalPlan, RemovalError> {
@@ -717,6 +809,7 @@ fn build_removal_plan(
         .iter()
         .filter(|(_, receipt)| {
             receipt.catalog_resource_id() == requested.as_str()
+                && receipt.agent() == agent.as_str()
                 && receipt.scope() == scope.as_str()
                 && receipt.root_path() == scope_root
         })
@@ -729,7 +822,7 @@ fn build_removal_plan(
             "multiple ownership receipts claim this canonical resource and scope".to_owned(),
         ));
     };
-    if receipt.agent() != "codex"
+    if receipt.agent() != agent.as_str()
         || receipt.scope() != scope.as_str()
         || receipt.root_path().to_str() != Some(scope_text)
     {
@@ -1519,14 +1612,14 @@ fn verify_rolled_back_operation(record: &JournalRecord) -> Result<(), RecoveryEr
         if agents.is_some() {
             return Err(recovery_conflict(
                 record,
-                "rolled-back operation-created .agents parent remains",
+                "rolled-back operation-created agent parent remains",
             ));
         }
         if record.project_agents_identity().is_some() && !record.has_cleanup_intent("agents-parent")
         {
             return Err(recovery_conflict(
                 record,
-                "rolled-back .agents parent is missing without a cleanup intent",
+                "rolled-back agent parent is missing without a cleanup intent",
             ));
         }
     }
@@ -1538,6 +1631,7 @@ fn recovery_parent_directories(
     record: &JournalRecord,
 ) -> Result<(SecureDir, Option<SecureDir>, Option<SecureDir>), RecoveryError> {
     let receipt = record.receipt();
+    let agent_directory = receipt.agent_directory();
     let project = SecureDir::open_absolute(&receipt.root_path()).map_err(|error| {
         recovery_conflict(record, format!("project root is unavailable: {error}"))
     })?;
@@ -1547,18 +1641,18 @@ fn recovery_parent_directories(
             "project filesystem identity changed",
         ));
     }
-    let agents = open_recovery_directory(record, &project, ".agents")?;
+    let agents = open_recovery_directory(record, &project, agent_directory)?;
     if let Some(agents) = &agents {
         if record.project_agents_identity() != agents.identity().ok() {
             return Err(recovery_conflict(
                 record,
-                "project .agents identity changed",
+                "agent directory identity changed",
             ));
         }
     } else if record.project_agents_identity().is_some() && !record.create_agents_directory() {
         return Err(recovery_conflict(
             record,
-            "pre-existing project .agents directory is missing",
+            "pre-existing agent directory is missing",
         ));
     }
     let skills = match &agents {
@@ -1608,6 +1702,7 @@ fn validate_and_remove_recovery_parents(
     journal_faults: &dyn JournalFaultInjector,
 ) -> Result<(), RecoveryError> {
     let record = journal.record().clone();
+    let agent_directory = record.receipt().agent_directory();
     if record.create_skills_directory() {
         if let Some(skills) = skills {
             if record.project_skills_identity() != skills.identity().ok()
@@ -1714,27 +1809,24 @@ fn validate_and_remove_recovery_parents(
             || !agents
                 .entries()
                 .map_err(|error| {
-                    recovery_conflict(
-                        &record,
-                        format!("cannot inspect .agents directory: {error}"),
-                    )
+                    recovery_conflict(&record, format!("cannot inspect agent directory: {error}"))
                 })?
                 .is_empty()
         {
             return Err(recovery_conflict(
                 &record,
-                "operation-created .agents directory changed or is not empty",
+                "operation-created agent directory changed or is not empty",
             ));
         }
         journal
             .record_cleanup_intent("agents-parent".to_owned(), journal_faults)
             .map_err(RecoveryError::Journal)?;
         let current = project
-            .open_directory(std::ffi::OsStr::new(".agents"))
+            .open_directory(std::ffi::OsStr::new(agent_directory))
             .map_err(|error| {
                 recovery_conflict(
                     &record,
-                    format!("cannot recheck .agents directory before cleanup: {error}"),
+                    format!("cannot recheck agent directory before cleanup: {error}"),
                 )
             })?;
         if current.identity().ok() != record.project_agents_identity()
@@ -1743,14 +1835,14 @@ fn validate_and_remove_recovery_parents(
                 .map_err(|error| {
                     recovery_conflict(
                         &record,
-                        format!("cannot recheck .agents directory before cleanup: {error}"),
+                        format!("cannot recheck agent directory before cleanup: {error}"),
                     )
                 })?
                 .is_empty()
         {
             return Err(recovery_conflict(
                 &record,
-                "operation-created .agents directory changed before cleanup",
+                "operation-created agent directory changed before cleanup",
             ));
         }
         install_faults
@@ -1758,13 +1850,13 @@ fn validate_and_remove_recovery_parents(
             .map_err(|error| {
                 recovery_conflict(
                     &record,
-                    format!("injected or failed .agents cleanup: {error}"),
+                    format!("injected or failed agent-directory cleanup: {error}"),
                 )
             })?;
-        project.remove_directory(".agents").map_err(|error| {
+        project.remove_directory(agent_directory).map_err(|error| {
             recovery_conflict(
                 &record,
-                format!("cannot remove empty operation-created .agents directory: {error}"),
+                format!("cannot remove empty operation-created agent directory: {error}"),
             )
         })?;
         install_faults
@@ -1772,7 +1864,7 @@ fn validate_and_remove_recovery_parents(
             .map_err(|error| {
                 recovery_conflict(
                     &record,
-                    format!(".agents cleanup completed but reported failure: {error}"),
+                    format!("agent-directory cleanup completed but reported failure: {error}"),
                 )
             })?;
         install_faults
@@ -1800,7 +1892,7 @@ fn validate_and_remove_recovery_parents(
     {
         return Err(recovery_conflict(
             &record,
-            "recorded .agents parent is missing without a durable cleanup intent",
+            "recorded agent parent is missing without a durable cleanup intent",
         ));
     }
     Ok(())
@@ -2830,8 +2922,11 @@ pub enum ReceiptStoreError {
     },
     #[error("receipt storage contains duplicate ownership claims for an installation identity")]
     DuplicateIdentity,
-    #[error("receipt storage contains conflicting claims for the same Codex project destination")]
-    DestinationConflict,
+    #[error("receipt storage contains conflicting claims for the same {agent} {scope} destination")]
+    DestinationConflict {
+        agent: &'static str,
+        scope: &'static str,
+    },
     #[error(
         "receipt storage has managed records but no persistent writer lock for a coherent read"
     )]
@@ -2912,12 +3007,31 @@ pub(crate) enum RecoveryError {
     )]
     LifecycleConflict,
     #[error(
+        "a pending lifecycle operation belongs to a different agent or scope; recover that exact target first"
+    )]
+    ForeignOperation,
+    #[error(
         "operation {operation_id} conflicts with current filesystem or receipt state: {detail}; preserve the content and inspect it manually"
     )]
     Conflict {
         operation_id: String,
         detail: String,
     },
+}
+
+fn receipt_matches_scope(
+    receipt: &InstallationReceipt,
+    scope: &super::scope::ResolvedScope,
+) -> bool {
+    receipt.agent() == scope.agent().as_str()
+        && receipt.scope() == scope.scope().as_str()
+        && receipt.root_path() == scope.root()
+}
+
+fn same_operation_scope(left: &InstallationReceipt, right: &InstallationReceipt) -> bool {
+    left.agent() == right.agent()
+        && left.scope() == right.scope()
+        && left.root_path() == right.root_path()
 }
 
 fn read_receipts(
@@ -3181,7 +3295,7 @@ fn validate_new_claim(
             return Err(ReceiptStoreError::DuplicateIdentity);
         }
         if new_receipt.same_destination(receipt) {
-            return Err(ReceiptStoreError::DestinationConflict);
+            return Err(destination_conflict(new_receipt));
         }
     }
     Ok(())
@@ -3195,16 +3309,30 @@ fn validate_unique_destinations(
             .iter()
             .any(|(_, other)| receipt.same_destination(other))
         {
-            return Err(ReceiptStoreError::DestinationConflict);
+            return Err(destination_conflict(receipt));
         }
     }
     Ok(())
+}
+
+fn destination_conflict(receipt: &InstallationReceipt) -> ReceiptStoreError {
+    ReceiptStoreError::DestinationConflict {
+        agent: match receipt.agent() {
+            "codex" => "Codex",
+            _ => "Claude Code",
+        },
+        scope: match receipt.scope() {
+            "project" => "project",
+            _ => "user",
+        },
+    }
 }
 
 fn valid_receipt_filename(name: &str) -> bool {
     let hex = name
         .strip_prefix("v1-")
         .or_else(|| name.strip_prefix("v2-"))
+        .or_else(|| name.strip_prefix("v4-"))
         .and_then(|name| name.strip_suffix(".json"));
     let Some(hex) = hex else { return false };
     hex.len() == 64
@@ -3241,7 +3369,7 @@ fn verify_receipt_tree(
     {
         return Ok(ReceiptContentState::Modified);
     }
-    let Some(agents) = open_directory_status(&project, ".agents")? else {
+    let Some(agents) = open_directory_status(&project, receipt.agent_directory())? else {
         return Ok(ReceiptContentState::Missing);
     };
     let Some(skills) = open_directory_status(&agents, "skills")? else {
@@ -3469,7 +3597,7 @@ mod tests {
                 JournalError, JournalFaultInjector, JournalIntent, JournalOperation, JournalStore,
                 MAX_JOURNAL_BYTES, OperationState,
             },
-            plan::InstallScope,
+            plan::{InstallAgent, InstallScope},
             receipt::InstallationReceipt,
             scope::ResolvedScope,
         },
@@ -3539,6 +3667,34 @@ mod tests {
 
     fn session(project: &Path, stage_parent: &Path) -> InstallationSession {
         session_with_archive(project, stage_parent, archive())
+    }
+
+    fn session_for_agent(
+        project: &Path,
+        stage_parent: &Path,
+        agent: InstallAgent,
+    ) -> InstallationSession {
+        if agent == InstallAgent::Codex {
+            return session(project, stage_parent);
+        }
+        let catalog = parse_catalog_json(include_bytes!(
+            "../../tests/fixtures/catalog/test-only-valid-v1.json"
+        ))
+        .expect("catalog");
+        let scope = ResolvedScope::from_agent_validated(
+            agent,
+            InstallScope::Project,
+            project.to_path_buf(),
+        );
+        prepare_install_session_in_scope(
+            &catalog,
+            "uncharted",
+            agent.as_str(),
+            &scope,
+            &FakeTransport(archive()),
+            &TestFactory(stage_parent.to_path_buf()),
+        )
+        .expect("validated agent session")
     }
 
     fn session_with_archive(
@@ -5174,8 +5330,12 @@ mod tests {
             let project = PathBuf::from(std::env::var_os("THRN_M2_06_PROJECT").expect("project"));
             let staging = PathBuf::from(std::env::var_os("THRN_M2_06_STAGING").expect("staging"));
             let data = PathBuf::from(std::env::var_os("THRN_M2_06_DATA").expect("data"));
+            let agent = match std::env::var("THRN_M2_06_AGENT").as_deref() {
+                Ok("claude-code") => InstallAgent::ClaudeCode,
+                _ => InstallAgent::Codex,
+            };
             let store = ReceiptStore::new(data.join("receipts"));
-            let _ = session(&project, &staging).commit_and_record_at(
+            let _ = session_for_agent(&project, &staging, agent).commit_and_record_at(
                 &store,
                 1,
                 &ExitAfterInstall(InstallOperation::CommitNoReplace),
@@ -5184,33 +5344,47 @@ mod tests {
             panic!("child should exit after the no-replace rename");
         }
 
-        let (_parent, project, staging, data) = setup();
-        let status = Command::new(std::env::current_exe().expect("test executable"))
-            .arg("--exact")
-            .arg("install::receipt_store::tests::subprocess_crash_after_directory_rename_finalizes_verified_receipt")
-            .arg("--nocapture")
-            .env("THRN_M2_06_CRASH_AFTER_DIRECTORY_RENAME", "1")
-            .env("THRN_M2_06_PROJECT", &project)
-            .env("THRN_M2_06_STAGING", &staging)
-            .env("THRN_M2_06_DATA", &data)
-            .status()
-            .expect("launch crash simulation");
-        assert_eq!(status.code(), Some(87));
-        let store = ReceiptStore::new(data.join("receipts"));
-        assert_eq!(
-            store
-                .recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults)
-                .expect("finalize verified committed directory"),
-            vec![super::RecoveryOutcome::FinalizedReceipt]
-        );
-        let receipts = store.list().expect("published receipt");
-        assert_eq!(receipts.len(), 1);
-        assert_eq!(
-            store
-                .verify_current_content(&receipts[0])
-                .expect("verify recovered install"),
-            ReceiptContentState::Verified
-        );
+        for agent in [InstallAgent::Codex, InstallAgent::ClaudeCode] {
+            let (_parent, project, staging, data) = setup();
+            let status = Command::new(std::env::current_exe().expect("test executable"))
+                .arg("--exact")
+                .arg("install::receipt_store::tests::subprocess_crash_after_directory_rename_finalizes_verified_receipt")
+                .arg("--nocapture")
+                .env("THRN_M2_06_CRASH_AFTER_DIRECTORY_RENAME", "1")
+                .env("THRN_M2_06_AGENT", agent.as_str())
+                .env("THRN_M2_06_PROJECT", &project)
+                .env("THRN_M2_06_STAGING", &staging)
+                .env("THRN_M2_06_DATA", &data)
+                .status()
+                .expect("launch crash simulation");
+            assert_eq!(status.code(), Some(87), "agent={}", agent.as_str());
+            let store = ReceiptStore::new(data.join("receipts"));
+            let scope =
+                ResolvedScope::from_agent_validated(agent, InstallScope::Project, project.clone());
+            assert_eq!(
+                store
+                    .recover_scope_with_faults(&scope, &NoJournalFaultsForTest, &NoReceiptFaults)
+                    .expect("finalize verified committed directory"),
+                vec![super::RecoveryOutcome::FinalizedReceipt]
+            );
+            let receipts = store.list().expect("published receipt");
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].agent(), agent.as_str());
+            assert_eq!(
+                receipts[0].schema_version(),
+                if agent == InstallAgent::ClaudeCode {
+                    4
+                } else {
+                    2
+                }
+            );
+            assert_eq!(
+                store
+                    .verify_current_content(&receipts[0])
+                    .expect("verify recovered install"),
+                ReceiptContentState::Verified
+            );
+        }
     }
 
     #[test]
@@ -5278,8 +5452,12 @@ mod tests {
             let project = PathBuf::from(std::env::var_os("THRN_M2_06_PROJECT").expect("project"));
             let staging = PathBuf::from(std::env::var_os("THRN_M2_06_STAGING").expect("staging"));
             let data = PathBuf::from(std::env::var_os("THRN_M2_06_DATA").expect("data"));
+            let agent = match std::env::var("THRN_M2_06_AGENT").as_deref() {
+                Ok("claude-code") => InstallAgent::ClaudeCode,
+                _ => InstallAgent::Codex,
+            };
             let store = ReceiptStore::new(data.join("receipts"));
-            let _ = session(&project, &staging).commit_and_record_at(
+            let _ = session_for_agent(&project, &staging, agent).commit_and_record_at(
                 &store,
                 1,
                 &NoInstallFaults,
@@ -5288,32 +5466,46 @@ mod tests {
             panic!("child should exit after the receipt rename");
         }
 
-        let (_parent, project, staging, data) = setup();
-        let status = Command::new(std::env::current_exe().expect("test executable"))
-            .arg("--exact")
-            .arg("install::receipt_store::tests::subprocess_crash_after_receipt_rename_is_completed_idempotently")
-            .arg("--nocapture")
-            .env("THRN_M2_06_CRASH_AFTER_RECEIPT_RENAME", "1")
-            .env("THRN_M2_06_PROJECT", &project)
-            .env("THRN_M2_06_STAGING", &staging)
-            .env("THRN_M2_06_DATA", &data)
-            .status()
-            .expect("launch crash simulation");
-        assert_eq!(status.code(), Some(89));
-        let store = ReceiptStore::new(data.join("receipts"));
-        assert_eq!(
-            store
-                .recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults)
-                .expect("complete already-published receipt"),
-            vec![super::RecoveryOutcome::FinalizedReceipt]
-        );
-        assert_eq!(store.list().expect("one receipt").len(), 1);
-        assert!(
-            store
-                .recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults)
-                .expect("repeat recovery")
-                .is_empty()
-        );
+        for agent in [InstallAgent::Codex, InstallAgent::ClaudeCode] {
+            let (_parent, project, staging, data) = setup();
+            let status = Command::new(std::env::current_exe().expect("test executable"))
+                .arg("--exact")
+                .arg("install::receipt_store::tests::subprocess_crash_after_receipt_rename_is_completed_idempotently")
+                .arg("--nocapture")
+                .env("THRN_M2_06_CRASH_AFTER_RECEIPT_RENAME", "1")
+                .env("THRN_M2_06_AGENT", agent.as_str())
+                .env("THRN_M2_06_PROJECT", &project)
+                .env("THRN_M2_06_STAGING", &staging)
+                .env("THRN_M2_06_DATA", &data)
+                .status()
+                .expect("launch crash simulation");
+            assert_eq!(status.code(), Some(89), "agent={}", agent.as_str());
+            let store = ReceiptStore::new(data.join("receipts"));
+            let scope = ResolvedScope::from_agent_validated(agent, InstallScope::Project, project);
+            assert_eq!(
+                store
+                    .recover_scope_with_faults(&scope, &NoJournalFaultsForTest, &NoReceiptFaults)
+                    .expect("complete already-published receipt"),
+                vec![super::RecoveryOutcome::FinalizedReceipt]
+            );
+            let receipts = store.list().expect("one receipt");
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].agent(), agent.as_str());
+            assert_eq!(
+                receipts[0].schema_version(),
+                if agent == InstallAgent::ClaudeCode {
+                    4
+                } else {
+                    2
+                }
+            );
+            assert!(
+                store
+                    .recover_scope_with_faults(&scope, &NoJournalFaultsForTest, &NoReceiptFaults)
+                    .expect("repeat recovery")
+                    .is_empty()
+            );
+        }
     }
 
     #[test]
@@ -5614,7 +5806,7 @@ mod tests {
         .expect("second conflicting claim");
         assert!(matches!(
             store.list(),
-            Err(ReceiptStoreError::DestinationConflict)
+            Err(ReceiptStoreError::DestinationConflict { .. })
         ));
     }
 

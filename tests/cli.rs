@@ -92,8 +92,11 @@ fn receipt_directory(directory: &TestDir) -> PathBuf {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = digest(&SHA256, bytes);
-    digest
-        .as_ref()
+    digest_hex(digest.as_ref())
+}
+
+fn digest_hex(bytes: &[u8]) -> String {
+    bytes
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>()
@@ -113,6 +116,112 @@ fn receipt_filename(project_root: &str, resource_id: &str) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     format!("v1-{hex}.json")
+}
+
+fn digest_field(context: &mut Context, value: &[u8]) {
+    context.update(&(value.len() as u64).to_be_bytes());
+    context.update(value);
+}
+
+fn claude_receipt_filename(root: &str, scope: &str, root_identity: (u64, u64)) -> String {
+    let mut context = Context::new(&SHA256);
+    context.update(b"THRN-RECEIPT-IDENTITY-V4\0");
+    digest_field(&mut context, b"claude-code");
+    digest_field(&mut context, scope.as_bytes());
+    digest_field(&mut context, b"claude-code-default-v1");
+    digest_field(&mut context, root.as_bytes());
+    context.update(&root_identity.0.to_be_bytes());
+    context.update(&root_identity.1.to_be_bytes());
+    digest_field(&mut context, b"claude-code");
+    digest_field(&mut context, b"uncharted");
+    let identity = context.finish();
+    format!("v4-{}.json", digest_hex(identity.as_ref()))
+}
+
+fn write_claude_receipt(directory: &TestDir, root: &std::path::Path, scope: &str) -> PathBuf {
+    let root = fs::canonicalize(root).expect("canonical selected scope root");
+    let root_text = root.to_str().expect("UTF-8 test path");
+    let destination = root.join(".claude/skills/uncharted-ideation");
+    fs::create_dir_all(&destination).expect("Claude skill destination");
+    let content = b"abc";
+    fs::write(destination.join("SKILL.md"), content).expect("Claude skill file");
+    let root_identity = project_filesystem_identity(&root);
+    let destination_identity = project_filesystem_identity(&destination);
+    let file_digest = digest(&SHA256, content);
+
+    let mut content_context = Context::new(&SHA256);
+    content_context.update(b"THRN-CONTENT-INVENTORY-V4\0");
+    digest_field(&mut content_context, b"claude-code");
+    digest_field(&mut content_context, scope.as_bytes());
+    digest_field(&mut content_context, b"claude-code-default-v1");
+    digest_field(&mut content_context, root_text.as_bytes());
+    content_context.update(&root_identity.0.to_be_bytes());
+    content_context.update(&root_identity.1.to_be_bytes());
+    content_context.update(&destination_identity.0.to_be_bytes());
+    content_context.update(&destination_identity.1.to_be_bytes());
+    content_context.update(&0_u64.to_be_bytes());
+    content_context.update(&1_u64.to_be_bytes());
+    content_context.update(b"F");
+    digest_field(&mut content_context, b"SKILL.md");
+    content_context.update(&(content.len() as u64).to_be_bytes());
+    content_context.update(file_digest.as_ref());
+    let content_digest = format!("sha256:{}", digest_hex(content_context.finish().as_ref()));
+
+    let mut receipt = serde_json::json!({
+        "schemaVersion": 4,
+        "destinationLayout": "claude-code-default-v1",
+        "catalogResourceId": "uncharted",
+        "skillName": "uncharted-ideation",
+        "agent": "claude-code",
+        "scope": scope,
+        "destination": destination.to_string_lossy(),
+        "installedAtUnixSeconds": 1,
+        "sourceOwner": "Example-Org",
+        "sourceRepository": "catalog-test-fixtures",
+        "sourceCommit": "2f68bee292a8c68346b4294fb31d9563eefe1ade",
+        "sourceDirectory": "skills/uncharted-ideation",
+        "resourceVersion": "1.0.0",
+        "installedDirectoryIdentity": {
+            "volume": destination_identity.0,
+            "object": destination_identity.1
+        },
+        "directories": [],
+        "files": [{
+            "path": "SKILL.md",
+            "byteCount": content.len(),
+            "sha256": format!("sha256:{}", sha256_hex(content))
+        }],
+        "fileCount": 1,
+        "byteCount": content.len(),
+        "contentDigest": content_digest
+    });
+    if scope == "project" {
+        receipt["canonicalProjectRoot"] = serde_json::json!(root_text);
+        receipt["projectRootIdentity"] = serde_json::json!({
+            "volume": root_identity.0,
+            "object": root_identity.1
+        });
+    } else {
+        receipt["canonicalScopeRoot"] = serde_json::json!(root_text);
+        receipt["scopeRootIdentity"] = serde_json::json!({
+            "volume": root_identity.0,
+            "object": root_identity.1
+        });
+    }
+
+    let receipts = receipt_directory(directory);
+    fs::create_dir_all(&receipts).expect("receipt storage");
+    let writer_lock = receipts.join(".writer.lock");
+    if !writer_lock.exists() {
+        fs::write(writer_lock, []).expect("persistent writer lock fixture");
+    }
+    let path = receipts.join(claude_receipt_filename(root_text, scope, root_identity));
+    fs::write(
+        &path,
+        serde_json::to_vec(&receipt).expect("Claude receipt JSON"),
+    )
+    .expect("Claude receipt fixture");
+    path
 }
 
 fn receipt_json(project_root: &str, resource_id: &str, skill_name: &str, identity: u64) -> Vec<u8> {
@@ -422,7 +531,7 @@ fn skills_check_empty_project_uses_bundled_metadata_offline_without_creating_sto
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Offline skill update check"));
     assert!(stdout.contains("Catalog source: bundled metadata; freshness: unknown"));
-    assert!(stdout.contains("No THRN-managed Codex project skills are recorded"));
+    assert!(stdout.contains("No THRN-managed codex project skills are recorded"));
     assert!(stdout.contains("no network request was made"));
     assert!(output.stderr.is_empty());
     assert_eq!(recursive_snapshot(directory.root()), before);
@@ -442,7 +551,7 @@ fn skills_check_user_scope_is_offline_read_only_and_uses_the_isolated_home() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Scope: user"));
     assert!(stdout.contains(&format!("User root: {}", directory.root().display())));
-    assert!(stdout.contains("No THRN-managed Codex user skills are recorded"));
+    assert!(stdout.contains("No THRN-managed codex user skills are recorded"));
     assert!(stdout.contains("no network request was made"));
     assert!(output.stderr.is_empty());
     assert_eq!(recursive_snapshot(directory.root()), before);
@@ -452,32 +561,129 @@ fn skills_check_user_scope_is_offline_read_only_and_uses_the_isolated_home() {
 }
 
 #[test]
+fn claude_check_and_installed_listing_are_offline_read_only_and_scope_accurate() {
+    let directory = TestDir::new();
+    let project_receipt = write_claude_receipt(&directory, directory.path(), "project");
+    write_claude_receipt(&directory, directory.root(), "user");
+    let before = recursive_snapshot(directory.root());
+
+    let project_check = command_in(
+        &directory,
+        &[
+            "skills",
+            "check",
+            "--agent",
+            "claude-code",
+            "--scope",
+            "project",
+        ],
+    )
+    .output()
+    .expect("compiled CLI starts without network access");
+    assert_eq!(
+        project_check.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&project_check.stderr)
+    );
+    let project_stdout = String::from_utf8_lossy(&project_check.stdout);
+    assert!(project_stdout.contains("Agent: claude-code"));
+    assert!(project_stdout.contains("THRN-managed claude-code project skills checked: 1"));
+    assert!(project_stdout.contains("Status:"));
+    assert!(project_stdout.contains("no network request was made"));
+    assert!(project_check.stderr.is_empty());
+
+    let alternate_config = directory.root().join("claude-config-override");
+    let mut user_command = command_in(
+        &directory,
+        &[
+            "skills",
+            "check",
+            "--agent",
+            "claude-code",
+            "--scope",
+            "user",
+        ],
+    );
+    user_command.env("CLAUDE_CONFIG_DIR", &alternate_config);
+    let user_check = user_command
+        .output()
+        .expect("Claude user check remains local-only");
+    assert_eq!(user_check.status.code(), Some(0));
+    let user_stdout = String::from_utf8_lossy(&user_check.stdout);
+    assert!(user_stdout.contains("Agent: claude-code"));
+    assert!(user_stdout.contains(&format!("User root: {}", directory.root().display())));
+    assert!(user_stdout.contains("THRN-managed claude-code user skills checked: 1"));
+    assert!(user_stdout.contains("no network request was made"));
+    assert!(user_check.stderr.is_empty());
+    assert!(
+        directory
+            .root()
+            .join(".claude/skills/uncharted-ideation/SKILL.md")
+            .is_file()
+    );
+    assert!(!alternate_config.exists());
+
+    let listing = command_in(&directory, &["skills", "list", "--installed"])
+        .output()
+        .expect("installed listing remains offline");
+    assert_eq!(listing.status.code(), Some(0));
+    let listing_stdout = String::from_utf8_lossy(&listing.stdout);
+    assert_eq!(listing_stdout.matches("Agent: claude-code").count(), 2);
+    assert_eq!(listing_stdout.matches("Scope: project").count(), 1);
+    assert_eq!(listing_stdout.matches("Scope: user").count(), 1);
+    assert!(!listing_stdout.contains(&project_receipt.to_string_lossy().to_string()));
+    assert!(
+        listing_stdout.contains(
+            &directory
+                .path()
+                .join(".claude/skills/uncharted-ideation")
+                .display()
+                .to_string()
+        )
+    );
+    assert!(
+        listing_stdout.contains(
+            &directory
+                .root()
+                .join(".claude/skills/uncharted-ideation")
+                .display()
+                .to_string()
+        )
+    );
+    assert!(listing.stderr.is_empty());
+    assert_eq!(recursive_snapshot(directory.root()), before);
+}
+
+#[test]
 fn user_scope_rejects_project_path_and_unsafe_home_before_writing() {
     let directory = TestDir::new();
     let before = recursive_snapshot(directory.root());
     let project_arg = directory.path().to_str().expect("project path");
-    let conflict = command_in(
-        &directory,
-        &[
-            "skills",
-            "install",
-            "uncharted",
-            "--agent",
-            "codex",
-            "--scope",
-            "user",
-            "--project",
-            project_arg,
-        ],
-    )
-    .output()
-    .expect("compiled CLI starts");
-    assert_eq!(conflict.status.code(), Some(2));
-    assert!(conflict.stdout.is_empty());
-    assert!(
-        String::from_utf8_lossy(&conflict.stderr)
-            .contains("--project can only be used with --scope project")
-    );
+    for agent in ["codex", "claude-code"] {
+        let conflict = command_in(
+            &directory,
+            &[
+                "skills",
+                "install",
+                "uncharted",
+                "--agent",
+                agent,
+                "--scope",
+                "user",
+                "--project",
+                project_arg,
+            ],
+        )
+        .output()
+        .expect("compiled CLI starts");
+        assert_eq!(conflict.status.code(), Some(2), "agent={agent}");
+        assert!(conflict.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&conflict.stderr)
+                .contains("--project can only be used with --scope project")
+        );
+    }
     assert_eq!(recursive_snapshot(directory.root()), before);
 
     #[cfg(windows)]
@@ -1229,7 +1435,7 @@ fn unsupported_agent_and_invalid_id_fail_without_success_output_or_project_write
     .expect("CLI process starts");
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("only --agent codex"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported agent"));
     assert!(!unsupported.path().join(".agents").exists());
 
     let invalid = TestDir::new();
@@ -1293,7 +1499,7 @@ fn update_cli_reports_usage_and_runtime_failures_on_stderr_without_partial_stdou
     .expect("CLI process starts");
     assert_eq!(unsupported.status.code(), Some(1));
     assert!(unsupported.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&unsupported.stderr).contains("only explicit --agent codex"));
+    assert!(String::from_utf8_lossy(&unsupported.stderr).contains("unsupported agent"));
     assert!(!directory.root().join("thrn-data").exists());
 
     let missing_receipt = command_in(

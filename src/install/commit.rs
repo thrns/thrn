@@ -1,4 +1,4 @@
-//! Internal Codex project commit engine, reached by the CLI through a retained install session.
+//! Shared agent commit engine reached through a retained validated install session.
 #![allow(dead_code)] // Low-level fault-injection and recovery helpers remain internal.
 
 use std::{
@@ -18,14 +18,15 @@ use crate::sources::staging::StagedSkill;
 
 use super::{
     destination::{
-        ComponentState, DestinationSnapshot, FileIdentity, ObjectKind, inspect_destination,
+        ComponentState, DestinationSnapshot, FileIdentity, ObjectKind,
+        inspect_destination_for_agent,
     },
     inventory::{StagedInventory, inspect_staged_skill},
     journal::{
         JournalError, JournalFaultInjector, NoJournalFaults, OperationJournal, OperationState,
         new_staging_name,
     },
-    plan::{InstallAgent, InstallPlan},
+    plan::InstallPlan,
 };
 
 const IO_CHUNK_BYTES: usize = 8 * 1024;
@@ -106,8 +107,13 @@ impl InstallationSession {
                 },
             )
         })?;
+        let resolved_scope = super::scope::ResolvedScope::from_agent_validated(
+            self.plan.agent(),
+            self.plan.scope(),
+            self.plan.scope_root().to_path_buf(),
+        );
         store
-            .recover_with_faults(journal_faults, receipt_faults)
+            .recover_scope_with_faults(&resolved_scope, journal_faults, receipt_faults)
             .map_err(InstallationCompletionError::Recovery)?;
         let journal_receipt = receipt.clone();
         let mut reservation = store
@@ -281,9 +287,9 @@ pub(crate) enum CommitError {
     IdentityMismatch,
     #[error("the validated staged source changed after planning")]
     SourceChanged,
-    #[error("the selected project or Codex destination changed after planning")]
+    #[error("the selected project or agent destination changed after planning")]
     DestinationChanged,
-    #[error("the Codex destination has an existing or case-insensitive collision")]
+    #[error("the selected agent destination has an existing or case-insensitive collision")]
     DestinationConflict,
     #[error("this platform does not provide the required safe no-replace directory commit")]
     UnsupportedPlatform,
@@ -351,7 +357,8 @@ fn commit_session_inner(
         })?;
 
     let snapshot = session.plan.destination_snapshot();
-    let current = inspect_destination(
+    let current = inspect_destination_for_agent(
+        session.plan.agent(),
         Some(session.plan.scope_root()),
         session.plan.scope_root(),
         session.plan.skill_name().as_str(),
@@ -370,9 +377,10 @@ fn commit_session_inner(
     })?;
     ensure_identity(&project, snapshot.project_identity())?;
 
+    let agent_directory_name = session.plan.agent().adapter().skill_directory();
     let (agents, created_agents) = open_or_create_parent(
         &project,
-        ".agents",
+        agent_directory_name,
         snapshot.agents_state(),
         InstallOperation::CreateParentDirectory,
         faults,
@@ -393,7 +401,7 @@ fn commit_session_inner(
             if created_agents {
                 remove_empty_child_if_identity(
                     &project,
-                    ".agents",
+                    agent_directory_name,
                     agents.identity().ok(),
                     InstallOperation::RemoveDirectory,
                     faults,
@@ -407,6 +415,7 @@ fn commit_session_inner(
         let mut created_parents = CreatedParents {
             project: &project,
             agents: &agents,
+            agent_directory: agent_directory_name,
             created_agents,
             created_skills,
         };
@@ -422,6 +431,7 @@ fn commit_session_inner(
     let mut created_parents = CreatedParents {
         project: &project,
         agents: &agents,
+        agent_directory: agent_directory_name,
         created_agents,
         created_skills,
     };
@@ -439,7 +449,7 @@ fn commit_session_inner(
         recovery_cleanup_required = true;
     }
 
-    verify_parent_names(&project, ".agents")
+    verify_parent_names(&project, agent_directory_name)
         .and_then(|()| verify_parent_names(&agents, "skills"))
         .map_err(|error| {
             let cleanup = cleanup_failed_commit(
@@ -499,7 +509,8 @@ fn commit_session_inner(
         )
     })?;
 
-    let latest = inspect_destination(
+    let latest = inspect_destination_for_agent(
+        session.plan.agent(),
         Some(session.plan.scope_root()),
         session.plan.scope_root(),
         session.plan.skill_name().as_str(),
@@ -617,7 +628,8 @@ fn commit_session_inner(
         return Err(with_cleanup(error, cleanup_errors));
     }
 
-    let latest = inspect_destination(
+    let latest = inspect_destination_for_agent(
+        session.plan.agent(),
         Some(session.plan.scope_root()),
         session.plan.scope_root(),
         session.plan.skill_name().as_str(),
@@ -735,8 +747,9 @@ fn validate_session_identity(session: &InstallationSession) -> Result<(), Commit
     let inventory = &session.inventory;
     let plan = &session.plan;
     let expected_destination = plan
-        .scope_root()
-        .join(".agents/skills")
+        .agent()
+        .adapter()
+        .skills_root(plan.scope_root().to_path_buf())
         .join(plan.skill_name().as_str());
     if staged.catalog_id() != plan.resource_id()
         || staged.skill_name() != plan.skill_name()
@@ -750,7 +763,7 @@ fn validate_session_identity(session: &InstallationSession) -> Result<(), Commit
         || inventory.catalog_id() != plan.resource_id()
         || inventory.skill_name() != plan.skill_name()
         || inventory.revision() != plan.source_commit()
-        || plan.agent() != InstallAgent::Codex
+        || plan.destination_snapshot().agent() != plan.agent()
         || plan.destination() != expected_destination
         || !plan.destination().starts_with(plan.scope_root())
         || inventory.total_bytes() != plan.total_file_bytes()
@@ -927,7 +940,7 @@ fn snapshot_matches_after_parent_creation(
     let mut expected_project_entries = planned.existing_project_entries().to_vec();
     if created_agents {
         expected_project_entries.push(super::destination::DirectoryEntrySnapshot::new(
-            ".agents".into(),
+            planned.agent_directory().into(),
             ObjectKind::Directory,
         ));
         expected_project_entries.sort_by(|a, b| a.name().cmp(b.name()));
@@ -991,6 +1004,7 @@ fn snapshot_matches_after_parent_creation(
 struct CreatedParents<'a> {
     project: &'a SecureDir,
     agents: &'a SecureDir,
+    agent_directory: &'a str,
     created_agents: bool,
     created_skills: bool,
 }
@@ -1065,7 +1079,7 @@ fn cleanup_parents(
     if created.created_agents {
         remove_empty_child_if_identity(
             created.project,
-            ".agents",
+            created.agent_directory,
             created.agents.identity().ok(),
             InstallOperation::RemoveDirectory,
             faults,

@@ -1,6 +1,6 @@
 # CLI contract
 
-This page describes the executable that exists today. The CLI supports offline catalog discovery, installed-resource listing and update checking, explicit catalog refresh, local skill validation, `doctor`, and receipt-backed Codex project and explicitly selected user-scope installation, check, update, and removal. Other agents, completions, JSON output, and noninteractive options are not implemented.
+This page describes the executable that exists today. The CLI supports offline catalog discovery, installed-resource listing and update checking, explicit catalog refresh, local skill validation, `doctor`, and receipt-backed Codex and Claude Code project/user installation, check, update, and removal. Agent selection is explicit; detection, other agents, completions, JSON output, and noninteractive options are not implemented.
 
 ## Available commands
 
@@ -33,25 +33,33 @@ This page describes the executable that exists today. The CLI supports offline c
 | `thrn skills check` | Compare current-project THRN-managed Codex installations with the selected local catalog; project is the default scope. |
 | `thrn skills check --project <path>` | Check one other existing project without inspecting installation trees from other projects. |
 | `thrn skills check --scope user` | Check only user-scope receipts and corresponding trees; never uses the network or changes files. |
-| `thrn skills check --agent codex` | Explicitly select the only currently supported agent; agent autodetection is not performed. |
+| `thrn skills check --agent codex` | Explicitly select Codex. Omitting `--agent` retains Codex behavior for compatibility. |
+| `thrn skills install <id> --agent claude-code [--scope project|user] [--project <path>] [--dry-run]` | Install or plan one Claude Code skill at its selected project or user destination. `--project` is project-only. |
+| `thrn skills remove <canonical-id> --agent claude-code [--scope project|user] [--project <path>] [--dry-run]` | Remove or plan removal of one exact receipt-owned Claude Code skill. |
+| `thrn skills update <canonical-id> --agent claude-code [--scope project|user] [--project <path>] [--dry-run]` | Update or compare one exact receipt-owned Claude Code skill. |
+| `thrn skills check --agent claude-code [--scope project|user] [--project <path>]` | Check Claude Code receipts in the selected scope, offline and read-only. |
 
 The root parser requires a subcommand. Clap also supplies its normal short-help and short-version aliases.
 
-## Codex skill scope
+## Agent and skill scope
 
-All lifecycle commands default to `--scope project`, preserving existing behavior. Project scope
-uses `<project>/.agents/skills/<skillName>` and defaults the project to the current directory;
-`--project <path>` selects another existing project. Explicit `--scope user` uses
-`<validated-home>/.agents/skills/<skillName>` and never uses the working directory as its root.
-`--project` with user scope is a usage error. The scope is included in receipts and lifecycle
-operations, so the same catalog resource may be managed independently in both scopes. THRN does
-not infer scope from files and does not adopt legacy Codex locations such as `$CODEX_HOME/skills`.
-Only the Codex adapter is supported in this milestone.
+Lifecycle commands default to `--scope project`. Codex uses `<project>/.agents/skills/<skillName>`
+and `<validated-home>/.agents/skills/<skillName>`; Claude Code uses
+`<project>/.claude/skills/<skillName>` and `<validated-home>/.claude/skills/<skillName>`. Project
+scope defaults to the current directory; `--project <path>` selects another existing project.
+Explicit `--scope user` never uses the working directory as its root, and `--project` with user
+scope is a usage error. Agent and scope are included in receipts and lifecycle operations, so one
+catalog resource can be managed independently in all four targets. THRN does not infer scope or
+detect agents, adopt existing skill directories, or adopt legacy Claude command files. It does not
+interpret `CLAUDE_CONFIG_DIR` as a skill-location override; the official [skills documentation](https://code.claude.com/docs/en/skills)
+documents `.claude/skills` project and `~/.claude/skills` user locations, while [settings documentation](https://code.claude.com/docs/en/settings)
+describes `CLAUDE_CONFIG_DIR` for settings, session history, and plugins. Claude Code reserved
+names such as `synced` and the `anthropic-skills` namespace are rejected.
 
 ## Output and exit status
 
 Successful help, version, doctor, list, search, info, validation, conflict-free dry-run, completed installation/update/removal, and already-up-to-date results go to stdout and exit `0`. Empty catalog and empty managed-installation states are successful. Catalog list, search, and info identify their selected catalog source (`local cache` or `bundled metadata`) and freshness. Installed listing reads validated receipts only and explicitly says current content integrity was not checked. Clap usage errors go to stderr and exit `2`. Invalid or unknown IDs, unsupported agents, network or source validation errors, unsafe or conflicting destinations, existing unmanaged skills, duplicate managed installs, active writer locks, recovery-required state, receipt or journal corruption, and output failures go to stderr and exit `1`. Failures after directory commitment identify the incomplete state and never print the full success message. Receipt publication followed by journal-cleanup failure is also an error even though the receipt may be visible. Recovery conflicts instruct the user to preserve the files and inspect the recorded operation; do not blindly delete receipts, journals, locks, or installed directories.
-Successful removal follows the same stdout/exit-0 rule as installation. It accepts only an exact canonical resource ID recorded in a valid receipt with installation-time destination identity; aliases and skill directory names are not resolved. Project schema-v1 receipts remain listable, but cannot authorize removal. The receipt must identify `agent: codex`, the explicitly selected scope, its root identity, and the exact scope destination (`<project>/.agents/skills/<skillName>` or `<home>/.agents/skills/<skillName>`). THRN verifies transaction identities, all receipt-listed files and directories, each file's byte count and SHA-256, and the absence of additional or linked objects. The catalog is not loaded, refreshed, or contacted. A missing, corrupt, or conflicting receipt; unmanaged directory; modified, missing, or extra content; identity change; lock contention; or unresolved transaction exits nonzero and preserves uncertain state. Once mutation begins, errors state that removal may be incomplete and never print the success block.
+Successful removal follows the same stdout/exit-0 rule as installation. It accepts only an exact canonical resource ID recorded in a valid receipt with installation-time destination identity; aliases and skill directory names are not resolved. Project schema-v1 receipts remain listable, but cannot authorize removal. The receipt must identify the selected agent, explicitly selected scope, its root identity, and the exact agent-specific destination. Claude Code uses strict schema v4. THRN verifies transaction identities, all receipt-listed files and directories, each file's byte count and SHA-256, and the absence of additional or linked objects. The catalog is not loaded, refreshed, or contacted. A missing, corrupt, or conflicting receipt; unmanaged directory; modified, missing, or extra content; identity change; lock contention; or unresolved transaction exits nonzero and preserves uncertain state. Once mutation begins, errors state that removal may be incomplete and never print the success block.
 
 ### Receipt-backed updates
 
@@ -61,8 +69,9 @@ thrn skills update uncharted --agent codex
 thrn skills update uncharted --agent codex --project ./my-project
 ```
 
-Update accepts only an exact canonical resource ID and uses project scope by default; `--scope user`
-selects the user installation. `--project` is valid only for project scope. It reads the validated
+Update accepts only an exact canonical resource ID and requires `--agent codex` or
+`--agent claude-code`. It uses project scope by default; `--scope user` selects that agent's user
+installation. `--project` is valid only for project scope. It reads the validated
 local catalog without refreshing it. Before fetching a replacement, THRN requires the matching
 scope-bound ownership receipt whose root, agent, scope, resource, GitHub owner/repository, source
 directory, skill name, and installation-time destination identity still match. It verifies every
@@ -105,11 +114,12 @@ thrn skills check --agent codex
 thrn skills check --scope user
 ```
 
-The command checks only THRN-managed Codex installations from its selected scope. Project scope is
-the default; its `--project` root must identify an existing real directory and otherwise defaults
-to the current directory. `--scope user` checks only receipts rooted at the validated operating
-system home. `--project` cannot be combined with user scope. `--agent codex` is optional and is the
-only accepted agent selection. THRN does not autodetect agents.
+The command checks only THRN-managed installations for the selected agent and scope. Codex remains
+the default when `--agent` is omitted, preserving prior behavior. Use `--agent claude-code` to
+select Claude Code. Project scope is the default; its `--project` root must identify an existing
+real directory and otherwise defaults to the current directory. `--scope user` checks only receipts
+rooted at the validated operating system home. `--project` cannot be combined with user scope. THRN
+does not autodetect agents.
 
 Check reads the validated local catalog through the existing `CatalogService` discovery path, which
 uses the local cache when valid and otherwise bundled metadata. It never refreshes stale data,
@@ -144,7 +154,7 @@ available updates and missing catalog entries; data-integrity, filesystem, catal
 cache or bundled catalog is not authoritative information about the latest GitHub state.
 
 To act on an **Update available** result, run the explicit update command after reviewing the
-resource: `thrn skills update <canonical-id> --agent codex`. Update performs its own ownership and
+resource: `thrn skills update <canonical-id> --agent <codex|claude-code>`. Update performs its own ownership and
 tree verification and fetches the exact locally pinned GitHub source; check does neither.
 
 ### Installation planning and installation
@@ -164,12 +174,12 @@ then fetches the resource's full pinned GitHub commit, validates the archive and
 and stages its files privately. Both dry-run and installation can contact GitHub and download the
 pinned archive. Installation does not automatically refresh the catalog.
 
-`--agent codex` is required. Project scope is the default and uses the current directory unless
+`--agent codex` or `--agent claude-code` is required. Project scope is the default and uses the current directory unless
 `--project` selects another existing project. Explicit `--scope user` selects the validated OS
 home and cannot be combined with `--project`. Destinations are respectively
 `<project-root>/.agents/skills/<validated-skillName>` and
-`<home>/.agents/skills/<validated-skillName>`, following the [Codex build-skills
-guide](https://learn.chatgpt.com/docs/build-skills). Catalog IDs and aliases are resolved through
+`<home>/.agents/skills/<validated-skillName>` for Codex, or `<project-root>/.claude/skills/` and
+`<home>/.claude/skills/` for Claude Code. Catalog IDs and aliases are resolved through
 validated metadata and are never used as the destination folder name.
 
 Dry-run output shows the resource, skill name, pinned repository and revision, agent, scope, selected
@@ -182,11 +192,11 @@ destination, rejects conflicts, commits without replacement, captures the commit
 identity through the secure handle layer, persists it in the install journal and strict scope-bound
 receipt, verifies installed hashes, records journal completion, and returns a verified receipt. Only
 then does the CLI print `Installed THRN skill`, the canonical resource ID, installed skill name,
-Codex scope, exact destination, pinned source revision, file and byte counts from that receipt, and
+the selected agent and scope, exact destination, pinned source revision, file and byte counts from that receipt, and
 `Ownership receipt: recorded`.
 
-Only explicit `--agent codex` is supported. User scope is never inferred and no global write occurs
-before `--scope user` is selected. The user home must exist as a safe real directory; THRN does not
+Agent selection is explicit. User scope is never inferred and no home write occurs before
+`--scope user` is selected. The user home must exist as a safe real directory; THRN does not
 fall back to another destination. The command resolves only a canonical catalog ID or an explicit
 alias; it never guesses from a skill directory name. There is no prompt after an explicit install
 command.
@@ -219,8 +229,8 @@ thrn skills remove uncharted --agent codex --scope user
 ```
 
 Removal defaults to project scope in the current directory. `--project` must select an existing
-project directory and is valid only for project scope. `--scope user` selects only the user
-installation. `--agent codex` is required. The ID must be the exact
+project directory and is valid only for project scope. `--scope user` selects only the selected
+agent's user installation. `--agent codex` or `--agent claude-code` is required. The ID must be the exact
 canonical ID in the ownership receipt. It does not accept an alias or infer an ID from the installed
 folder, and it does not require the current catalog or network.
 
@@ -235,8 +245,7 @@ journal. It renames the verified directory to a random `.thrn-removal-<operation
 a no-replace operation. Cleanup deletes only exact receipt-listed regular files after identity,
 link-count, byte-count and hash checks; it records a durable cleanup intent for each object first
 and removes directories only when their recorded identities match and they are empty. The receipt
-is retired only after the quarantined tree is completely removed. Empty `.agents` and
-`.agents/skills` parents remain.
+is retired only after the quarantined tree is completely removed. Agent and `skills` parents remain.
 
 After a failure or process termination, install admission and installed listing fail closed while a
 removal journal remains. A later install or remove operation acquires the same lock and runs
@@ -292,7 +301,7 @@ modify, or execute supporting files.
 
 Default `skills list`, `skills search`, and `skills info` are offline. They try the validated cache first, then the embedded catalog. Cached data is fresh through 24 hours after its successful refresh; older cache remains usable and is labeled stale. A missing, corrupt, incompatible, or invalid cache falls back to bundled metadata. The fallback does not trigger a refresh. The cache lives in the OS-standard application cache directory: Linux uses `$XDG_CACHE_HOME/thrn` or `~/.cache/thrn`, macOS uses `~/Library/Caches/im.thrn.thrn`, and Windows uses `%LOCALAPPDATA%/thrn/thrn/cache`. Set `THRN_CACHE_DIR` to an alternate absolute directory when needed; it changes only the local cache path. The file is named `catalog-v1.cache`.
 
-`skills list --installed` reads only `<application-data-directory>/receipts`, resolved by THRN's OS path resolver. `THRN_DATA_DIR` can select an alternate absolute application-data root; THRN checks its `receipts` child and never creates it. Missing or empty storage reports that no THRN-managed installations are recorded. Valid project schema-v1/v2 and user schema-v3 receipts display the canonical resource ID, actual skill directory name, agent, actual scope, corresponding project or user destination, pinned revision, and an explicit `current content integrity: not checked` status. Unknown, corrupt, unsupported, duplicated, conflicting, linked, or nonregular receipt storage fails closed. Skills present in agent folders outside THRN are not checked. This command does not invoke catalog discovery and does not need a catalog cache. See [receipt design](receipts.md).
+`skills list --installed` reads only `<application-data-directory>/receipts`, resolved by THRN's OS path resolver. `THRN_DATA_DIR` can select an alternate absolute application-data root; THRN checks its `receipts` child and never creates it. Missing or empty storage reports that no THRN-managed installations are recorded. Valid Codex project schema-v1/v2, Codex user schema-v3, and Claude Code schema-v4 receipts display the canonical resource ID, actual skill directory name, agent, actual scope, corresponding project or user destination, pinned revision, and an explicit `current content integrity: not checked` status. Unknown, corrupt, unsupported, duplicated, conflicting, linked, or nonregular receipt storage fails closed. Skills present in agent folders outside THRN are not checked. This command does not invoke catalog discovery and does not need a catalog cache. See [receipt design](receipts.md).
 
 `thrn skills search --refresh [query]` is the catalog-refresh network path. It fetches only `https://raw.githubusercontent.com/thrns/thrn/main/src/registry/builtin-v1.json`. The request requires HTTPS certificate verification, follows no redirects, uses connection/body/overall timeouts, and reads no more than 1 MiB. The response must be UTF-8 and pass the catalog schema validator before it is persisted. A failed request, response validation, or cache commit exits nonzero on stderr. A failed commit leaves the earlier cache intact. The refresh command never fetches skill directories or executes catalog or skill content. `skills install --dry-run` separately fetches only the selected resource's pinned GitHub archive through the M2-02 source pipeline.
 

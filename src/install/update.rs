@@ -1,4 +1,4 @@
-//! Safe replacement of an exactly verified THRN-managed Codex project skill.
+//! Safe replacement of an exactly verified THRN-managed agent skill.
 //!
 //! Update planning is read-only. A plan retains the validated pinned source stage and the
 //! receipt-backed identities needed by the separately journaled replacement transaction.
@@ -20,7 +20,7 @@ use crate::{
         commit::{NodeKind, SecureDir},
         destination::FileIdentity,
         inventory::{InventoryError, StagedInventory, inspect_staged_skill},
-        plan::{InstallPlan, PlanError, build_update_install_plan_for_scope},
+        plan::{InstallPlan, PlanError, build_update_install_plan_for_agent_scope},
         receipt::InstallationReceipt,
         removal::{RemovalError, RemovalIdentity, RemovalObject, RemovalObjectKind, RemovalPlan},
         scope::ResolvedScope,
@@ -32,13 +32,11 @@ use crate::{
     },
 };
 
-use super::{
-    destination::inspect_destination,
-    receipt_store::{ReceiptFaultInjector, ReceiptStore, WriterLock},
-};
+use super::receipt_store::{ReceiptFaultInjector, ReceiptStore, WriterLock};
 
 const PROJECT_UPDATE_JOURNAL_SCHEMA_VERSION: u64 = 1;
 const USER_UPDATE_JOURNAL_SCHEMA_VERSION: u64 = 2;
+const CLAUDE_UPDATE_JOURNAL_SCHEMA_VERSION: u64 = 3;
 const MAX_UPDATE_JOURNAL_BYTES: usize = 12 * 1024 * 1024;
 const MAX_UPDATE_JOURNAL_FILES: usize = 16_384;
 const MAX_UPDATE_JOURNAL_TOTAL_BYTES: u64 = 384 * 1024 * 1024;
@@ -229,7 +227,7 @@ pub(crate) enum UpdatePreparation {
 
 #[derive(Debug, Error)]
 pub(crate) enum UpdateError {
-    #[error("only explicit --agent codex is supported for updates")]
+    #[error("the selected agent does not match the resolved scope or receipt")]
     UnsupportedAgent,
     #[error("update requires an exact canonical catalog resource ID")]
     NonCanonicalId,
@@ -302,7 +300,12 @@ pub(crate) fn prepare_update_in_scope<T: GithubTransport + ?Sized>(
     transport: &T,
     tempdir_factory: &dyn TempDirFactory,
 ) -> Result<UpdatePreparation, UpdateError> {
-    if agent != "codex" {
+    let selected_agent = match agent {
+        "codex" => crate::agents::AgentId::Codex,
+        "claude-code" => crate::agents::AgentId::ClaudeCode,
+        _ => return Err(UpdateError::UnsupportedAgent),
+    };
+    if selected_agent != scope.agent() {
         return Err(UpdateError::UnsupportedAgent);
     }
     let requested = SkillId::from_str(identifier).map_err(|_| UpdateError::NonCanonicalId)?;
@@ -344,7 +347,8 @@ pub(crate) fn prepare_update_in_scope<T: GithubTransport + ?Sized>(
 
     let staged = fetch_and_stage_skill_with_factory(resource, transport, tempdir_factory)?;
     let inventory = inspect_staged_skill(&staged)?;
-    let destination = inspect_destination(
+    let destination = super::destination::inspect_destination_for_agent(
+        scope.agent(),
         Some(&old.receipt().root_path()),
         scope.root(),
         staged.skill_name().as_str(),
@@ -356,8 +360,13 @@ pub(crate) fn prepare_update_in_scope<T: GithubTransport + ?Sized>(
             "the selected project, agent, scope, or destination differs from the recorded installation".to_owned(),
         ));
     }
-    let replacement =
-        build_update_install_plan_for_scope(&staged, &inventory, destination, scope.scope())?;
+    let replacement = build_update_install_plan_for_agent_scope(
+        &staged,
+        &inventory,
+        destination,
+        scope.agent(),
+        scope.scope(),
+    )?;
     if !replacement.conflicts().is_empty() {
         return Err(UpdateError::Conflict(
             "destination parents contain an unexpected or ambiguous object".to_owned(),
@@ -492,9 +501,11 @@ pub(crate) fn format_dry_run(plan: &UpdatePlan) -> String {
         .filter(|item| item.kind == UpdateFileChangeKind::Unchanged)
         .count();
     let mut output = format!(
-        "DRY RUN — no project or receipt-store files were modified\nResource: {}\nSkill name: {}\nDestination: {}\nPrevious revision: {}\nNew revision: {}\nVerified ownership: schema-v2 receipt and complete installed tree match\nFile changes:\n",
+        "DRY RUN — no project or receipt-store files were modified\nResource: {}\nSkill name: {}\nAgent: {}\nScope: {}\nDestination: {}\nPrevious revision: {}\nNew revision: {}\nVerified ownership: versioned receipt and complete installed tree match\nFile changes:\n",
         plan.resource_id(),
         plan.skill_name(),
+        plan.replacement().agent().as_str(),
+        plan.replacement().scope().as_str(),
         safe_path(plan.destination()),
         plan.previous_revision(),
         plan.new_revision(),
@@ -563,7 +574,7 @@ enum UpdateOperationType {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct UpdateRecord {
+pub(super) struct UpdateRecord {
     schema_version: u64,
     operation_type: UpdateOperationType,
     operation_id: String,
@@ -592,15 +603,34 @@ struct UpdateRecord {
 }
 
 impl UpdateRecord {
+    pub(super) fn receipt(&self) -> &InstallationReceipt {
+        &self.old_receipt
+    }
+
     fn validate(&self) -> Result<(), UpdateJournalError> {
         let user_scope = self.old_receipt.scope() == "user";
-        let expected_journal_schema = if user_scope {
+        let claude = self.old_receipt.agent() == "claude-code";
+        let expected_journal_schema = if claude {
+            CLAUDE_UPDATE_JOURNAL_SCHEMA_VERSION
+        } else if user_scope {
             USER_UPDATE_JOURNAL_SCHEMA_VERSION
         } else {
             PROJECT_UPDATE_JOURNAL_SCHEMA_VERSION
         };
-        let expected_receipt_schema = if user_scope { 3 } else { 2 };
-        let expected_intent_schema = if user_scope { 3 } else { 1 };
+        let expected_receipt_schema = if claude {
+            4
+        } else if user_scope {
+            3
+        } else {
+            2
+        };
+        let expected_intent_schema = if claude {
+            4
+        } else if user_scope {
+            3
+        } else {
+            1
+        };
         if self.schema_version != expected_journal_schema
             || self.operation_type != UpdateOperationType::Replacement
             || !valid_hex(&self.operation_id, 32)
@@ -856,7 +886,9 @@ impl UpdateJournalStore {
         let directory = SecureDir::open_or_create_absolute(&self.directory)
             .map_err(|error| update_journal_io("create update journal storage", error))?;
         let operation_id = plan.operation_id.clone();
-        let schema_version = if plan.old.receipt().scope() == "user" {
+        let schema_version = if plan.old.receipt().agent() == "claude-code" {
+            CLAUDE_UPDATE_JOURNAL_SCHEMA_VERSION
+        } else if plan.old.receipt().scope() == "user" {
             USER_UPDATE_JOURNAL_SCHEMA_VERSION
         } else {
             PROJECT_UPDATE_JOURNAL_SCHEMA_VERSION
@@ -912,7 +944,7 @@ impl UpdateJournalStore {
         Ok(self.read_all()?.len())
     }
 
-    fn read_all(&self) -> Result<Vec<UpdateRecord>, UpdateJournalError> {
+    pub(super) fn read_all(&self) -> Result<Vec<UpdateRecord>, UpdateJournalError> {
         if !self.directory.is_absolute() {
             return Err(UpdateJournalError::UnsafeDirectory);
         }
@@ -1341,6 +1373,10 @@ pub(crate) struct UpdateSummary {
 }
 
 impl UpdateSummary {
+    pub(crate) fn agent(&self) -> &str {
+        self.receipt.agent()
+    }
+
     pub(crate) fn scope(&self) -> &str {
         self.receipt.scope()
     }
@@ -2976,10 +3012,14 @@ fn open_plan_parents(plan: &RemovalPlan) -> Result<(SecureDir, SecureDir, Secure
             "project root identity changed after update planning".to_owned(),
         ));
     }
-    let agents = open_required_directory(&project, ".agents").map_err(UpdateError::Conflict)?;
+    let agents = open_required_directory(&project, plan.receipt().agent_directory())
+        .map_err(UpdateError::Conflict)?;
     let skills = open_required_directory(&agents, "skills").map_err(UpdateError::Conflict)?;
     if agents.identity().map_err(|error| {
-        UpdateError::Conflict(format!("could not identify .agents ({})", error.kind()))
+        UpdateError::Conflict(format!(
+            "could not identify agent directory ({})",
+            error.kind()
+        ))
     })? != plan.agents_identity()
         || skills.identity().map_err(|error| {
             UpdateError::Conflict(format!(
@@ -2989,7 +3029,7 @@ fn open_plan_parents(plan: &RemovalPlan) -> Result<(SecureDir, SecureDir, Secure
         })? != plan.skills_identity()
     {
         return Err(UpdateError::Conflict(
-            "Codex destination parent identity changed after update planning".to_owned(),
+            "agent destination parent identity changed after update planning".to_owned(),
         ));
     }
     Ok((project, agents, skills))
@@ -3012,18 +3052,18 @@ fn open_update_parents(record: &UpdateRecord) -> Result<(SecureDir, SecureDir, S
     {
         return Err("project root identity differs from the update journal".to_owned());
     }
-    let agents = open_required_directory(&project, ".agents")?;
+    let agents = open_required_directory(&project, record.old_receipt.agent_directory())?;
     let skills = open_required_directory(&agents, "skills")?;
     if agents
         .identity()
-        .map_err(|error| format!("could not identify .agents ({})", error.kind()))?
+        .map_err(|error| format!("could not identify agent directory ({})", error.kind()))?
         != FileIdentity::from(record.agents_identity)
         || skills
             .identity()
             .map_err(|error| format!("could not identify skills directory ({})", error.kind()))?
             != FileIdentity::from(record.skills_identity)
     {
-        return Err("Codex destination parent identity differs from the update journal".to_owned());
+        return Err("agent destination parent identity differs from the update journal".to_owned());
     }
     Ok((project, agents, skills))
 }
@@ -3123,7 +3163,7 @@ mod tests {
             command::prepare_install_session,
             commit::InstallFaultInjector,
             journal::NoJournalFaults,
-            plan::InstallScope,
+            plan::{InstallAgent, InstallScope},
             receipt_store::{NoReceiptFaults, ReceiptStore, ReceiptStoreError},
             removal::NoRemovalFaults,
             scope::ResolvedScope,
@@ -3192,6 +3232,30 @@ mod tests {
             session
                 .commit_and_record_at(&self.store, 100, &NoInstallFaults, &NoReceiptFaults)
                 .expect("install old version")
+        }
+
+        fn claude_project_scope(&self) -> ResolvedScope {
+            ResolvedScope::from_agent_validated(
+                InstallAgent::ClaudeCode,
+                InstallScope::Project,
+                self.project.clone(),
+            )
+        }
+
+        fn install_old_claude(&self) -> crate::install::receipt::InstallationReceipt {
+            let scope = self.claude_project_scope();
+            let session = super::super::command::prepare_install_session_in_scope(
+                &catalog(OLD_REVISION, "1.0.0"),
+                "uncharted",
+                "claude-code",
+                &scope,
+                &TestTransport,
+                &TestFactory(self.staging.clone()),
+            )
+            .expect("validated Claude install session");
+            session
+                .commit_and_record_at(&self.store, 100, &NoInstallFaults, &NoReceiptFaults)
+                .expect("install old Claude version")
         }
 
         fn user_scope(&self) -> ResolvedScope {
@@ -3631,7 +3695,7 @@ mod tests {
         assert_eq!(
             crate::cli::format_update_already_up_to_date(&current),
             format!(
-                "Already up to date\nResource: uncharted\nSkill name: uncharted-ideation\nDestination: {}\nPinned revision: Example-Org/catalog-test-fixtures@{OLD_REVISION}\nNo project files or ownership receipt were modified.\n",
+                "Already up to date\nResource: uncharted\nSkill name: uncharted-ideation\nAgent: codex\nScope: project\nDestination: {}\nPinned revision: Example-Org/catalog-test-fixtures@{OLD_REVISION}\nOwnership receipt: verified, no changes needed\n",
                 receipt.destination_path().display()
             )
         );
@@ -3641,6 +3705,128 @@ mod tests {
         );
         assert_eq!(fixture.store.list().expect("receipt remains")[0], receipt);
         assert!(!fixture.data.join("updates").exists());
+    }
+
+    #[test]
+    fn claude_project_and_user_updates_use_v4_receipts_and_scoped_v3_recovery() {
+        let fixture = Fixture::new();
+        let codex_project = fixture.install_old();
+        let claude_project = ResolvedScope::from_agent_validated(
+            crate::agents::AgentId::ClaudeCode,
+            InstallScope::Project,
+            fixture.project.clone(),
+        );
+        let claude_user = ResolvedScope::from_agent_validated(
+            crate::agents::AgentId::ClaudeCode,
+            InstallScope::User,
+            fixture.home.clone(),
+        );
+        let install_claude = |scope: &ResolvedScope| {
+            super::super::command::prepare_install_session_in_scope(
+                &catalog(OLD_REVISION, "1.0.0"),
+                "uncharted",
+                "claude-code",
+                scope,
+                &TestTransport,
+                &TestFactory(fixture.staging.clone()),
+            )
+            .expect("Claude install session")
+            .commit_and_record_at(&fixture.store, 101, &NoInstallFaults, &NoReceiptFaults)
+            .expect("Claude schema-v4 receipt")
+        };
+        let old_project = install_claude(&claude_project);
+        let old_user = install_claude(&claude_user);
+        assert_eq!(old_project.schema_version(), 4);
+        assert_eq!(old_user.schema_version(), 4);
+
+        let prepare_claude_update = |scope: &ResolvedScope| match prepare_update_in_scope(
+            &catalog(NEW_REVISION, "1.1.0"),
+            "uncharted",
+            "claude-code",
+            scope,
+            &fixture.store,
+            &TestTransport,
+            &TestFactory(fixture.staging.clone()),
+        )
+        .expect("Claude update plan")
+        {
+            UpdatePreparation::Ready(plan) => *plan,
+            UpdatePreparation::AlreadyUpToDate(_) => panic!("new pin differs"),
+        };
+        let project_plan = prepare_claude_update(&claude_project);
+        let error = fixture
+            .store
+            .update(
+                &project_plan,
+                &FailAfter(UpdateOperation::CommitReplacement),
+            )
+            .expect_err("post-commit fault cannot report update success");
+        assert!(matches!(error, UpdateError::Incomplete { .. }), "{error}");
+        let pending_journal = fs::read_dir(fixture.data.join("updates"))
+            .expect("pending Claude update journal")
+            .next()
+            .expect("one pending journal")
+            .expect("journal entry")
+            .path();
+        let journal_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&pending_journal).expect("Claude journal bytes"))
+                .expect("Claude journal JSON");
+        assert_eq!(journal_json["schemaVersion"], 3);
+        assert_eq!(journal_json["oldReceipt"]["agent"], "claude-code");
+        assert_eq!(journal_json["oldReceipt"]["scope"], "project");
+        assert!(fixture.store.list().is_err());
+
+        fixture
+            .store
+            .recover_scope_with_faults(&claude_project, &NoJournalFaults, &NoReceiptFaults)
+            .expect("recover only the selected Claude project target");
+        fixture
+            .store
+            .recover_scope_with_faults(&claude_project, &NoJournalFaults, &NoReceiptFaults)
+            .expect("same-target recovery is idempotent");
+        let after_project_recovery = fixture.store.list().expect("all receipts recovered");
+        let new_project = after_project_recovery
+            .iter()
+            .find(|receipt| receipt.agent() == "claude-code" && receipt.scope() == "project")
+            .expect("updated Claude project receipt");
+        let unchanged_user = after_project_recovery
+            .iter()
+            .find(|receipt| receipt.agent() == "claude-code" && receipt.scope() == "user")
+            .expect("unmodified Claude user receipt");
+        let unchanged_codex = after_project_recovery
+            .iter()
+            .find(|receipt| receipt.agent() == "codex")
+            .expect("Codex project receipt");
+        assert_eq!(new_project.schema_version(), 4);
+        assert_eq!(new_project.source_commit(), NEW_REVISION);
+        assert_eq!(unchanged_user.source_commit(), OLD_REVISION);
+        assert_eq!(unchanged_codex.source_commit(), OLD_REVISION);
+        assert_eq!(
+            unchanged_codex.destination_path(),
+            codex_project.destination_path()
+        );
+
+        let user_plan = prepare_claude_update(&claude_user);
+        let summary = fixture
+            .store
+            .update(&user_plan, &NoUpdateFaults)
+            .expect("Claude user update");
+        assert_eq!(summary.agent(), "claude-code");
+        assert_eq!(summary.scope(), "user");
+        assert_eq!(summary.destination(), old_user.destination_path());
+        assert!(
+            crate::cli::format_update_success(&summary)
+                .contains("Agent: claude-code\nScope: user\n")
+        );
+        let after_user_update = fixture.store.list().expect("updated receipts");
+        assert_eq!(after_user_update.len(), 3);
+        assert!(
+            after_user_update
+                .iter()
+                .all(|receipt| receipt.schema_version() == 4 || receipt.agent() == "codex")
+        );
+        assert!(!fixture.project.join("SKILL-WAS-EXECUTED").exists());
+        assert!(!fixture.home.join("SKILL-WAS-EXECUTED").exists());
     }
 
     struct NeverTransport;
@@ -3750,7 +3936,32 @@ mod tests {
         let operation = parse_crash_operation(&operation).expect("known crash boundary");
         let fixture = Fixture::from_root(PathBuf::from(root), None);
         let user_scope = std::env::var_os("THRN_UPDATE_CRASH_SCOPE").is_some();
-        let plan = if user_scope {
+        let agent = std::env::var("THRN_UPDATE_CRASH_AGENT").unwrap_or_else(|_| "codex".into());
+        let plan = if agent == "claude-code" {
+            let scope = if user_scope {
+                ResolvedScope::from_agent_validated(
+                    InstallAgent::ClaudeCode,
+                    InstallScope::User,
+                    fixture.home.clone(),
+                )
+            } else {
+                fixture.claude_project_scope()
+            };
+            match prepare_update_in_scope(
+                &catalog(NEW_REVISION, "1.1.0"),
+                "uncharted",
+                &agent,
+                &scope,
+                &fixture.store,
+                &TestTransport,
+                &TestFactory(fixture.staging.clone()),
+            )
+            .expect("prepare Claude crash update")
+            {
+                UpdatePreparation::Ready(plan) => *plan,
+                UpdatePreparation::AlreadyUpToDate(_) => panic!("new pin differs"),
+            }
+        } else if user_scope {
             fixture.prepare_new_user()
         } else {
             fixture.prepare_new()
@@ -3931,6 +4142,72 @@ mod tests {
             .store
             .recover_with_faults(&NoJournalFaults, &NoReceiptFaults)
             .expect("user update recovery is idempotent");
+    }
+
+    #[test]
+    fn claude_update_crash_during_receipt_transition_recovers_only_claude() {
+        for operation in [
+            UpdateOperation::ReceiptBackupRename,
+            UpdateOperation::PublishReceipt,
+        ] {
+            let fixture = Fixture::new();
+            fixture.install_old();
+            let old_claude = fixture.install_old_claude();
+            assert_eq!(old_claude.schema_version(), 4);
+
+            let status = Command::new(std::env::current_exe().expect("test executable"))
+                .arg("--exact")
+                .arg("install::update::tests::update_crash_child")
+                .arg("--nocapture")
+                .env(
+                    "THRN_UPDATE_CRASH_ROOT",
+                    fixture._parent.as_ref().expect("fixture root").path(),
+                )
+                .env("THRN_UPDATE_CRASH_AFTER", format!("{operation:?}"))
+                .env("THRN_UPDATE_CRASH_AGENT", "claude-code")
+                .status()
+                .expect("Claude update crash child starts");
+            assert_eq!(status.code(), Some(79), "crash at {operation:?}");
+            assert!(fixture.store.list().is_err());
+
+            let journal_path = fs::read_dir(fixture.data.join("updates"))
+                .expect("pending Claude update journal directory")
+                .next()
+                .expect("one pending update journal")
+                .expect("journal entry")
+                .path();
+            let journal: serde_json::Value = serde_json::from_slice(
+                &fs::read(journal_path).expect("Claude update journal bytes"),
+            )
+            .expect("Claude update journal JSON");
+            assert_eq!(journal["schemaVersion"], 3);
+            assert_eq!(journal["oldReceipt"]["agent"], "claude-code");
+            assert_eq!(journal["oldReceipt"]["scope"], "project");
+
+            let scope = fixture.claude_project_scope();
+            fixture
+                .store
+                .recover_scope_with_faults(&scope, &NoJournalFaults, &NoReceiptFaults)
+                .unwrap_or_else(|error| panic!("recover Claude update {operation:?}: {error}"));
+            fixture
+                .store
+                .recover_scope_with_faults(&scope, &NoJournalFaults, &NoReceiptFaults)
+                .expect("Claude update recovery is idempotent");
+
+            let receipts = fixture.store.list().expect("both receipts remain");
+            assert_eq!(receipts.len(), 2);
+            let claude = receipts
+                .iter()
+                .find(|receipt| receipt.agent() == "claude-code")
+                .expect("updated Claude receipt");
+            let codex = receipts
+                .iter()
+                .find(|receipt| receipt.agent() == "codex")
+                .expect("unchanged Codex receipt");
+            assert_eq!(claude.schema_version(), 4);
+            assert_eq!(claude.source_commit(), NEW_REVISION);
+            assert_eq!(codex.source_commit(), OLD_REVISION);
+        }
     }
 
     #[test]

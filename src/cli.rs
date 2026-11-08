@@ -72,11 +72,11 @@ enum SkillsCommand {
     Info { id: String },
     /// Validate a local skill directory without modifying or executing its contents.
     Validate { path: std::path::PathBuf },
-    /// Inspect a read-only plan or install a pinned Codex project skill.
+    /// Inspect a read-only plan or install a pinned skill for the selected agent.
     Install {
         /// Exact catalog resource ID or explicit alias.
         id: String,
-        /// Select the only currently supported agent (codex).
+        /// Select codex or claude-code.
         #[arg(long, required = true, value_name = "AGENT")]
         agent: String,
         /// Select project (default) or user skill scope.
@@ -89,11 +89,11 @@ enum SkillsCommand {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Remove one exactly verified THRN-managed Codex project skill.
+    /// Remove one exactly verified THRN-managed skill.
     Remove {
         /// Exact canonical resource ID recorded in a THRN ownership receipt.
         id: String,
-        /// Select the only currently supported agent (codex).
+        /// Select codex or claude-code.
         #[arg(long, required = true, value_name = "AGENT")]
         agent: String,
         /// Select project (default) or user skill scope.
@@ -106,11 +106,11 @@ enum SkillsCommand {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Update one exactly verified THRN-managed Codex project skill to the local catalog pin.
+    /// Update one exactly verified THRN-managed skill to the local catalog pin.
     Update {
         /// Exact canonical resource ID recorded in a THRN ownership receipt.
         id: String,
-        /// Select the only currently supported agent (codex).
+        /// Select codex or claude-code.
         #[arg(long, required = true, value_name = "AGENT")]
         agent: String,
         /// Select project (default) or user skill scope.
@@ -123,7 +123,7 @@ enum SkillsCommand {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Compare current-project Codex installations with local catalog pins without network access.
+    /// Compare selected agent installations with local catalog pins without network access.
     Check {
         /// Select project (default) or user skill scope.
         #[arg(long, value_enum, default_value = "project")]
@@ -131,8 +131,8 @@ enum SkillsCommand {
         /// Select an existing project directory (defaults to the current directory).
         #[arg(long, value_name = "PATH")]
         project: Option<std::path::PathBuf>,
-        /// Select the only currently supported agent (codex).
-        #[arg(long, value_name = "AGENT", value_parser = ["codex"])]
+        /// Defaults to codex for backward compatibility.
+        #[arg(long, value_name = "AGENT", value_parser = ["codex", "claude-code"])]
         agent: Option<String>,
     },
 }
@@ -200,14 +200,18 @@ pub fn run() -> Result<()> {
             SkillsCommand::Check {
                 scope,
                 project,
-                agent: _,
-            } => check_skills(scope, project.as_deref()),
+                agent,
+            } => check_skills(
+                agent.as_deref().unwrap_or("codex"),
+                scope,
+                project.as_deref(),
+            ),
         },
     }
 }
 
-fn check_skills(scope: InstallScope, project: Option<&Path>) -> Result<()> {
-    let resolved_scope = resolve_scope(scope, project)?;
+fn check_skills(agent: &str, scope: InstallScope, project: Option<&Path>) -> Result<()> {
+    let resolved_scope = resolve_scope(agent, scope, project)?;
     let selection = CatalogService::for_system().discover()?;
     let store = ReceiptStore::for_system()?;
     let snapshot = store.inspect_scope(&resolved_scope)?;
@@ -215,6 +219,7 @@ fn check_skills(scope: InstallScope, project: Option<&Path>) -> Result<()> {
     report_cache_warning(selection.cache_warning.as_deref())?;
     write_stdout(&format_skill_check(
         &selection,
+        agent,
         scope,
         &snapshot.project_root,
         &findings,
@@ -222,6 +227,7 @@ fn check_skills(scope: InstallScope, project: Option<&Path>) -> Result<()> {
 }
 
 fn resolve_scope(
+    agent: &str,
     scope: InstallScope,
     project: Option<&Path>,
 ) -> std::result::Result<ResolvedScope, crate::install::scope::ScopeResolutionError> {
@@ -233,45 +239,55 @@ fn resolve_scope(
     } else {
         None
     };
-    ScopeResolver::for_system()?.resolve(scope, project, current_directory.as_deref())
+    let agent_id = match agent {
+        "codex" => crate::agents::AgentId::Codex,
+        "claude-code" => crate::agents::AgentId::ClaudeCode,
+        other => {
+            return Err(
+                crate::install::scope::ScopeResolutionError::UnsupportedAgent(other.to_owned()),
+            );
+        }
+    };
+    ScopeResolver::for_system()?.resolve(agent_id, scope, project, current_directory.as_deref())
 }
 
 fn format_skill_check(
     selection: &CatalogSelection,
+    agent: &str,
     scope: InstallScope,
     scope_root: &Path,
     findings: &[CheckFinding],
 ) -> String {
     let mut output = if scope == InstallScope::Project {
         format!(
-            "Offline skill update check\nProject: {}\n{}Catalog comparison uses the selected local metadata and installation receipts only; no network request was made.\n",
+            "Offline skill update check\nAgent: {agent}\nProject: {}\n{}Catalog comparison uses the selected local metadata and installation receipts only; no network request was made.\n",
             safe_path_display(scope_root),
             catalog_heading(selection),
         )
     } else {
         format!(
-            "Offline skill update check\nScope: user\nUser root: {}\n{}Catalog comparison uses the selected local metadata and installation receipts only; no network request was made.\n",
+            "Offline skill update check\nAgent: {agent}\nScope: user\nUser root: {}\n{}Catalog comparison uses the selected local metadata and installation receipts only; no network request was made.\n",
             safe_path_display(scope_root),
             catalog_heading(selection),
         )
     };
     if findings.is_empty() {
-        output.push_str(if scope == InstallScope::Project {
-            "No THRN-managed Codex project skills are recorded in this project.\n"
+        output.push_str(&if scope == InstallScope::Project {
+            format!("No THRN-managed {agent} project skills are recorded in this project.\n")
         } else {
-            "No THRN-managed Codex user skills are recorded in this user scope.\n"
+            format!("No THRN-managed {agent} user skills are recorded in this user scope.\n")
         });
         return output;
     }
 
     if scope == InstallScope::Project {
         output.push_str(&format!(
-            "THRN-managed Codex project skills checked: {}\n",
+            "THRN-managed {agent} project skills checked: {}\n",
             findings.len()
         ));
     } else {
         output.push_str(&format!(
-            "THRN-managed Codex user skills checked: {}\n",
+            "THRN-managed {agent} user skills checked: {}\n",
             findings.len()
         ));
     }
@@ -305,7 +321,7 @@ fn remove_skill(
     project: Option<&Path>,
     dry_run: bool,
 ) -> Result<()> {
-    let resolved_scope = resolve_scope(scope, project)?;
+    let resolved_scope = resolve_scope(agent, scope, project)?;
     let store =
         ReceiptStore::for_system().map_err(|error| RemovalError::Store(error.to_string()))?;
     let output = execute_remove_in_scope_with(
@@ -326,10 +342,7 @@ fn update_skill(
     project: Option<&Path>,
     dry_run: bool,
 ) -> Result<()> {
-    if agent != "codex" {
-        return Err(UpdateError::UnsupportedAgent.into());
-    }
-    let resolved_scope = resolve_scope(scope, project)?;
+    let resolved_scope = resolve_scope(agent, scope, project)?;
     let selection = CatalogService::for_system().discover()?;
     let store = ReceiptStore::for_system()?;
     let transport = crate::sources::github::UreqGithubTransport::new();
@@ -381,21 +394,11 @@ fn execute_update_in_scope_with<T: crate::sources::github::GithubTransport + ?Si
 }
 
 pub(crate) fn format_update_already_up_to_date(receipt: &InstallationReceipt) -> String {
-    if receipt.scope() == "project" {
-        return format!(
-            "Already up to date\nResource: {}\nSkill name: {}\nDestination: {}\nPinned revision: {}/{}@{}\nNo project files or ownership receipt were modified.\n",
-            receipt.catalog_resource_id(),
-            receipt.skill_name(),
-            safe_path_display(&receipt.destination_path()),
-            receipt.source_owner(),
-            receipt.source_repository(),
-            receipt.source_commit(),
-        );
-    }
     format!(
-        "Already up to date\nResource: {}\nSkill name: {}\nScope: {}\nDestination: {}\nPinned revision: {}/{}@{}\nNo scope files or ownership receipt were modified.\n",
+        "Already up to date\nResource: {}\nSkill name: {}\nAgent: {}\nScope: {}\nDestination: {}\nPinned revision: {}/{}@{}\nOwnership receipt: verified, no changes needed\n",
         receipt.catalog_resource_id(),
         receipt.skill_name(),
+        receipt.agent(),
         receipt.scope(),
         safe_path_display(&receipt.destination_path()),
         receipt.source_owner(),
@@ -406,9 +409,10 @@ pub(crate) fn format_update_already_up_to_date(receipt: &InstallationReceipt) ->
 
 pub(crate) fn format_update_success(summary: &UpdateSummary) -> String {
     format!(
-        "Updated THRN skill\nResource: {}\nSkill name: {}\nAgent: codex\nScope: {}\nDestination: {}\nPrevious pinned revision: {}\nNew pinned revision: {}\nFiles updated: {}\nBytes installed: {}\nOwnership receipt: updated and verified\n",
+        "Updated THRN skill\nResource: {}\nSkill name: {}\nAgent: {}\nScope: {}\nDestination: {}\nPrevious pinned revision: {}\nNew pinned revision: {}\nFiles updated: {}\nBytes installed: {}\nOwnership receipt: updated and verified\n",
         summary.resource_id(),
         summary.skill_name(),
+        summary.agent(),
         summary.scope(),
         safe_path_display(summary.destination()),
         summary.previous_revision(),
@@ -450,9 +454,9 @@ fn execute_remove_in_scope_with(
     dry_run: bool,
     faults: &dyn crate::install::removal::RemovalFaultInjector,
 ) -> std::result::Result<String, RemovalError> {
-    if agent != "codex" {
+    if scope.agent().as_str() != agent {
         return Err(RemovalError::Conflict(
-            "only explicit --agent codex is supported for removal".to_owned(),
+            "the selected agent does not match the resolved scope".to_owned(),
         ));
     }
     if dry_run {
@@ -467,9 +471,10 @@ fn execute_remove_in_scope_with(
 fn format_removal_success(summary: &RemovalSummary) -> String {
     let receipt = summary.receipt();
     format!(
-        "Removed THRN skill\nResource: {}\nSkill name: {}\nAgent: codex\nScope: {}\nDestination: {}\nFiles removed: {}\nBytes removed: {}\nOwnership receipt: retired\n",
+        "Removed THRN skill\nResource: {}\nSkill name: {}\nAgent: {}\nScope: {}\nDestination: {}\nFiles removed: {}\nBytes removed: {}\nOwnership receipt: retired\n",
         receipt.catalog_resource_id(),
         receipt.skill_name(),
+        receipt.agent(),
         receipt.scope(),
         safe_path_display(&receipt.destination_path()),
         summary.files_removed(),
@@ -480,9 +485,10 @@ fn format_removal_success(summary: &RemovalSummary) -> String {
 fn format_removal_dry_run(plan: &RemovalPlan) -> String {
     let receipt = plan.receipt();
     let mut output = format!(
-        "Verified THRN skill removal plan\nResource: {}\nSkill name: {}\nAgent: codex\nScope: {}\nDestination: {}\nFiles:\n",
+        "Verified THRN skill removal plan\nResource: {}\nSkill name: {}\nAgent: {}\nScope: {}\nDestination: {}\nFiles:\n",
         receipt.catalog_resource_id(),
         receipt.skill_name(),
+        receipt.agent(),
         receipt.scope(),
         safe_path_display(&receipt.destination_path()),
     );
@@ -505,10 +511,7 @@ fn install_skill(
     project: Option<&Path>,
     dry_run: bool,
 ) -> Result<()> {
-    if agent != "codex" {
-        return Err(InstallCommandError::UnsupportedAgent.into());
-    }
-    let resolved_scope = resolve_scope(scope, project)?;
+    let resolved_scope = resolve_scope(agent, scope, project)?;
     let selection = CatalogService::for_system().discover()?;
     let transport = crate::sources::github::UreqGithubTransport::new();
     let output = if dry_run {
@@ -568,7 +571,7 @@ where
     ) -> std::result::Result<InstallationReceipt, InstallationCompletionError>,
 {
     if agent != "codex" {
-        return Err(InstallCommandError::UnsupportedAgent);
+        return Err(InstallCommandError::UnsupportedAgent(agent.to_owned()));
     }
 
     let session = crate::install::command::prepare_install_session(
@@ -597,8 +600,8 @@ where
         &ReceiptStore,
     ) -> std::result::Result<InstallationReceipt, InstallationCompletionError>,
 {
-    if agent != "codex" {
-        return Err(InstallCommandError::UnsupportedAgent);
+    if agent != scope.agent().as_str() {
+        return Err(InstallCommandError::UnsupportedAgent(agent.to_owned()));
     }
     let session = prepare_install_session_in_scope(
         context.catalog,
@@ -628,8 +631,13 @@ where
         // from a manually installed directory. Reconcile a valid interrupted operation first;
         // the unchanged destination will then be recognized as a managed duplicate.
         let store = receipt_store().map_err(InstallCommandError::ReceiptStore)?;
+        let selected_scope = ResolvedScope::from_agent_validated(
+            session.plan().agent(),
+            session.plan().scope(),
+            session.plan().scope_root().to_path_buf(),
+        );
         store
-            .recover_with_faults(&NoJournalFaults, &NoReceiptFaults)
+            .recover_scope_with_faults(&selected_scope, &NoJournalFaults, &NoReceiptFaults)
             .map_err(InstallCommandError::Recovery)?;
         let receipts = store.list().map_err(InstallCommandError::ReceiptStore)?;
         if receipts.iter().any(|receipt| {
@@ -940,7 +948,8 @@ mod install_tests {
     use super::{
         InstallCommandError, InstallContext, InstallationSession, ReceiptStore,
         execute_install_in_scope_with, execute_install_with, execute_remove_in_scope_with,
-        execute_remove_with, installed_listing_with,
+        execute_remove_with, format_dry_run, installed_listing_with,
+        prepare_install_session_in_scope,
     };
     use crate::{
         install::{
@@ -1103,7 +1112,7 @@ mod install_tests {
             let factory = TestFactory(self.staging.clone());
             execute_install_in_scope_with(
                 identifier,
-                "codex",
+                scope.agent().as_str(),
                 scope,
                 InstallContext {
                     catalog: &self.catalog,
@@ -1118,13 +1127,17 @@ mod install_tests {
     }
 
     fn make_archive() -> Vec<u8> {
+        make_archive_for_name("uncharted-ideation")
+    }
+
+    fn make_archive_for_name(skill_name: &str) -> Vec<u8> {
         let mut bytes = Cursor::new(Vec::new());
         {
             let mut zip = ZipWriter::new(&mut bytes);
             let options =
                 SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
             let root = "catalog-test-fixtures-2f68bee292a8c68346b4294fb31d9563eefe1ade/";
-            let skill = format!("{root}skills/uncharted-ideation/");
+            let skill = format!("{root}skills/{skill_name}/");
             zip.add_directory(root, options).expect("repository root");
             zip.add_directory(format!("{root}skills/"), options)
                 .expect("skills directory");
@@ -1139,8 +1152,11 @@ mod install_tests {
                 .expect("unselected repository file");
             zip.write_all(b"must not be installed")
                 .expect("unselected contents");
+            let skill_md = format!(
+                "---\nname: {skill_name}\ndescription: A deterministic install fixture.\n---\n\nNever execute these instructions.\n"
+            );
             for (path, contents) in [
-                (format!("{skill}SKILL.md"), SKILL_MD),
+                (format!("{skill}SKILL.md"), skill_md.as_bytes()),
                 (format!("{skill}references/guide.md"), GUIDE),
                 (format!("{skill}scripts/not-run.sh"), SCRIPT),
                 (format!("{skill}assets/blob.bin"), BINARY),
@@ -2254,49 +2270,66 @@ mod install_tests {
                 Ok("receipt") => RemovalOperation::RetireReceipt,
                 _ => panic!("unknown crash boundary"),
             };
+            let agent = match std::env::var("THRN_M3_AGENT").as_deref() {
+                Ok("claude-code") => crate::agents::AgentId::ClaudeCode,
+                _ => crate::agents::AgentId::Codex,
+            };
             if std::env::var_os("THRN_M3_SCOPE").is_some() {
                 let home = PathBuf::from(std::env::var_os("THRN_M3_HOME").expect("home"));
-                let scope = ResolvedScope::for_test(InstallScope::User, home);
+                let scope = ResolvedScope::from_agent_validated(agent, InstallScope::User, home);
                 let _ =
                     store.remove_by_id_in_scope("uncharted", &scope, &ExitAfterRemoval(operation));
             } else {
+                let scope =
+                    ResolvedScope::from_agent_validated(agent, InstallScope::Project, project);
                 let _ =
-                    store.remove_by_id("uncharted", None, &project, &ExitAfterRemoval(operation));
+                    store.remove_by_id_in_scope("uncharted", &scope, &ExitAfterRemoval(operation));
             }
             panic!("child process should have terminated at the crash boundary");
         }
 
-        for boundary in ["rename", "file", "receipt"] {
-            let fixture = InstallFixture::new();
-            fixture
-                .execute("uncharted", None, &FixtureTransport::archive())
-                .expect("install fixture");
-            let status = Command::new(std::env::current_exe().expect("test executable"))
-                .arg("--exact")
-                .arg("cli::install_tests::subprocess_crash_after_cleanup_intent_recovers_removed_skill")
-                .arg("--nocapture")
-                .env("THRN_M3_CRASH_DURING_REMOVAL", "1")
-                .env("THRN_M3_CRASH_OPERATION", boundary)
-                .env("THRN_M3_PROJECT", &fixture.project)
-                .env("THRN_M3_DATA", &fixture.data)
-                .status()
-                .expect("launch removal crash simulation");
-            assert_eq!(status.code(), Some(89), "boundary={boundary}");
-            fixture
-                .store()
-                .recover_with_faults(&NoJournalFaults, &NoReceiptFaults)
-                .expect("recover process interruption");
-            assert!(fixture.store().list().expect("receipt retired").is_empty());
-            assert!(
-                !fixture
-                    .project
-                    .join(".agents/skills/uncharted-ideation")
-                    .exists()
-            );
-            fixture
-                .store()
-                .recover_with_faults(&NoJournalFaults, &NoReceiptFaults)
-                .expect("recovery repeats safely");
+        for agent in [
+            crate::agents::AgentId::Codex,
+            crate::agents::AgentId::ClaudeCode,
+        ] {
+            for boundary in ["rename", "file", "receipt"] {
+                let fixture = InstallFixture::new();
+                let scope = ResolvedScope::from_agent_validated(
+                    agent,
+                    InstallScope::Project,
+                    fixture.project.clone(),
+                );
+                fixture
+                    .execute_in_scope("uncharted", &scope, &FixtureTransport::archive())
+                    .expect("install fixture");
+                let status = Command::new(std::env::current_exe().expect("test executable"))
+                    .arg("--exact")
+                    .arg("cli::install_tests::subprocess_crash_after_cleanup_intent_recovers_removed_skill")
+                    .arg("--nocapture")
+                    .env("THRN_M3_CRASH_DURING_REMOVAL", "1")
+                    .env("THRN_M3_CRASH_OPERATION", boundary)
+                    .env("THRN_M3_AGENT", agent.as_str())
+                    .env("THRN_M3_PROJECT", &fixture.project)
+                    .env("THRN_M3_DATA", &fixture.data)
+                    .status()
+                    .expect("launch removal crash simulation");
+                assert_eq!(
+                    status.code(),
+                    Some(89),
+                    "agent={}, boundary={boundary}",
+                    agent.as_str()
+                );
+                fixture
+                    .store()
+                    .recover_scope_with_faults(&scope, &NoJournalFaults, &NoReceiptFaults)
+                    .expect("recover process interruption");
+                assert!(fixture.store().list().expect("receipt retired").is_empty());
+                assert!(!scope.skills_root().join("uncharted-ideation").exists());
+                fixture
+                    .store()
+                    .recover_scope_with_faults(&scope, &NoJournalFaults, &NoReceiptFaults)
+                    .expect("recovery repeats safely");
+            }
         }
     }
 
@@ -2529,6 +2562,266 @@ mod install_tests {
     }
 
     #[test]
+    fn codex_and_claude_project_and_user_installations_are_independently_owned() {
+        let fixture = InstallFixture::new();
+        let root = fixture.project.parent().expect("fixture root");
+        let home = root.join("home");
+        fs::create_dir(&home).expect("isolated user home");
+        let unmanaged = fixture.project.join(".claude/skills/manual-skill");
+        fs::create_dir_all(&unmanaged).expect("unmanaged Claude skill");
+        fs::write(unmanaged.join("SKILL.md"), b"manual Claude content\n")
+            .expect("unmanaged Claude content");
+
+        let codex_project =
+            ResolvedScope::from_validated(InstallScope::Project, fixture.project.clone());
+        let claude_project = ResolvedScope::from_agent_validated(
+            crate::agents::AgentId::ClaudeCode,
+            InstallScope::Project,
+            fixture.project.clone(),
+        );
+        let codex_user = ResolvedScope::from_validated(InstallScope::User, home.clone());
+        let claude_user = ResolvedScope::from_agent_validated(
+            crate::agents::AgentId::ClaudeCode,
+            InstallScope::User,
+            home.clone(),
+        );
+
+        fixture
+            .execute_in_scope("uncharted", &codex_project, &FixtureTransport::archive())
+            .expect("Codex project installation");
+        let claude_project_output = fixture
+            .execute_in_scope("uncharted", &claude_project, &FixtureTransport::archive())
+            .expect("Claude project installation");
+        let claude_user_output = fixture
+            .execute_in_scope("uncharted", &claude_user, &FixtureTransport::archive())
+            .expect("Claude user installation");
+        fixture
+            .execute_in_scope("uncharted", &codex_user, &FixtureTransport::archive())
+            .expect("Codex user installation");
+
+        let codex_project_destination = fixture.project.join(".agents/skills/uncharted-ideation");
+        let claude_project_destination = fixture.project.join(".claude/skills/uncharted-ideation");
+        let codex_user_destination = home.join(".agents/skills/uncharted-ideation");
+        let claude_user_destination = home.join(".claude/skills/uncharted-ideation");
+        assert!(claude_project_output.contains("Agent: claude-code\nScope: project\n"));
+        assert!(claude_project_output.contains(&claude_project_destination.display().to_string()));
+        assert!(claude_user_output.contains("Agent: claude-code\nScope: user\n"));
+        assert!(claude_user_output.contains(&claude_user_destination.display().to_string()));
+        assert!(codex_project_destination.join("SKILL.md").is_file());
+        assert!(claude_project_destination.join("SKILL.md").is_file());
+        assert!(codex_user_destination.join("SKILL.md").is_file());
+        assert!(claude_user_destination.join("SKILL.md").is_file());
+        assert_eq!(
+            fs::read(unmanaged.join("SKILL.md")).expect("unmanaged Claude content remains"),
+            b"manual Claude content\n"
+        );
+        assert!(!fixture.project.join("SKILL-WAS-EXECUTED").exists());
+
+        let receipts = fixture.store().list().expect("all receipts are readable");
+        assert_eq!(receipts.len(), 4);
+        let claude_receipt = receipts
+            .iter()
+            .find(|receipt| receipt.agent() == "claude-code" && receipt.scope() == "project")
+            .expect("Claude project receipt");
+        assert_eq!(claude_receipt.schema_version(), 4);
+        assert!(
+            claude_receipt
+                .receipt_filename()
+                .expect("versioned receipt key")
+                .starts_with("v4-")
+        );
+        let receipt_json: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                fixture
+                    .data
+                    .join("receipts")
+                    .join(claude_receipt.receipt_filename().expect("receipt key")),
+            )
+            .expect("Claude receipt bytes"),
+        )
+        .expect("Claude receipt JSON");
+        assert_eq!(receipt_json["agent"], "claude-code");
+        assert_eq!(receipt_json["scope"], "project");
+        assert_eq!(receipt_json["destinationLayout"], "claude-code-default-v1");
+
+        let claude_skill_md = claude_project_destination.join("SKILL.md");
+        let claude_original = fs::read(&claude_skill_md).expect("Claude metadata content");
+        fs::write(&claude_skill_md, b"modified Claude content\n")
+            .expect("modify installed Claude content");
+        assert!(
+            fixture
+                .store()
+                .plan_removal_in_scope("uncharted", &claude_project)
+                .is_err()
+        );
+        fs::write(&claude_skill_md, &claude_original).expect("restore Claude content");
+
+        let displaced = root.join("displaced-Claude-project-skill");
+        fs::rename(&claude_project_destination, &displaced).expect("displace original skill");
+        copy_fixture_tree(&displaced, &claude_project_destination)
+            .expect("copy identical Claude skill tree");
+        assert!(
+            fixture
+                .store()
+                .plan_removal_in_scope("uncharted", &claude_project)
+                .expect_err("byte-identical replacement is not the installed directory")
+                .to_string()
+                .contains("installation-time receipt evidence")
+        );
+        fs::remove_dir_all(&claude_project_destination).expect("remove copied replacement");
+        fs::rename(&displaced, &claude_project_destination).expect("restore installed tree");
+
+        let listing = installed_listing_with(&fixture.store()).expect("offline listing");
+        assert_eq!(listing.matches("Agent: codex").count(), 2);
+        assert_eq!(listing.matches("Agent: claude-code").count(), 2);
+        for scope in [&codex_project, &codex_user, &claude_project, &claude_user] {
+            assert_eq!(
+                fixture
+                    .store()
+                    .inspect_scope(scope)
+                    .expect("scope inspection")
+                    .installations
+                    .len(),
+                1
+            );
+        }
+
+        let removal = execute_remove_in_scope_with(
+            "uncharted",
+            "claude-code",
+            &claude_project,
+            &fixture.store(),
+            false,
+            &NoRemovalFaults,
+        )
+        .expect("remove Claude project installation only");
+        assert!(removal.contains("Agent: claude-code\nScope: project\n"));
+        assert!(!claude_project_destination.exists());
+        assert!(codex_project_destination.join("SKILL.md").is_file());
+        assert!(claude_user_destination.join("SKILL.md").is_file());
+
+        execute_remove_in_scope_with(
+            "uncharted",
+            "claude-code",
+            &claude_user,
+            &fixture.store(),
+            false,
+            &NoRemovalFaults,
+        )
+        .expect("remove Claude user installation only");
+        assert!(!claude_user_destination.exists());
+        assert!(codex_user_destination.join("SKILL.md").is_file());
+        assert!(unmanaged.join("SKILL.md").is_file());
+        let remaining = fixture.store().list().expect("Codex receipts remain");
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().all(|receipt| receipt.agent() == "codex"));
+    }
+
+    #[test]
+    fn claude_dry_run_is_read_only_and_reserved_skill_names_are_rejected() {
+        let fixture = InstallFixture::new();
+        let scope = ResolvedScope::from_agent_validated(
+            crate::agents::AgentId::ClaudeCode,
+            InstallScope::Project,
+            fixture.project.clone(),
+        );
+        let before = fs::read_dir(&fixture.project)
+            .expect("project snapshot")
+            .count();
+        let factory = TestFactory(fixture.staging.clone());
+        let session = prepare_install_session_in_scope(
+            &fixture.catalog,
+            "uncharted",
+            "claude-code",
+            &scope,
+            &FixtureTransport::archive(),
+            &factory,
+        )
+        .expect("Claude plan");
+        let dry_run = format_dry_run(session.plan()).expect("complete read-only plan");
+        assert!(dry_run.contains("Agent: claude-code\nScope: project\n"));
+        assert!(dry_run.contains("Destination: "));
+        assert_eq!(
+            fs::read_dir(&fixture.project)
+                .expect("project remains unchanged")
+                .count(),
+            before
+        );
+        assert!(!fixture.project.join(".claude").exists());
+        assert!(!fixture.data.join("receipts").exists());
+        drop(session);
+
+        let mut catalog_json: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../tests/fixtures/catalog/test-only-valid-v1.json"
+        ))
+        .expect("catalog JSON");
+        catalog_json["resources"][0]["skillName"] = serde_json::json!("synced");
+        catalog_json["resources"][0]["source"]["path"] = serde_json::json!("skills/synced");
+        let reserved_catalog =
+            parse_catalog_json(&serde_json::to_vec(&catalog_json).expect("reserved catalog bytes"))
+                .expect("valid catalog with agent-reserved directory name");
+        let transport = FixtureTransport::with_response(Ok(make_archive_for_name("synced")));
+        let error = execute_install_in_scope_with(
+            "uncharted",
+            "claude-code",
+            &scope,
+            InstallContext {
+                catalog: &reserved_catalog,
+                _current_directory: &fixture.current,
+                transport: &transport,
+                tempdir_factory: &factory,
+                receipt_store: || Ok(fixture.store()),
+                complete: InstallationSession::commit_and_record,
+            },
+        )
+        .expect_err("Claude reserved names do not load and cannot be installed");
+        assert!(error.to_string().contains("reserved by the selected agent"));
+        assert!(!fixture.project.join(".claude").exists());
+        assert!(
+            fixture
+                .store()
+                .list()
+                .expect("no Claude receipt")
+                .is_empty()
+        );
+        assert!(!fixture.project.join("SKILL-WAS-EXECUTED").exists());
+
+        let unmanaged_fixture = InstallFixture::new();
+        let unmanaged_scope = ResolvedScope::from_agent_validated(
+            crate::agents::AgentId::ClaudeCode,
+            InstallScope::Project,
+            unmanaged_fixture.project.clone(),
+        );
+        let unmanaged_destination = unmanaged_fixture
+            .project
+            .join(".claude/skills/uncharted-ideation");
+        fs::create_dir_all(&unmanaged_destination).expect("unmanaged Claude target");
+        fs::write(
+            unmanaged_destination.join("keep.txt"),
+            b"unmanaged Claude data",
+        )
+        .expect("unmanaged sentinel");
+        let unmanaged_error = unmanaged_fixture
+            .execute_in_scope("uncharted", &unmanaged_scope, &FixtureTransport::archive())
+            .expect_err("an unmanaged Claude skill is never adopted");
+        assert!(matches!(
+            unmanaged_error,
+            InstallCommandError::ExistingUnmanagedSkill
+        ));
+        assert_eq!(
+            fs::read(unmanaged_destination.join("keep.txt")).expect("unmanaged content remains"),
+            b"unmanaged Claude data"
+        );
+        assert!(
+            unmanaged_fixture
+                .store()
+                .list()
+                .expect("no unmanaged ownership claim")
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn explicit_project_and_alias_resolve_to_skill_name_destination() {
         let fixture = InstallFixture::new();
         let selected = fixture.current.join("selected-project");
@@ -2595,7 +2888,7 @@ mod install_tests {
         let never_transport = FixtureTransport::with_response(Err(TransportError::Connection));
         let never_store_calls = Arc::new(AtomicUsize::new(0));
         for (id, agent, expected) in [
-            ("uncharted", "cursor", "only --agent codex"),
+            ("uncharted", "cursor", "unsupported agent"),
             ("unknown-id", "codex", "no catalog entry matches"),
         ] {
             let store_calls = Arc::clone(&never_store_calls);
@@ -2712,6 +3005,134 @@ mod install_tests {
     }
 
     #[test]
+    fn claude_recovery_refuses_to_mutate_a_pending_codex_install() {
+        let fixture = InstallFixture::new();
+        let failed = run_with_completion(
+            &fixture,
+            "uncharted",
+            None,
+            &FixtureTransport::archive(),
+            |session, store| {
+                session.commit_and_record_at_with_journal(
+                    store,
+                    1_900_000_000,
+                    &NoInstallFaults,
+                    &FailReceiptAt(ReceiptOperation::PublishNoReplace),
+                    &NoJournalFaults,
+                )
+            },
+        )
+        .expect_err("injected Codex receipt failure leaves a pending operation");
+        assert!(failed.to_string().contains("installed files remain"));
+
+        let codex_destination = fixture.project.join(".agents/skills/uncharted-ideation");
+        let codex_journal_dir = fixture.data.join("operations");
+        let journal_path = fs::read_dir(&codex_journal_dir)
+            .expect("pending Codex journal directory")
+            .next()
+            .expect("one Codex journal")
+            .expect("journal entry")
+            .path();
+        let journal_before = fs::read(&journal_path).expect("Codex journal snapshot");
+        let claude_scope = ResolvedScope::from_agent_validated(
+            crate::agents::AgentId::ClaudeCode,
+            InstallScope::Project,
+            fixture.project.clone(),
+        );
+        assert!(
+            fixture
+                .store()
+                .recover_scope_with_faults(&claude_scope, &NoJournalFaults, &NoReceiptFaults)
+                .is_err(),
+            "Claude recovery cannot claim or finish Codex work"
+        );
+        assert!(codex_destination.join("SKILL.md").is_file());
+        assert_eq!(
+            fs::read(&journal_path).expect("Codex journal remains"),
+            journal_before
+        );
+
+        let codex_scope =
+            ResolvedScope::from_validated(InstallScope::Project, fixture.project.clone());
+        fixture
+            .store()
+            .recover_scope_with_faults(&codex_scope, &NoJournalFaults, &NoReceiptFaults)
+            .expect("Codex recovery remains available to its own scope");
+        let receipts = fixture.store().list().expect("published Codex receipt");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].agent(), "codex");
+        assert!(codex_destination.join("SKILL.md").is_file());
+        assert!(!fixture.project.join(".claude").exists());
+    }
+
+    #[test]
+    fn claude_removal_journal_recovers_after_quarantine_and_preserves_codex() {
+        let fixture = InstallFixture::new();
+        let codex_scope =
+            ResolvedScope::from_validated(InstallScope::Project, fixture.project.clone());
+        let claude_scope = ResolvedScope::from_agent_validated(
+            crate::agents::AgentId::ClaudeCode,
+            InstallScope::Project,
+            fixture.project.clone(),
+        );
+        fixture
+            .execute_in_scope("uncharted", &codex_scope, &FixtureTransport::archive())
+            .expect("Codex installation");
+        fixture
+            .execute_in_scope("uncharted", &claude_scope, &FixtureTransport::archive())
+            .expect("Claude installation");
+
+        let _error = fixture
+            .store()
+            .remove_by_id_in_scope(
+                "uncharted",
+                &claude_scope,
+                &FailRemovalBoundary {
+                    operation: RemovalOperation::RenameToQuarantine,
+                    timing: FaultTiming::After,
+                    fired: std::sync::atomic::AtomicBool::new(false),
+                },
+            )
+            .expect_err("fault after quarantine must not report success");
+        let journal_path = fs::read_dir(fixture.data.join("removals"))
+            .expect("Claude removal journal directory")
+            .next()
+            .expect("pending Claude journal")
+            .expect("journal entry")
+            .path();
+        let journal: serde_json::Value =
+            serde_json::from_slice(&fs::read(&journal_path).expect("Claude removal journal bytes"))
+                .expect("Claude removal journal JSON");
+        assert_eq!(journal["schemaVersion"], 3);
+        assert_eq!(journal["receipt"]["agent"], "claude-code");
+        assert_eq!(journal["receipt"]["scope"], "project");
+
+        fixture
+            .store()
+            .recover_scope_with_faults(&claude_scope, &NoJournalFaults, &NoReceiptFaults)
+            .expect("recover quarantined Claude removal");
+        fixture
+            .store()
+            .recover_scope_with_faults(&claude_scope, &NoJournalFaults, &NoReceiptFaults)
+            .expect("Claude removal recovery is idempotent");
+        assert!(
+            !fixture
+                .project
+                .join(".claude/skills/uncharted-ideation")
+                .exists()
+        );
+        assert!(
+            fixture
+                .project
+                .join(".agents/skills/uncharted-ideation/SKILL.md")
+                .is_file()
+        );
+        let receipts = fixture.store().list().expect("Codex receipt remains");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].agent(), "codex");
+    }
+
+    #[test]
     fn user_install_receipt_publication_recovery_keeps_scope_and_root_identity() {
         let fixture = InstallFixture::new();
         let home = fixture
@@ -2771,46 +3192,59 @@ mod install_tests {
 
     #[test]
     fn concurrent_install_attempts_cannot_both_succeed() {
-        let fixture = InstallFixture::new();
-        let barrier = Arc::new(Barrier::new(2));
-        let mut workers = Vec::new();
-        for index in 0..2 {
-            let catalog = fixture.catalog.clone();
-            let current = fixture.current.clone();
-            let staging = fixture
-                .staging
-                .parent()
-                .expect("staging parent")
-                .join(format!("staging-{index}"));
-            fs::create_dir(&staging).expect("worker staging directory");
-            let data = fixture.data.clone();
-            let barrier = Arc::clone(&barrier);
-            workers.push(thread::spawn(move || {
-                barrier.wait();
-                let factory = TestFactory(staging);
-                execute_install_with(
-                    "uncharted",
-                    "codex",
-                    None,
-                    InstallContext {
-                        catalog: &catalog,
-                        _current_directory: &current,
-                        transport: &FixtureTransport::archive(),
-                        tempdir_factory: &factory,
-                        receipt_store: || Ok(ReceiptStore::new(data.join("receipts"))),
-                        complete: InstallationSession::commit_and_record,
-                    },
-                )
-                .is_ok()
-            }));
+        for agent in [
+            crate::agents::AgentId::Codex,
+            crate::agents::AgentId::ClaudeCode,
+        ] {
+            let fixture = InstallFixture::new();
+            let scope = ResolvedScope::from_agent_validated(
+                agent,
+                InstallScope::Project,
+                fixture.project.clone(),
+            );
+            let barrier = Arc::new(Barrier::new(2));
+            let mut workers = Vec::new();
+            for index in 0..2 {
+                let catalog = fixture.catalog.clone();
+                let current = fixture.current.clone();
+                let scope = scope.clone();
+                let staging = fixture
+                    .staging
+                    .parent()
+                    .expect("staging parent")
+                    .join(format!("staging-{index}"));
+                fs::create_dir(&staging).expect("worker staging directory");
+                let data = fixture.data.clone();
+                let barrier = Arc::clone(&barrier);
+                workers.push(thread::spawn(move || {
+                    barrier.wait();
+                    let factory = TestFactory(staging);
+                    execute_install_in_scope_with(
+                        "uncharted",
+                        agent.as_str(),
+                        &scope,
+                        InstallContext {
+                            catalog: &catalog,
+                            _current_directory: &current,
+                            transport: &FixtureTransport::archive(),
+                            tempdir_factory: &factory,
+                            receipt_store: || Ok(ReceiptStore::new(data.join("receipts"))),
+                            complete: InstallationSession::commit_and_record,
+                        },
+                    )
+                    .is_ok()
+                }));
+            }
+            let successes = workers
+                .into_iter()
+                .map(|worker| worker.join().expect("worker finishes"))
+                .filter(|success| *success)
+                .count();
+            assert_eq!(successes, 1, "agent={}", agent.as_str());
+            let receipts = fixture.store().list().expect("single receipt");
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].agent(), agent.as_str());
         }
-        let successes = workers
-            .into_iter()
-            .map(|worker| worker.join().expect("worker finishes"))
-            .filter(|success| *success)
-            .count();
-        assert_eq!(successes, 1);
-        assert_eq!(fixture.store().list().expect("single receipt").len(), 1);
     }
 
     #[test]

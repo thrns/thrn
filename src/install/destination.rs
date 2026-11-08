@@ -6,6 +6,8 @@ use std::{
 
 use thiserror::Error;
 
+use crate::agents::AgentId;
+
 /// Maximum entries retained from any inspected project or destination directory.
 pub const MAX_DESTINATION_DIRECTORY_ENTRIES: usize = 16_384;
 
@@ -248,12 +250,14 @@ impl DestinationConflict {
     }
 }
 
-/// Read-only assumptions about the selected project and Codex destination.
+/// Read-only assumptions about the selected project and agent destination.
 ///
 /// M2-04 can inspect again and compare this value before any write. It is not an authorization
 /// token and cannot prevent changes that occur after reinspection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DestinationSnapshot {
+    agent: AgentId,
+    agent_directory: String,
     project_root: PathBuf,
     project_identity: Option<FileIdentity>,
     agents_state: ComponentState,
@@ -269,6 +273,14 @@ pub struct DestinationSnapshot {
 }
 
 impl DestinationSnapshot {
+    pub(crate) fn agent(&self) -> AgentId {
+        self.agent
+    }
+
+    pub(crate) fn agent_directory(&self) -> &str {
+        &self.agent_directory
+    }
+
     pub fn project_root(&self) -> &Path {
         &self.project_root
     }
@@ -348,7 +360,17 @@ pub fn inspect_destination(
     current_directory: &Path,
     skill_name: &str,
 ) -> Result<DestinationSnapshot, DestinationError> {
-    inspect_destination_with_file_system(
+    inspect_destination_for_agent(AgentId::Codex, project, current_directory, skill_name)
+}
+
+pub(crate) fn inspect_destination_for_agent(
+    agent: AgentId,
+    project: Option<&Path>,
+    current_directory: &Path,
+    skill_name: &str,
+) -> Result<DestinationSnapshot, DestinationError> {
+    inspect_destination_with_file_system_for_agent(
+        agent,
         project,
         current_directory,
         skill_name,
@@ -358,6 +380,22 @@ pub fn inspect_destination(
 
 /// Injectable counterpart used by tests and future destination adapters.
 pub fn inspect_destination_with_file_system(
+    project: Option<&Path>,
+    current_directory: &Path,
+    skill_name: &str,
+    file_system: &dyn DestinationFileSystem,
+) -> Result<DestinationSnapshot, DestinationError> {
+    inspect_destination_with_file_system_for_agent(
+        AgentId::Codex,
+        project,
+        current_directory,
+        skill_name,
+        file_system,
+    )
+}
+
+pub(crate) fn inspect_destination_with_file_system_for_agent(
+    agent: AgentId,
     project: Option<&Path>,
     current_directory: &Path,
     skill_name: &str,
@@ -413,7 +451,8 @@ pub fn inspect_destination_with_file_system(
         .object_identity(&project_root)
         .map_err(|error| filesystem_error("identify", &project_root, error))?;
 
-    let agents = project_root.join(".agents");
+    let agent_directory = agent.adapter().skill_directory();
+    let agents = project_root.join(agent_directory);
     let skills = agents.join("skills");
     let destination = skills.join(skill_name);
     if !destination.starts_with(&project_root) {
@@ -424,7 +463,7 @@ pub fn inspect_destination_with_file_system(
     let existing_project_entries = read_directory_snapshot(file_system, &project_root)?;
     record_component_collisions(
         &existing_project_entries,
-        ".agents",
+        agent_directory,
         &project_root,
         &mut conflicts,
     );
@@ -517,6 +556,8 @@ pub fn inspect_destination_with_file_system(
     };
 
     Ok(DestinationSnapshot {
+        agent,
+        agent_directory: agent_directory.to_owned(),
         project_root,
         project_identity,
         agents_state,
@@ -632,10 +673,14 @@ mod tests {
 
     use tempfile::tempdir;
 
+    use crate::agents::AgentId;
+    #[cfg(windows)]
+    use crate::install::windows_test_support::create_junction;
+
     use super::{
         ConflictKind, DestinationError, DestinationFileSystem, DirectoryEntrySnapshot,
         MAX_DESTINATION_DIRECTORY_ENTRIES, ObjectKind, RealDestinationFileSystem,
-        inspect_destination, inspect_destination_with_file_system,
+        inspect_destination, inspect_destination_for_agent, inspect_destination_with_file_system,
     };
 
     #[test]
@@ -889,6 +934,58 @@ mod tests {
         assert_eq!(
             snapshot.conflicts()[0].kind(),
             ConflictKind::ExistingSymlink
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_code_adapter_rejects_a_symlinked_project_skill_root() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempdir().expect("temporary root");
+        let project = temporary.path().join("project");
+        let external = temporary.path().join("external");
+        fs::create_dir(&project).expect("project");
+        fs::create_dir(&external).expect("external target");
+        fs::write(external.join("keep.txt"), b"outside content").expect("external sentinel");
+        symlink(&external, project.join(".claude")).expect("Claude root symlink");
+
+        let snapshot =
+            inspect_destination_for_agent(AgentId::ClaudeCode, None, &project, "skill-name")
+                .expect("unsafe adapter root is a plan conflict");
+        assert_eq!(snapshot.conflicts().len(), 1);
+        assert_eq!(
+            snapshot.conflicts()[0].kind(),
+            ConflictKind::UnsafeDestinationComponent
+        );
+        assert_eq!(
+            fs::read(external.join("keep.txt")).expect("external target unchanged"),
+            b"outside content"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn claude_code_adapter_rejects_a_real_windows_project_junction() {
+        let temporary = tempdir().expect("temporary root");
+        let project = temporary.path().join("project");
+        let external = temporary.path().join("external");
+        fs::create_dir(&project).expect("project");
+        fs::create_dir(&external).expect("external target");
+        fs::write(external.join("keep.txt"), b"outside content").expect("external sentinel");
+        create_junction(&project.join(".claude"), &external);
+
+        let snapshot =
+            inspect_destination_for_agent(AgentId::ClaudeCode, None, &project, "skill-name")
+                .expect("junction is a plan conflict");
+        assert_eq!(snapshot.conflicts().len(), 1);
+        assert_eq!(
+            snapshot.conflicts()[0].kind(),
+            ConflictKind::UnsafeDestinationComponent
+        );
+        assert_eq!(
+            fs::read(external.join("keep.txt")).expect("external target unchanged"),
+            b"outside content"
         );
     }
 
