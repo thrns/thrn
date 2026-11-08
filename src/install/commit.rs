@@ -25,7 +25,7 @@ use super::{
         JournalError, JournalFaultInjector, NoJournalFaults, OperationJournal, OperationState,
         new_staging_name,
     },
-    plan::{InstallAgent, InstallPlan, InstallScope},
+    plan::{InstallAgent, InstallPlan},
 };
 
 const IO_CHUNK_BYTES: usize = 8 * 1024;
@@ -352,8 +352,8 @@ fn commit_session_inner(
 
     let snapshot = session.plan.destination_snapshot();
     let current = inspect_destination(
-        Some(session.plan.project_root()),
-        session.plan.project_root(),
+        Some(session.plan.scope_root()),
+        session.plan.scope_root(),
         session.plan.skill_name().as_str(),
     )
     .map_err(|_| CommitError::DestinationChanged)?;
@@ -365,7 +365,7 @@ fn commit_session_inner(
         });
     }
 
-    let project = SecureDir::open_absolute(session.plan.project_root()).map_err(|error| {
+    let project = SecureDir::open_absolute(session.plan.scope_root()).map_err(|error| {
         operation_error(InstallOperation::CreateParentDirectory, error, true, vec![])
     })?;
     ensure_identity(&project, snapshot.project_identity())?;
@@ -500,8 +500,8 @@ fn commit_session_inner(
     })?;
 
     let latest = inspect_destination(
-        Some(session.plan.project_root()),
-        session.plan.project_root(),
+        Some(session.plan.scope_root()),
+        session.plan.scope_root(),
         session.plan.skill_name().as_str(),
     )
     .map_err(|_| {
@@ -618,8 +618,8 @@ fn commit_session_inner(
     }
 
     let latest = inspect_destination(
-        Some(session.plan.project_root()),
-        session.plan.project_root(),
+        Some(session.plan.scope_root()),
+        session.plan.scope_root(),
         session.plan.skill_name().as_str(),
     )
     .map_err(|_| {
@@ -735,7 +735,7 @@ fn validate_session_identity(session: &InstallationSession) -> Result<(), Commit
     let inventory = &session.inventory;
     let plan = &session.plan;
     let expected_destination = plan
-        .project_root()
+        .scope_root()
         .join(".agents/skills")
         .join(plan.skill_name().as_str());
     if staged.catalog_id() != plan.resource_id()
@@ -751,9 +751,8 @@ fn validate_session_identity(session: &InstallationSession) -> Result<(), Commit
         || inventory.skill_name() != plan.skill_name()
         || inventory.revision() != plan.source_commit()
         || plan.agent() != InstallAgent::Codex
-        || plan.scope() != InstallScope::Project
         || plan.destination() != expected_destination
-        || !plan.destination().starts_with(plan.project_root())
+        || !plan.destination().starts_with(plan.scope_root())
         || inventory.total_bytes() != plan.total_file_bytes()
         || inventory.files().len() != plan.files().len()
     {

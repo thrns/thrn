@@ -23,6 +23,7 @@ impl TestDir {
             let path = parent.join(format!("thrn-cli-test-{}-{sequence}", std::process::id()));
             match fs::create_dir(&path) {
                 Ok(()) => {
+                    let path = path.canonicalize().expect("canonical isolated test root");
                     let project = path.join("project");
                     fs::create_dir(&project).expect("test project directory should be created");
                     return Self {
@@ -55,6 +56,9 @@ fn command_in(directory: &TestDir, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_thrn"));
     command.args(args).current_dir(directory.path()).env_clear();
     command.env("HOME", directory.root());
+    command.env("USERPROFILE", directory.root());
+    command.env("XDG_CONFIG_HOME", directory.root().join("xdg-config"));
+    command.env("XDG_DATA_HOME", directory.root().join("xdg-data"));
     command.env("XDG_CACHE_HOME", directory.root().join("xdg-cache"));
     command.env("LOCALAPPDATA", directory.root().join("local-app-data"));
     command.env("THRN_CACHE_DIR", directory.root().join("thrn-cache"));
@@ -423,6 +427,68 @@ fn skills_check_empty_project_uses_bundled_metadata_offline_without_creating_sto
     assert_eq!(recursive_snapshot(directory.root()), before);
     assert!(!directory.root().join("thrn-cache").exists());
     assert!(!data_directory(&directory).exists());
+}
+
+#[test]
+fn skills_check_user_scope_is_offline_read_only_and_uses_the_isolated_home() {
+    let directory = TestDir::new();
+    let before = recursive_snapshot(directory.root());
+    let output = command_in(&directory, &["skills", "check", "--scope", "user"])
+        .output()
+        .expect("compiled CLI starts with network disabled");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Scope: user"));
+    assert!(stdout.contains(&format!("User root: {}", directory.root().display())));
+    assert!(stdout.contains("No THRN-managed Codex user skills are recorded"));
+    assert!(stdout.contains("no network request was made"));
+    assert!(output.stderr.is_empty());
+    assert_eq!(recursive_snapshot(directory.root()), before);
+    assert!(!directory.root().join(".agents").exists());
+    assert!(!data_directory(&directory).exists());
+    assert!(!directory.root().join("thrn-cache").exists());
+}
+
+#[test]
+fn user_scope_rejects_project_path_and_unsafe_home_before_writing() {
+    let directory = TestDir::new();
+    let before = recursive_snapshot(directory.root());
+    let project_arg = directory.path().to_str().expect("project path");
+    let conflict = command_in(
+        &directory,
+        &[
+            "skills",
+            "install",
+            "uncharted",
+            "--agent",
+            "codex",
+            "--scope",
+            "user",
+            "--project",
+            project_arg,
+        ],
+    )
+    .output()
+    .expect("compiled CLI starts");
+    assert_eq!(conflict.status.code(), Some(2));
+    assert!(conflict.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&conflict.stderr)
+            .contains("--project can only be used with --scope project")
+    );
+    assert_eq!(recursive_snapshot(directory.root()), before);
+
+    let invalid_home = command_in(&directory, &["skills", "check", "--scope", "user"])
+        .env("HOME", "relative-home")
+        .output()
+        .expect("compiled CLI starts");
+    assert_eq!(invalid_home.status.code(), Some(1));
+    assert!(invalid_home.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&invalid_home.stderr).contains("missing, ambiguous, or unsafe")
+    );
+    assert_eq!(recursive_snapshot(directory.root()), before);
 }
 
 #[test]
@@ -906,7 +972,7 @@ fn installed_listing_fails_on_unrecognized_receipt_content_without_changing_it()
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("schema-v1 deterministic identity key"),
+        stderr.contains("receipt filename is not a supported deterministic identity key"),
         "unexpected listing error: {stderr}"
     );
     assert_eq!(

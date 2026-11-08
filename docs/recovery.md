@@ -1,14 +1,28 @@
 # Installation, update, and removal recovery
 
-M2-06 adds the recovery protocol used by Codex project installation. `thrn skills install` enters
-it through `InstallationSession::commit_and_record`; the recovery implementation itself has no
-network dependency and tests use isolated application-data and project directories.
+M2-06 introduced the recovery protocol for Codex project installation. M3-04 extends the same
+receipt store, OS-backed writer lock, staging, no-replace commitment, removal quarantine, update
+backup, and recovery paths to explicitly selected Codex user scope. `thrn skills install` enters it
+through `InstallationSession::commit_and_record`; recovery itself has no network dependency and
+tests use isolated application-data, project, and home directories.
+
+## Scope-bound recovery
+
+Project operations retain their original journal formats and resolve the selected project root.
+Explicit user operations resolve the validated OS home and require receipt scope, canonical root,
+root filesystem identity, destination, and journal identities to agree. User install, removal, and
+update journals use schema version 2; project journals retain their existing schema version 1. A
+record cannot switch scope during recovery. The selected skill destination is
+`<project>/.agents/skills/<skillName>` or `<home>/.agents/skills/<skillName>`. User operations do
+not use the current working directory or legacy `$CODEX_HOME/skills` as a fallback. Both scopes
+hold the same `.writer.lock` through recovery and transaction completion.
 
 ## Journal storage and schema
 
 Operation records live in the application-data `operations` directory, beside and separate from
 `receipts` and the catalog cache. Each operation is a sequence of immutable JSON snapshots named
-`op-<random-128-bit-id>-<zero-padded-sequence>.json`. Schema version 1 rejects unknown fields,
+`op-<random-128-bit-id>-<zero-padded-sequence>.json`. Project schema version 1 and user schema
+version 2 reject unknown fields,
 unsupported versions, malformed names, missing or duplicate sequence entries, unsafe object types,
 invalid receipt data, and records larger than 10 MiB. The store is bounded to 16,384 entries and
 256 MiB total; inventory paths and record counts are validated against the receipt and archive
@@ -16,14 +30,15 @@ limits. Capacity exhaustion fails closed and can leave an explicitly incomplete 
 recovery or manual inspection.
 
 Every snapshot carries a strict receipt identity and full expected receipt, operation ID and
-sequence, state, destination-local staging name, project `.agents` and `skills` identities, whether
+sequence, state, destination-local staging name, selected-root `.agents` and `skills` identities, whether
 THRN intended to create those parents, the staging and final directory identities, and the relative
 paths and filesystem identities of operation-created files and directories. A new operation begins
-with the schema-v1 receipt intent needed for reservation. After the no-replace commit, the journal
-records the committed destination identity and matching schema-v2 receipt together before it can
-advance to `DirectoryCommitVerified`. A v2 receipt's identity must equal the journal's destination
-identity. Historical v1 journal snapshots remain readable; they keep their original strict receipt
-data until recovery can prove an in-progress installation from its recorded staging identity. The
+with a scope-specific receipt intent needed for reservation. After the no-replace commit, the journal
+records the committed destination identity and matching project schema-v2 or user schema-v3 receipt
+together before it can advance to `DirectoryCommitVerified`. The receipt's identity must equal the
+journal's destination identity. Historical project v1 journal snapshots remain readable; they keep
+their original strict receipt data until recovery can prove an in-progress installation from its
+recorded staging identity. The
 receipt supplies the expected path inventory, file sizes, and SHA-256 hashes. A file record also
 marks whether the complete staged file was verified before commit. Journal contents and receipts are
 both untrusted and neither is sufficient evidence by itself.
@@ -147,14 +162,15 @@ operations fail closed.
 
 ## Receipt-backed removal state machine
 
-M3-01 adds a separate versioned removal journal in application-data `removals`; new removal
-operations require the schema-v2 installation receipt and do not weaken the install journal. Removal and
+M3-01 adds a separate versioned removal journal in application-data `removals`; project removal
+requires a schema-v2 installation receipt and user removal requires schema v3. Neither weakens the
+install journal. Removal and
 installation hold the same exclusive `.writer.lock` from recovery/admission through transaction
 completion. Install admission rejects any unresolved removal record, and receipt listing remains
 read-only but fails closed while a removal transaction is pending.
 
-The removal journal contains the strict v2 ownership receipt, receipt-store and receipt-file
-identities, canonical project and `.agents/skills` identities, the verified destination identity,
+The removal journal contains the strict scope-appropriate ownership receipt, receipt-store and receipt-file
+identities, canonical selected root and `.agents/skills` identities, the verified destination identity,
 the complete expected object inventory with filesystem identities and file digests, a random sibling
 quarantine name, and a set of durable per-object cleanup intents. The record duplicates the
 receipt's installation-time destination identity and requires both to agree. It also pins the
@@ -233,9 +249,10 @@ recovery may need to preserve and report a conflict.
 ## Receipt-backed update state machine
 
 M3-02 uses a separate strict versioned journal in application-data `updates`. It shares the
-persistent `.writer.lock` with installation and removal. The record captures the old schema-v2
+persistent `.writer.lock` with installation and removal. Project updates require schema v2 and user
+updates require schema v3. The record captures the old scope-appropriate
 receipt, its raw-byte SHA-256 and filesystem identity, the complete old and replacement inventories,
-project and Codex parent identities, stage and destination directory identities, receipt transition
+scope-root and Codex parent identities, stage and destination directory identities, receipt transition
 temporary/backup identities, operation-owned names, and per-object cleanup intents. It records the
 new schema-v2 receipt before that receipt can be published. Journal snapshots use exclusive temp
 files, strict read-back validation, and no-replace publication; malformed journals and leftover
@@ -263,13 +280,13 @@ stateDiagram-v2
 ```
 
 The update plan and first durable journal are prepared only after the exact canonical resource,
-matching schema-v2 installation, complete installed tree, and pinned replacement source validate.
+matching scope-specific installation, complete installed tree, and pinned replacement source validate.
 `Already up to date` returns before fetching or writing. For a newer source, THRN copies into a
 private sibling stage on the destination filesystem, verifies every expected byte and SHA-256, and
 records the stage identity/inventory before moving the original. It then performs two separate
 no-replace renames: original to operation-owned backup, then stage to original destination. This is
 not an atomic swap. The replacement's committed directory identity is captured through the secure
-handle and bound into the new schema-v2 receipt.
+handle and bound into the new project schema-v2 or user schema-v3 receipt.
 
 Receipt transition retains the deterministic receipt filename. The exact old receipt remains active
 until the journal has the new receipt contents and temp identity. THRN moves the exact old receipt

@@ -2,7 +2,6 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::OsString,
     fs,
     io::{self, Read, Write},
     path::PathBuf,
@@ -59,19 +58,8 @@ pub(crate) struct ProjectInspectionSnapshot {
 
 impl ReceiptStore {
     pub fn for_system() -> Result<Self, ReceiptStoreError> {
-        let data_directory = if let Some(path) = std::env::var_os("THRN_DATA_DIR") {
-            let path = PathBuf::from(path);
-            if !path.is_absolute() {
-                return Err(ReceiptStoreError::RelativeDirectoryOverride);
-            }
-            path
-        } else {
-            directories::ProjectDirs::from("im", "thrn", "thrn")
-                .ok_or(ReceiptStoreError::DirectoryUnavailable)?
-                .data_dir()
-                .to_path_buf()
-        };
-        let data_directory = resolve_data_directory(&data_directory)?;
+        let paths = crate::os_paths::OsPaths::for_system().map_err(map_os_path_error)?;
+        let data_directory = paths.application_data_dir().map_err(map_os_path_error)?;
         Ok(Self::new(data_directory.join("receipts")))
     }
 
@@ -105,6 +93,7 @@ impl ReceiptStore {
     /// Inspect only installations recorded for one existing project. The read reservation, when
     /// present, is held while lifecycle journals, receipts, and selected project trees are read.
     /// This path never creates storage and never invokes recovery.
+    #[cfg(test)]
     pub(crate) fn inspect_project(
         &self,
         project: Option<&std::path::Path>,
@@ -112,10 +101,21 @@ impl ReceiptStore {
     ) -> Result<ProjectInspectionSnapshot, ReceiptStoreError> {
         let project_root = super::removal::resolve_project_root(project, current_directory)
             .map_err(|error| ReceiptStoreError::ProjectInspection(error.to_string()))?;
+        self.inspect_scope(&super::scope::ResolvedScope::from_validated(
+            super::plan::InstallScope::Project,
+            project_root,
+        ))
+    }
+
+    /// Read-only inspection restricted to the supplied validated scope identity and root.
+    pub(crate) fn inspect_scope(
+        &self,
+        scope: &super::scope::ResolvedScope,
+    ) -> Result<ProjectInspectionSnapshot, ReceiptStoreError> {
         let Some(directory) = self.open_existing_directory()? else {
             self.ensure_no_pending_operations()?;
             return Ok(ProjectInspectionSnapshot {
-                project_root,
+                project_root: scope.root().to_path_buf(),
                 installations: Vec::new(),
             });
         };
@@ -128,7 +128,7 @@ impl ReceiptStore {
 
         let mut inspections = Vec::new();
         for (_, receipt) in receipts {
-            if receipt.root_path() != project_root {
+            if receipt.scope() != scope.scope().as_str() || receipt.root_path() != scope.root() {
                 continue;
             }
             let content = if super::removal::verify_receipt_for_check(&receipt).is_ok() {
@@ -160,12 +160,13 @@ impl ReceiptStore {
         }
         self.ensure_no_pending_operations()?;
         Ok(ProjectInspectionSnapshot {
-            project_root,
+            project_root: scope.root().to_path_buf(),
             installations: inspections,
         })
     }
 
     /// Build a read-only removal plan from one exact canonical-ID receipt and its current tree.
+    #[cfg(test)]
     pub(crate) fn plan_removal(
         &self,
         resource_id: &str,
@@ -173,28 +174,27 @@ impl ReceiptStore {
         current_directory: &std::path::Path,
     ) -> Result<RemovalPlan, RemovalError> {
         let project_root = super::removal::resolve_project_root(project, current_directory)?;
-        let directory = self
-            .open_existing_directory()
-            .map_err(|error| RemovalError::Store(error.to_string()))?
-            .ok_or(RemovalError::MissingReceipt)?;
-        check_idle_writer_lock(&directory)
-            .map_err(|error| RemovalError::Store(error.to_string()))?;
-        self.ensure_no_pending_operations()
-            .map_err(|error| RemovalError::Store(error.to_string()))?;
-        let receipts = read_receipts(&directory, true)
-            .map_err(|error| RemovalError::Store(error.to_string()))?;
-        build_removal_plan(&directory, &receipts, resource_id, &project_root)
+        self.plan_removal_at(
+            resource_id,
+            super::plan::InstallScope::Project,
+            &project_root,
+        )
     }
 
-    /// Build a read-only update proof using the same schema-v2 ownership and complete-tree
-    /// verification used by removal. The caller supplies an exact canonical catalog ID.
-    pub(crate) fn plan_update_target(
+    pub(crate) fn plan_removal_in_scope(
         &self,
         resource_id: &str,
-        project: Option<&std::path::Path>,
-        current_directory: &std::path::Path,
+        scope: &super::scope::ResolvedScope,
     ) -> Result<RemovalPlan, RemovalError> {
-        let project_root = super::removal::resolve_project_root(project, current_directory)?;
+        self.plan_removal_at(resource_id, scope.scope(), scope.root())
+    }
+
+    fn plan_removal_at(
+        &self,
+        resource_id: &str,
+        scope: super::plan::InstallScope,
+        scope_root: &std::path::Path,
+    ) -> Result<RemovalPlan, RemovalError> {
         let directory = self
             .open_existing_directory()
             .map_err(|error| RemovalError::Store(error.to_string()))?
@@ -205,7 +205,34 @@ impl ReceiptStore {
             .map_err(|error| RemovalError::Store(error.to_string()))?;
         let receipts = read_receipts(&directory, true)
             .map_err(|error| RemovalError::Store(error.to_string()))?;
-        build_removal_plan(&directory, &receipts, resource_id, &project_root)
+        build_removal_plan(&directory, &receipts, resource_id, scope, scope_root)
+    }
+
+    pub(crate) fn plan_update_target_in_scope(
+        &self,
+        resource_id: &str,
+        scope: &super::scope::ResolvedScope,
+    ) -> Result<RemovalPlan, RemovalError> {
+        self.plan_update_target_at(resource_id, scope.scope(), scope.root())
+    }
+
+    fn plan_update_target_at(
+        &self,
+        resource_id: &str,
+        scope: super::plan::InstallScope,
+        scope_root: &std::path::Path,
+    ) -> Result<RemovalPlan, RemovalError> {
+        let directory = self
+            .open_existing_directory()
+            .map_err(|error| RemovalError::Store(error.to_string()))?
+            .ok_or(RemovalError::MissingReceipt)?;
+        check_idle_writer_lock(&directory)
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+        self.ensure_no_pending_operations()
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+        let receipts = read_receipts(&directory, true)
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+        build_removal_plan(&directory, &receipts, resource_id, scope, scope_root)
     }
 
     pub(crate) fn update_receipt_digest(
@@ -226,6 +253,7 @@ impl ReceiptStore {
     }
 
     /// Recover an interrupted removal and then remove one exact receipt-backed installation.
+    #[cfg(test)]
     pub(crate) fn remove_by_id(
         &self,
         resource_id: &str,
@@ -234,6 +262,30 @@ impl ReceiptStore {
         faults: &dyn RemovalFaultInjector,
     ) -> Result<RemovalSummary, RemovalError> {
         let project_root = super::removal::resolve_project_root(project, current_directory)?;
+        self.remove_by_id_at(
+            resource_id,
+            super::plan::InstallScope::Project,
+            &project_root,
+            faults,
+        )
+    }
+
+    pub(crate) fn remove_by_id_in_scope(
+        &self,
+        resource_id: &str,
+        scope: &super::scope::ResolvedScope,
+        faults: &dyn RemovalFaultInjector,
+    ) -> Result<RemovalSummary, RemovalError> {
+        self.remove_by_id_at(resource_id, scope.scope(), scope.root(), faults)
+    }
+
+    fn remove_by_id_at(
+        &self,
+        resource_id: &str,
+        scope: super::plan::InstallScope,
+        scope_root: &std::path::Path,
+        faults: &dyn RemovalFaultInjector,
+    ) -> Result<RemovalSummary, RemovalError> {
         let directory = self
             .open_existing_directory()
             .map_err(|error| RemovalError::Store(error.to_string()))?
@@ -284,7 +336,7 @@ impl ReceiptStore {
             .map_err(|error| RemovalError::Store(error.to_string()))?;
         let receipts = read_receipts(&directory, true)
             .map_err(|error| RemovalError::Store(error.to_string()))?;
-        let plan = build_removal_plan(&directory, &receipts, resource_id, &project_root)?;
+        let plan = build_removal_plan(&directory, &receipts, resource_id, scope, scope_root)?;
         let summary = super::removal::remove_plan(&plan, &removal_store, directory, &lock, faults)?;
         lock.release()
             .map_err(|error| RemovalError::Store(error.to_string()))?;
@@ -299,7 +351,7 @@ impl ReceiptStore {
         faults: &dyn ReceiptFaultInjector,
     ) -> Result<ReceiptReservation, ReceiptStoreError> {
         receipt
-            .validate()
+            .validate_install_intent()
             .map_err(|source| validation_error("pending receipt", source))?;
         if !self.directory.is_absolute() {
             return Err(ReceiptStoreError::RelativeDirectoryOverride);
@@ -611,40 +663,38 @@ impl ReceiptStore {
 /// Resolve configured data-root aliases without creating anything. A link at the data root itself
 /// is rejected, while a platform alias in an existing ancestor (for example macOS `/var`) is
 /// canonicalized before the no-follow receipt child is opened.
-fn resolve_data_directory(path: &std::path::Path) -> Result<PathBuf, ReceiptStoreError> {
-    let mut current = path;
-    let mut missing = Vec::<OsString>::new();
-    loop {
-        match fs::symlink_metadata(current) {
-            Ok(metadata) => {
-                if missing.is_empty() && metadata.file_type().is_symlink() {
-                    return Err(ReceiptStoreError::UnsafeDirectory);
-                }
-                let mut resolved = current
-                    .canonicalize()
-                    .map_err(|error| map_io("resolve application-data directory", error))?;
-                for component in missing.iter().rev() {
-                    resolved.push(component);
-                }
-                return Ok(resolved);
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let name = current
-                    .file_name()
-                    .ok_or(ReceiptStoreError::UnsafeDirectory)?;
-                missing.push(name.to_os_string());
-                current = current.parent().ok_or(ReceiptStoreError::UnsafeDirectory)?;
-            }
-            Err(error) => return Err(map_io("inspect application-data directory", error)),
+fn map_os_path_error(error: crate::os_paths::OsPathError) -> ReceiptStoreError {
+    match error {
+        crate::os_paths::OsPathError::DirectoryUnavailable => {
+            ReceiptStoreError::DirectoryUnavailable
+        }
+        crate::os_paths::OsPathError::RelativeDataOverride => {
+            ReceiptStoreError::RelativeDirectoryOverride
+        }
+        crate::os_paths::OsPathError::UnsafeDataDirectory => ReceiptStoreError::UnsafeDirectory,
+        crate::os_paths::OsPathError::RelativeCacheOverride => {
+            ReceiptStoreError::PathResolution("THRN_CACHE_DIR must be absolute".to_owned())
+        }
+        crate::os_paths::OsPathError::Io { action, kind } => {
+            ReceiptStoreError::PathResolution(format!("could not {action} ({kind})"))
         }
     }
+}
+
+#[cfg(test)]
+fn resolve_data_directory(path: &std::path::Path) -> Result<PathBuf, ReceiptStoreError> {
+    if !path.is_absolute() {
+        return Err(ReceiptStoreError::RelativeDirectoryOverride);
+    }
+    crate::os_paths::resolve_data_directory(path).map_err(map_os_path_error)
 }
 
 fn build_removal_plan(
     directory: &SecureDir,
     receipts: &[(String, InstallationReceipt)],
     resource_id: &str,
-    project_root: &std::path::Path,
+    scope: super::plan::InstallScope,
+    scope_root: &std::path::Path,
 ) -> Result<RemovalPlan, RemovalError> {
     use std::str::FromStr;
 
@@ -656,14 +706,15 @@ fn build_removal_plan(
             "resource ID must be the exact canonical catalog ID recorded in the receipt".to_owned(),
         ));
     }
-    let project_text = project_root.to_str().ok_or_else(|| {
-        RemovalError::Conflict("canonical project path is not valid UTF-8".to_owned())
+    let scope_text = scope_root.to_str().ok_or_else(|| {
+        RemovalError::Conflict("canonical scope path is not valid UTF-8".to_owned())
     })?;
     let matches = receipts
         .iter()
         .filter(|(_, receipt)| {
             receipt.catalog_resource_id() == requested.as_str()
-                && receipt.root_path() == project_root
+                && receipt.scope() == scope.as_str()
+                && receipt.root_path() == scope_root
         })
         .collect::<Vec<_>>();
     let [(name, receipt)] = matches.as_slice() else {
@@ -671,15 +722,15 @@ fn build_removal_plan(
             return Err(RemovalError::MissingReceipt);
         }
         return Err(RemovalError::Conflict(
-            "multiple ownership receipts claim this canonical resource and project".to_owned(),
+            "multiple ownership receipts claim this canonical resource and scope".to_owned(),
         ));
     };
     if receipt.agent() != "codex"
-        || receipt.scope() != "project"
-        || receipt.root_path().to_str() != Some(project_text)
+        || receipt.scope() != scope.as_str()
+        || receipt.root_path().to_str() != Some(scope_text)
     {
         return Err(RemovalError::Conflict(
-            "receipt agent, scope, or canonical project path differs from the selected target"
+            "receipt agent, scope, or canonical scope path differs from the selected target"
                 .to_owned(),
         ));
     }
@@ -1486,7 +1537,7 @@ fn recovery_parent_directories(
     let project = SecureDir::open_absolute(&receipt.root_path()).map_err(|error| {
         recovery_conflict(record, format!("project root is unavailable: {error}"))
     })?;
-    if project.identity().ok() != Some(receipt.project_identity()) {
+    if project.identity().ok() != Some(receipt.scope_root_identity()) {
         return Err(recovery_conflict(
             record,
             "project filesystem identity changed",
@@ -2749,6 +2800,8 @@ pub enum ReceiptStoreError {
     DirectoryUnavailable,
     #[error("THRN_DATA_DIR must be an absolute path")]
     RelativeDirectoryOverride,
+    #[error("could not resolve a THRN operating-system path: {0}")]
+    PathResolution(String),
     #[error("could not {action} receipt storage ({kind}, os_error={os_error:?})")]
     Io {
         action: &'static str,
@@ -2761,7 +2814,7 @@ pub enum ReceiptStoreError {
     UnsafeObject { name: String },
     #[error("receipt storage contains more than {maximum} entries")]
     TooManyReceipts { maximum: usize },
-    #[error("receipt filename is not a schema-v1 deterministic identity key")]
+    #[error("receipt filename is not a supported deterministic identity key")]
     InvalidFilename,
     #[error("receipt filename does not match the identity recorded in its contents")]
     FilenameMismatch,
@@ -3145,12 +3198,11 @@ fn validate_unique_destinations(
 }
 
 fn valid_receipt_filename(name: &str) -> bool {
-    let Some(hex) = name
+    let hex = name
         .strip_prefix("v1-")
-        .and_then(|name| name.strip_suffix(".json"))
-    else {
-        return false;
-    };
+        .or_else(|| name.strip_prefix("v2-"))
+        .and_then(|name| name.strip_suffix(".json"));
+    let Some(hex) = hex else { return false };
     hex.len() == 64
         && hex
             .bytes()
@@ -3181,7 +3233,7 @@ fn verify_receipt_tree(
     if project
         .identity()
         .map_err(|error| content_error("identify project root", error))?
-        != receipt.project_identity()
+        != receipt.scope_root_identity()
     {
         return Ok(ReceiptContentState::Modified);
     }
@@ -3406,14 +3458,16 @@ mod tests {
 
     use crate::{
         install::{
-            command::prepare_install_session,
+            command::{prepare_install_session, prepare_install_session_in_scope},
             commit::{InstallFaultInjector, InstallOperation, InstallationSession},
             destination::ComponentState,
             journal::{
                 JournalError, JournalFaultInjector, JournalIntent, JournalOperation, JournalStore,
                 MAX_JOURNAL_BYTES, OperationState,
             },
+            plan::InstallScope,
             receipt::InstallationReceipt,
+            scope::ResolvedScope,
         },
         registry::catalog::parse_catalog_json,
         sources::{
@@ -5038,6 +5092,76 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn subprocess_user_install_crash_after_commit_recovers_schema_v3_receipt() {
+        if std::env::var_os("THRN_USER_INSTALL_CRASH_CHILD").is_some() {
+            let home = PathBuf::from(std::env::var_os("THRN_USER_INSTALL_HOME").expect("home"));
+            let staging =
+                PathBuf::from(std::env::var_os("THRN_USER_INSTALL_STAGING").expect("staging"));
+            let data = PathBuf::from(std::env::var_os("THRN_USER_INSTALL_DATA").expect("data"));
+            let catalog = parse_catalog_json(include_bytes!(
+                "../../tests/fixtures/catalog/test-only-valid-v1.json"
+            ))
+            .expect("catalog");
+            let scope = ResolvedScope::for_test(InstallScope::User, home);
+            let install = prepare_install_session_in_scope(
+                &catalog,
+                "uncharted",
+                "codex",
+                &scope,
+                &FakeTransport(archive()),
+                &TestFactory(staging.clone()),
+            )
+            .expect("user installation session");
+            let store = ReceiptStore::new(data.join("receipts"));
+            let _ = install.commit_and_record_at_with_journal(
+                &store,
+                1,
+                &NoInstallFaults,
+                &NoReceiptFaults,
+                &ExitAfterJournalState {
+                    directory: data.join("operations"),
+                    state: "directoryCommitVerified".to_owned(),
+                },
+            );
+            panic!("child should exit after user directory commit");
+        }
+
+        let (_parent, project, staging, data) = setup();
+        let home = project.parent().expect("fixture root").join("home");
+        fs::create_dir(&home).expect("isolated user home");
+        let status = Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("install::receipt_store::tests::subprocess_user_install_crash_after_commit_recovers_schema_v3_receipt")
+            .arg("--nocapture")
+            .env("THRN_USER_INSTALL_CRASH_CHILD", "1")
+            .env("THRN_USER_INSTALL_HOME", &home)
+            .env("THRN_USER_INSTALL_STAGING", &staging)
+            .env("THRN_USER_INSTALL_DATA", &data)
+            .status()
+            .expect("launch user install crash simulation");
+        assert_eq!(status.code(), Some(90));
+        let store = ReceiptStore::new(data.join("receipts"));
+        assert_eq!(
+            store
+                .recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults)
+                .expect("recover committed user install"),
+            vec![super::RecoveryOutcome::FinalizedReceipt]
+        );
+        let receipts = store.list().expect("user receipt after recovery");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].scope(), "user");
+        assert_eq!(receipts[0].schema_version(), 3);
+        assert_eq!(receipts[0].root_path(), home);
+        assert_eq!(
+            store
+                .verify_current_content(&receipts[0])
+                .expect("verified user tree"),
+            ReceiptContentState::Verified
+        );
+        assert!(!project.join(".agents").exists());
     }
 
     #[test]

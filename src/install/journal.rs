@@ -22,7 +22,8 @@ use super::{
 pub(crate) const MAX_JOURNAL_BYTES: usize = 10 * 1024 * 1024;
 pub(crate) const MAX_JOURNAL_FILES: usize = 16_384;
 pub(crate) const MAX_JOURNAL_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
-const JOURNAL_SCHEMA_VERSION: u64 = 1;
+const PROJECT_JOURNAL_SCHEMA_VERSION: u64 = 1;
+const USER_JOURNAL_SCHEMA_VERSION: u64 = 2;
 const TEMP_NAME_ATTEMPTS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -150,7 +151,12 @@ impl JournalRecord {
     }
 
     pub(crate) fn validate(&self) -> Result<(), JournalError> {
-        if self.schema_version != JOURNAL_SCHEMA_VERSION {
+        let expected_schema = if self.receipt.scope() == "user" {
+            USER_JOURNAL_SCHEMA_VERSION
+        } else {
+            PROJECT_JOURNAL_SCHEMA_VERSION
+        };
+        if self.schema_version != expected_schema {
             return Err(JournalError::UnsupportedSchema(self.schema_version));
         }
         if !is_lower_hex(&self.operation_id, 32)
@@ -165,23 +171,26 @@ impl JournalRecord {
             return Err(JournalError::InvalidRecord);
         }
         self.receipt
-            .validate()
+            .validate_install_intent()
             .map_err(|_| JournalError::InvalidRecord)?;
         if let Some(receipt_identity) = self.receipt.installed_directory_identity()
             && self.destination_identity.map(Into::into) != Some(receipt_identity)
         {
             return Err(JournalError::InvalidRecord);
         }
-        if !self.receipt.is_legacy() && self.destination_identity.is_none() {
+        if !self.receipt.is_legacy()
+            && !self.receipt.is_user_intent()
+            && self.destination_identity.is_none()
+        {
             return Err(JournalError::InvalidRecord);
         }
-        if self
-            .receipt
-            .to_json()
-            .map_err(|_| JournalError::InvalidRecord)?
-            .len()
-            > MAX_RECEIPT_BYTES
-        {
+        let receipt_bytes = if self.receipt.is_user_intent() {
+            self.receipt.to_journal_intent_json()
+        } else {
+            self.receipt.to_json()
+        }
+        .map_err(|_| JournalError::InvalidRecord)?;
+        if receipt_bytes.len() > MAX_RECEIPT_BYTES {
             return Err(JournalError::InvalidRecord);
         }
         let expected_files = self
@@ -307,8 +316,13 @@ impl JournalStore {
         faults
             .after(JournalOperation::CreateStore)
             .map_err(|error| map_io("create journal storage", error))?;
+        let schema_version = if intent.receipt.scope() == "user" {
+            USER_JOURNAL_SCHEMA_VERSION
+        } else {
+            PROJECT_JOURNAL_SCHEMA_VERSION
+        };
         let record = JournalRecord {
-            schema_version: JOURNAL_SCHEMA_VERSION,
+            schema_version,
             operation_id: random_id().map_err(|error| map_io("name operation", error))?,
             sequence: 0,
             state: OperationState::Prepared,
@@ -725,7 +739,7 @@ impl OperationJournal {
         {
             return Err(JournalError::InvalidRecord);
         }
-        if self.record.receipt.is_legacy() {
+        if self.record.receipt.is_legacy() || self.record.receipt.is_user_intent() {
             self.record.receipt = self
                 .record
                 .receipt

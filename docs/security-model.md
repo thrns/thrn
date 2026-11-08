@@ -2,29 +2,60 @@
 
 ## Current exposure
 
-THRN is under development and has no supported package-manager release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, reads validated local catalog data, offers an explicit HTTPS catalog refresh, performs read-only local `SKILL.md` validation, lists validated receipt-backed installations, checks Codex project skill updates offline, plans/installs Codex project skills, and updates/removes exactly verified receipt-backed Codex project skills. Default discovery, both `skills list` modes, `skills check`, and `skills remove` never use the network. Explicit refresh contacts one fixed THRN-operated HTTPS endpoint, validates the response, and writes only the catalog cache. Install and update commands read the local catalog without refreshing it, then fetch the selected skill at its pinned public GitHub commit and validate it privately. Install/update dry-runs print plans without changing the project or receipt store. A real install uses the M2-04/M2-05/M2-06 commit, receipt, and recovery boundary. Update uses a distinct M3-02 journal and receipt transition. Both print success only after journal finalization. Removal validates a receipt and full current tree, then uses M3-01's separate removal journal, same-filesystem quarantine, and per-object cleanup intents. No retrieved or installed content, script, or subprocess is executed. Installed listing reads only THRN's application-data receipt directory: it does not inspect agent skill folders, create receipt storage, fetch the catalog, open receipt-referenced project paths, or mutate recovery state. It labels current content integrity as unchecked and fails closed while lifecycle recovery is pending. See [the recovery protocol](recovery.md) for transaction and durability limits.
+THRN is under development and has no supported package-manager release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, reads validated local catalog data, offers an explicit HTTPS catalog refresh, performs read-only local `SKILL.md` validation, lists validated receipt-backed installations, checks selected Codex project or user-scope skills offline, and plans/installs or updates/removes exactly verified receipt-backed Codex skills in either explicitly selected scope. Project scope remains the default. User scope is selected only with `--scope user`. Default discovery, both `skills list` modes, `skills check`, and `skills remove` never use the network. Explicit refresh contacts one fixed THRN-operated HTTPS endpoint, validates the response, and writes only the catalog cache. Install and update commands read the local catalog without refreshing it, then fetch the selected skill at its pinned public GitHub commit and validate it privately. Install/update dry-runs print plans without changing skill or receipt data. Both scopes use the same commit, receipt, journal, lock, and recovery boundaries. No retrieved or installed content, script, or subprocess is executed. Installed listing reads only THRN's application-data receipt directory: it does not inspect agent skill folders, create receipt storage, fetch the catalog, open receipt-referenced destinations, or mutate recovery state. It labels current content integrity as unchecked and fails closed while lifecycle recovery is pending. See [the recovery protocol](recovery.md) for transaction and durability limits.
+
+## Scope and operating-system paths
+
+`InstallScope` is a typed selection shared by install planning, install commit, read-only check,
+receipt lookup, update, removal, and recovery. Project remains the default and resolves the selected
+existing project (current directory unless `--project` is supplied) to
+`<project>/.agents/skills/<validated-skillName>`. Explicit user scope resolves only the validated
+OS home to `<home>/.agents/skills/<validated-skillName>`; it does not use the working directory.
+`--scope user --project <path>` is rejected. The catalog resource ID remains separate from the
+validated skill directory name. No scope is inferred from an existing skill.
+
+`OsPaths` centralizes user home, application config, application data, and catalog cache resolution.
+Unix-like systems use `HOME` and Windows uses `USERPROFILE`, with the platform home-directory API
+as fallback. Platform-standard configuration, data, and cache locations remain in use; absolute
+`THRN_DATA_DIR` and `THRN_CACHE_DIR` overrides keep their existing purpose and do not change the
+skill destination. A missing, nonabsolute, ambiguous, or unresolvable home fails closed. Home path
+components are opened without following Unix symlinks or Windows reparse points. THRN has no
+arbitrary destination override and does not fall back to another folder if the expected user skill
+root is unavailable.
+
+User ownership is separate from project ownership: schema-v3 receipts bind user scope, the actual
+canonical home and its filesystem identity, committed destination identity, source provenance, and
+the complete hash inventory. Project schema-v1/v2 receipts remain unchanged. Both scopes use the
+same receipt store, OS-backed writer lock, install/remove/update journals, no-replace operations,
+object-specific cleanup intents, and recovery algorithms. Existing unmanaged skills are never
+adopted. `$CODEX_HOME/skills` and other legacy Codex locations are not THRN destinations and are
+not automatically migrated. Only the Codex adapter is supported; other agents remain future work.
+
+Path tests inject isolated `HOME`, `USERPROFILE`, platform data/cache variables, and THRN data roots.
+The CLI tests do not read or write the developer's real user skill directory.
 
 ## Read-only update checking
 
-`thrn skills check` compares the selected project's THRN receipts and installed Codex skill trees
-with the catalog selected by `CatalogService::discover()`. It uses a validated local cache when
+`thrn skills check` compares receipts and installed Codex skill trees from the explicitly selected
+scope with the catalog selected by `CatalogService::discover()`. Project scope is the default;
+`--scope user` selects receipts rooted at the validated OS home. It uses a validated local cache when
 available and otherwise bundled metadata; stale cache data remains usable but is labeled stale.
 Bundled metadata and stale cache values are not claims about the latest GitHub state. The check
 never refreshes the catalog, sends network requests, stages GitHub content, executes skill files,
 starts lifecycle transactions, or attempts recovery. It creates no application-data directory or
-lock file and leaves project, receipt, and journal contents unchanged. It may temporarily acquire
+lock file and leaves skill, receipt, and journal contents unchanged. It may temporarily acquire
 the existing OS-backed receipt-store lock. An active writer, pending install/remove/update journal,
 corrupt or unsafe receipt storage, or invalid catalog data prevents a trustworthy result and
-returns an error. A modified or structurally unsafe project installation is reported as an
+returns an error. A modified or structurally unsafe selected-scope installation is reported as an
 ineligible finding when its receipt metadata can be safely read.
 
 Check reads receipt metadata for storage validation but opens and verifies installed trees only
-for the selected canonical project. Results are ordered by canonical resource ID and skill name.
+for the selected scope root. Results are ordered by canonical resource ID and skill name.
 For each installation it reports the installed receipt SHA and local catalog SHA when available:
 
-- **Up to date** means schema-v2 receipt identity and full tree verification succeed, catalog
+- **Up to date** means scope-appropriate receipt identity and full tree verification succeed, catalog
   identity fields match, and both pins are equal.
-- **Update available** means the v2 identity and full tree verify, resource ID, owner, repository,
+- **Update available** means the scope-appropriate identity and full tree verify, resource ID, owner, repository,
   source directory, and skill name match, and the local catalog pins a different full commit SHA.
   A different SHA only means a different catalog-pinned revision; it does not establish Git
   ancestry or commit chronology.
@@ -51,18 +82,18 @@ The enabled installation path follows these source and filesystem boundaries:
 - Catalog refresh is limited to `https://raw.githubusercontent.com/thrns/thrn/main/src/registry/builtin-v1.json`; require HTTPS certificate verification, reject redirects, use explicit timeouts, and enforce the 1 MiB limit while streaming. Validate UTF-8 and the full catalog schema before caching. This endpoint is curated by THRN, but HTTPS and catalog inclusion do not authenticate or establish the safety of individual skill publishers. Skill fetching uses public GitHub sources at exact, full commit hashes and independently validates source origin and immutable revision. A checksum from the same registry can detect accidental changes but does not prove publisher identity if that registry is compromised.
 - Bound network time, response size, archive size, expanded bytes, file count, per-file size, and path depth. Reject malformed metadata, absolute or traversal paths, drive/UNC prefixes, unsupported file types, case-fold collisions, and symlinks or hardlinks that escape the staging or target root.
 - Validate Agent Skills frontmatter and the skill directory/name relationship before installation, while preserving legitimate supporting files.
-- Treat an existing unreceipted target as externally managed. Never overwrite or recursively remove unrelated or user-modified paths. The current installer requires explicit `--agent codex`, supports project scope only, and requires an existing project root; destination conflicts fail without overwrite.
+- Treat an existing unreceipted target as externally managed. Never overwrite or recursively remove unrelated or user-modified paths. The installer requires explicit `--agent codex`; project is the default scope, and user scope requires explicit `--scope user`. Destination conflicts fail without overwrite.
 - Stage complete content near each destination and use atomic rename where the filesystem supports it. Multiple destinations are a recoverable sequence, not one cross-target atomic transaction. Write durable ownership receipts only after successful commits; preserve recovery state and report incomplete rollback.
 - Avoid logging credentials, tokens, environment secrets, private skill content, or unnecessary personal paths. The v1 public-source workflow should not require a GitHub token. Any future credential support needs an explicit design and redaction tests.
 - Make supply-chain claims proportionate to evidence. Pinned commits identify source revisions, not author identity. Stronger publisher authenticity requires a separately reviewed signing or attestation design; do not imply that TLS or a same-origin digest provides it.
 
 The removal path adds its own checks and has narrower authorization than a catalog install:
 
-- Require explicit `--agent codex`, project scope, and an exact canonical resource ID from one
+- Require explicit `--agent codex`, an explicitly resolved scope, and an exact canonical resource ID from one
   validated ownership receipt. Removal does not load catalog data, accept aliases, infer identity
   from `skillName`, or operate on unreceipted content.
-- Match the selected canonical project root and its recorded filesystem identity, receipt agent and
-  scope, and the exact `<project>/.agents/skills/<skillName>` destination. Open every path component
+- Match the selected scope root and its recorded filesystem identity, receipt agent and
+  scope, and exact `<project>/.agents/skills/<skillName>` or `<home>/.agents/skills/<skillName>` destination. Open every path component
   without following links/reparse points. Reject case-insensitive collisions, unexpected object
   types, duplicate filesystem identities, hard-linked files, missing/extra entries, changed bytes,
   and file hashes or lengths that differ from the receipt.
@@ -75,11 +106,11 @@ The removal path adds its own checks and has narrower authorization than a catal
   after its expected identity matches and it is empty. Keep the receipt until content removal has
   been established; a failure or uncertain state is nonzero and cannot print success.
 - Do not execute installed skill files, scripts, hooks, or instructions during verification,
-  removal, or recovery. Leave project `.agents` and `.agents/skills` parent directories in place.
+  removal, or recovery. Leave `.agents` and `.agents/skills` parent directories in place.
 
 The update path has its own constraints:
 
-- Require an exact canonical resource ID and schema-v2 receipt, with matching project, agent,
+- Require an exact canonical resource ID and matching project schema-v2 or user schema-v3 receipt, with matching scope root, agent,
   scope, source owner/repository/directory, skill name, and installation-time destination identity.
   Do not refresh the catalog or accept caller-supplied URLs.
 - Verify every current object identity, file length, and SHA-256 against the receipt before fetching
@@ -103,7 +134,7 @@ transaction from substitutions. Proposed ADR-013 leaves the sufficiency of that 
 for independent architectural review. On Windows, the current secure handle layer cannot portably
 flush directory-entry metadata; a power loss can therefore leave rename/unlink durability uncertain.
 
-M2-03 implements read-only destination checks and an immutable proposal. M2-04 adds the Codex project directory commit; M2-05 adds post-commit ownership receipts and receipt-backed listing; M2-06 adds journaled recovery; M2-07 connects the explicit Codex project install command to `prepare_install_session()` and `commit_and_record()`. M3-01 adds explicit Codex project removal only when a schema-v2 receipt proves the installation-time destination identity and the complete current inventory verifies. M3-02 adds update only when the same ownership proof and complete current inventory verify against an exact canonical catalog ID and unchanged GitHub source identity. These commands do not resolve aliases, refresh the catalog, modify unreceipted content, or support user scope or other agents. New installs persist the committed destination identity in the install journal and schema-v2 receipt before success. Historical schema-v1 receipts remain listable but cannot authorize automatic removal or update. Removal and update use separate versioned journals and report incomplete transactions without a success block. Lifecycle implementation is pending independent architectural review and is not a claim of a supported package release.
+M2-03 implements read-only destination checks and an immutable proposal. M2-04 adds the initial Codex project directory commit; M2-05 adds post-commit ownership receipts and receipt-backed listing; M2-06 adds journaled recovery; M2-07 connects project install to `prepare_install_session()` and `commit_and_record()`. M3-01 adds receipt-backed removal, M3-02 adds verified update, and M3-03 adds offline read-only check. M3-04 extends the same validated lifecycle to explicitly selected user scope and centralizes OS path resolution. The default remains project scope; aliases and unreceipted directories are not resolved or adopted, and no command refreshes the catalog implicitly. Project schema-v1/v2 receipts and their identity formats remain unchanged; explicit user installs write schema-v3 receipts. Removal and update use separate versioned journals and report incomplete transactions without a success block. The M3 lifecycle and proposed ADR-015 remain pending independent architectural review; this documentation is not a claim of an accepted design or supported package release.
 
 ## Milestone status
 
@@ -232,10 +263,10 @@ Current implementation boundaries through M2-07:
   or commits do not replace the last valid cache. Offline discovery uses cache or bundled metadata
   and never silently refreshes stale content.
 - **Listing boundary:** M1-05's catalog list reuses the validated local catalog selection and exact
-  resolver. M2-05's installed list parses strict schema-v1 and schema-v2 receipts from the OS application-data
+  resolver. M2-05's installed list parses strict project schema-v1/v2 and user schema-v3 receipts from the OS application-data
   `receipts` directory. It treats missing or empty storage as no recorded installations and rejects
   corrupt, unsupported, duplicated, conflicting, linked, nonregular, or unknown content. Listing
-  creates no directories, writes no files, opens no referenced project paths, and reports current
+  creates no directories, writes no files, opens no referenced destination paths, and reports current
   file integrity as unchecked. It does not infer ownership from catalog data or agent folders.
 - **Archive boundary:** M2-01 applies the ZIP-only validation described above. The validator
   preserves GitHub archive root prefixes and has no network, extraction, install, or
@@ -252,16 +283,18 @@ Current implementation boundaries through M2-07:
   the archive's count, depth and byte budgets, rechecks each file's size and CRC-32, and rejects
   changed, missing, extra, linked or unsupported objects. CRC-32 here detects accidental or
   post-stage changes; it is not cryptographic authentication.
-- **Codex destination boundary:** M2-03 supports only explicit `--agent codex` and project scope.
-  The default root is the current directory; `--project` selects another existing directory. THRN
-  resolves and prints the canonical project root. It inspects `.agents`, `.agents/skills`, and the
+- **Codex destination boundary:** M2-03 introduced explicit `--agent codex` at project scope.
+  M3-04 keeps project as default and adds explicit user scope via one typed scope resolver. The
+  project root is the current directory unless `--project` selects another existing directory; the
+  user root is the validated OS home and never comes from the working directory. THRN inspects
+  `.agents`, `.agents/skills`, and the
   selected skill entry without creating them or following destination symlinks. Inspected project,
   `.agents`, and `.agents/skills` directory listings are bounded to 16,384 entries each. Non-directory
   components, symlinks, exact target paths, and case-insensitive collisions for the `.agents`,
   `skills`, and skill-name components become conflicts. Existing content is always treated as
   externally managed. The selected destination
-  uses validated `skillName`, not the catalog ID or alias, at
-  `<project-root>/.agents/skills/<skillName>` as documented in the
+  uses validated `skillName`, not the catalog ID or alias, at either
+  `<project-root>/.agents/skills/<skillName>` or `<home>/.agents/skills/<skillName>` as documented in the
   [Codex build-skills guide](https://learn.chatgpt.com/docs/build-skills).
 - **Immutable-plan boundary:** `src/install/plan.rs` is a pure builder over a validated staged
   inventory and a read-only destination snapshot. The plan retains canonical resource identity,
@@ -282,9 +315,10 @@ At M2-04, the CLI remained dry-run-only. `src/install/command.rs` has a session 
 validated `StagedSkill`, its staged inventory and digests, and the corresponding immutable plan for
 the full commit operation. The session rejects mismatched catalog resource, skill name, source
 owner/repository/path/revision, target agent/scope, inventory, file list, or destination identity.
-The Codex adapter supports project scope only and addresses
-`<project-root>/.agents/skills/<skillName>` using the validated catalog `skillName`; IDs and aliases
-are never path components. It does not auto-detect targets or write global or other-agent paths.
+The original M2-04 Codex adapter supported project scope only. M3-04 extends the same destination
+boundary to explicitly selected user scope. Both use the validated catalog `skillName`; IDs and
+aliases are never path components. The adapter does not auto-detect targets or write other-agent
+paths.
 
 Before mutation, the engine rechecks the staged inventory and the project and destination snapshot,
 including directory identities where the OS exposes them. It opens project directories without
@@ -351,8 +385,10 @@ Remaining requirements:
   proposal. It uses a separate update journal, operation-owned old-directory and old-receipt
   backups, a no-replace receipt transition, and verified forward recovery. It preserves schema-v2
   destination identity and fails closed on schema-v1, modified, or ambiguous content.
-- **M3-03:** read-only `skills check` is implemented on the local cache/bundled metadata and
+- **M3-03:** read-only `skills check` is implemented on local cache/bundled metadata and
   receipt/inventory verification paths; independent architectural review remains required.
-- **Remaining M3:** user scope, other agents, JSON and noninteractive behavior.
+- **M3-04:** explicit Codex user scope and centralized OS paths are implemented on the feature branch;
+  proposed ADR-015 and lifecycle changes await independent architectural review and required CI.
+- **Remaining M3:** other agents, JSON and noninteractive behavior.
 
 Security-sensitive parsing and writes require negative tests with hostile fixtures, isolated temporary directories, and deterministic network mocks. See the [roadmap](ROADMAP.md) and [repository security policy](../SECURITY.md) for project status.

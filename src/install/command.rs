@@ -15,15 +15,17 @@ use super::{
     commit::InstallationSession,
     destination::{DestinationConflict, DestinationError, inspect_destination},
     inventory::{InventoryError, inspect_staged_skill},
-    plan::{InstallPlan, PlanError, build_install_plan},
+    plan::{InstallPlan, PlanError, build_install_plan_for_scope},
+    scope::ResolvedScope,
 };
+
+#[cfg(test)]
+use super::plan::build_install_plan;
 
 #[derive(Debug, Error)]
 pub(crate) enum InstallCommandError {
     #[error("M2-03 supports only --agent codex")]
     UnsupportedAgent,
-    #[error("could not determine the current project directory ({kind})")]
-    CurrentDirectory { kind: io::ErrorKind },
     #[error(transparent)]
     Resolution(#[from] ResolutionError),
     #[error(transparent)]
@@ -60,6 +62,7 @@ pub(crate) enum InstallCommandError {
 
 /// Build a plan through the existing validated catalog and source pipeline. Transport and
 /// temporary-directory creation are injected so all orchestration tests remain offline.
+#[cfg(test)]
 pub(crate) fn prepare_install_plan<T: GithubTransport + ?Sized>(
     catalog: &Catalog,
     identifier: &str,
@@ -84,6 +87,7 @@ pub(crate) fn prepare_install_plan<T: GithubTransport + ?Sized>(
 /// Prepare a commit-capable internal session that keeps the validated source alive alongside
 /// its immutable plan and inventory. Real installation keeps this session through receipt-backed
 /// completion; dry-run callers convert it into a read-only plan.
+#[cfg(test)]
 pub(crate) fn prepare_install_session<T: GithubTransport + ?Sized>(
     catalog: &Catalog,
     identifier: &str,
@@ -106,6 +110,31 @@ pub(crate) fn prepare_install_session<T: GithubTransport + ?Sized>(
     Ok(InstallationSession::new(staged, inventory, plan))
 }
 
+/// Prepare a retained install session against a scope already resolved by the shared resolver.
+pub(crate) fn prepare_install_session_in_scope<T: GithubTransport + ?Sized>(
+    catalog: &Catalog,
+    identifier: &str,
+    agent: &str,
+    scope: &ResolvedScope,
+    transport: &T,
+    tempdir_factory: &dyn TempDirFactory,
+) -> Result<InstallationSession, InstallCommandError> {
+    if agent != "codex" {
+        return Err(InstallCommandError::UnsupportedAgent);
+    }
+
+    let resource = CatalogResolver::new(catalog).resolve(identifier)?;
+    let staged = fetch_and_stage_skill_with_factory(resource, transport, tempdir_factory)?;
+    let inventory = inspect_staged_skill(&staged)?;
+    let destination = inspect_destination(
+        Some(scope.root()),
+        scope.root(),
+        staged.skill_name().as_str(),
+    )?;
+    let plan = build_install_plan_for_scope(&staged, &inventory, destination, scope.scope())?;
+    Ok(InstallationSession::new(staged, inventory, plan))
+}
+
 /// Render a complete successful plan into memory before the CLI writes one byte to stdout.
 pub(crate) fn format_dry_run(plan: &InstallPlan) -> Result<String, InstallCommandError> {
     if !plan.conflicts().is_empty() {
@@ -115,7 +144,11 @@ pub(crate) fn format_dry_run(plan: &InstallPlan) -> Result<String, InstallComman
     }
 
     let mut output = String::new();
-    output.push_str("DRY RUN — no project files were modified\n");
+    output.push_str(if plan.scope() == super::plan::InstallScope::Project {
+        "DRY RUN — no project files were modified\n"
+    } else {
+        "DRY RUN — no user-scope files were modified\n"
+    });
     output.push_str(&format!("Resource: {}\n", plan.resource_id().as_str()));
     output.push_str(&format!("Skill name: {}\n", plan.skill_name().as_str()));
     output.push_str(&format!(
@@ -133,9 +166,14 @@ pub(crate) fn format_dry_run(plan: &InstallPlan) -> Result<String, InstallComman
     ));
     output.push_str(&format!("Agent: {}\n", plan.agent().as_str()));
     output.push_str(&format!("Scope: {}\n", plan.scope().as_str()));
+    let root_label = if plan.scope() == super::plan::InstallScope::Project {
+        "Project root"
+    } else {
+        "User root"
+    };
     output.push_str(&format!(
-        "Project root: {}\n",
-        safe_path_display(plan.project_root())
+        "{root_label}: {}\n",
+        safe_path_display(plan.scope_root())
     ));
     output.push_str(&format!(
         "Destination: {}\n",
@@ -172,7 +210,11 @@ pub(crate) fn format_dry_run(plan: &InstallPlan) -> Result<String, InstallComman
         plan.files().len(),
         plan.total_file_bytes()
     ));
-    output.push_str("No project files were modified.\n");
+    output.push_str(if plan.scope() == super::plan::InstallScope::Project {
+        "No project files were modified.\n"
+    } else {
+        "No user-scope files were modified.\n"
+    });
     Ok(output)
 }
 

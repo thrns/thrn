@@ -20,9 +20,10 @@ use crate::{
         commit::{NodeKind, SecureDir},
         destination::FileIdentity,
         inventory::{InventoryError, StagedInventory, inspect_staged_skill},
-        plan::{InstallPlan, PlanError, build_update_install_plan},
+        plan::{InstallPlan, PlanError, build_update_install_plan_for_scope},
         receipt::InstallationReceipt,
         removal::{RemovalError, RemovalIdentity, RemovalObject, RemovalObjectKind, RemovalPlan},
+        scope::ResolvedScope,
     },
     models::catalog::{Catalog, Resource, SkillId},
     sources::{
@@ -36,7 +37,8 @@ use super::{
     receipt_store::{ReceiptFaultInjector, ReceiptStore, WriterLock},
 };
 
-const UPDATE_JOURNAL_SCHEMA_VERSION: u64 = 1;
+const PROJECT_UPDATE_JOURNAL_SCHEMA_VERSION: u64 = 1;
+const USER_UPDATE_JOURNAL_SCHEMA_VERSION: u64 = 2;
 const MAX_UPDATE_JOURNAL_BYTES: usize = 12 * 1024 * 1024;
 const MAX_UPDATE_JOURNAL_FILES: usize = 16_384;
 const MAX_UPDATE_JOURNAL_TOTAL_BYTES: u64 = 384 * 1024 * 1024;
@@ -229,8 +231,6 @@ pub(crate) enum UpdatePreparation {
 pub(crate) enum UpdateError {
     #[error("only explicit --agent codex is supported for updates")]
     UnsupportedAgent,
-    #[error("current directory could not be read ({0})")]
-    CurrentDirectory(io::ErrorKind),
     #[error("update requires an exact canonical catalog resource ID")]
     NonCanonicalId,
     #[error("no validated local catalog resource has canonical ID {0:?}")]
@@ -266,6 +266,7 @@ pub(crate) enum UpdateError {
 
 /// Resolve only an exact canonical ID, verify the installed schema-v2 ownership claim, and stage
 /// the local catalog's exact pinned GitHub revision. No catalog refresh is performed.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_update<T: GithubTransport + ?Sized>(
     catalog: &Catalog,
@@ -273,6 +274,30 @@ pub(crate) fn prepare_update<T: GithubTransport + ?Sized>(
     agent: &str,
     project: Option<&Path>,
     current_directory: &Path,
+    store: &ReceiptStore,
+    transport: &T,
+    tempdir_factory: &dyn TempDirFactory,
+) -> Result<UpdatePreparation, UpdateError> {
+    let root = super::removal::resolve_project_root(project, current_directory)?;
+    let scope = ResolvedScope::from_validated(super::plan::InstallScope::Project, root);
+    prepare_update_in_scope(
+        catalog,
+        identifier,
+        agent,
+        &scope,
+        store,
+        transport,
+        tempdir_factory,
+    )
+}
+
+/// Prepare an update against one explicit, already validated scope root.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_update_in_scope<T: GithubTransport + ?Sized>(
+    catalog: &Catalog,
+    identifier: &str,
+    agent: &str,
+    scope: &ResolvedScope,
     store: &ReceiptStore,
     transport: &T,
     tempdir_factory: &dyn TempDirFactory,
@@ -294,7 +319,7 @@ pub(crate) fn prepare_update<T: GithubTransport + ?Sized>(
         .find(|resource| resource.id().as_str() == identifier)
         .ok_or_else(|| UpdateError::UnknownResource(identifier.to_owned()))?;
     let old = store
-        .plan_update_target(identifier, project, current_directory)
+        .plan_update_target_in_scope(identifier, scope)
         .map_err(|error| match error {
             RemovalError::MissingReceipt => UpdateError::MissingReceipt,
             other => UpdateError::Removal(other),
@@ -321,7 +346,7 @@ pub(crate) fn prepare_update<T: GithubTransport + ?Sized>(
     let inventory = inspect_staged_skill(&staged)?;
     let destination = inspect_destination(
         Some(&old.receipt().root_path()),
-        current_directory,
+        scope.root(),
         staged.skill_name().as_str(),
     )?;
     if destination.project_root() != old.receipt().root_path()
@@ -331,7 +356,8 @@ pub(crate) fn prepare_update<T: GithubTransport + ?Sized>(
             "the selected project, agent, scope, or destination differs from the recorded installation".to_owned(),
         ));
     }
-    let replacement = build_update_install_plan(&staged, &inventory, destination)?;
+    let replacement =
+        build_update_install_plan_for_scope(&staged, &inventory, destination, scope.scope())?;
     if !replacement.conflicts().is_empty() {
         return Err(UpdateError::Conflict(
             "destination parents contain an unexpected or ambiguous object".to_owned(),
@@ -567,14 +593,22 @@ struct UpdateRecord {
 
 impl UpdateRecord {
     fn validate(&self) -> Result<(), UpdateJournalError> {
-        if self.schema_version != UPDATE_JOURNAL_SCHEMA_VERSION
+        let user_scope = self.old_receipt.scope() == "user";
+        let expected_journal_schema = if user_scope {
+            USER_UPDATE_JOURNAL_SCHEMA_VERSION
+        } else {
+            PROJECT_UPDATE_JOURNAL_SCHEMA_VERSION
+        };
+        let expected_receipt_schema = if user_scope { 3 } else { 2 };
+        let expected_intent_schema = if user_scope { 3 } else { 1 };
+        if self.schema_version != expected_journal_schema
             || self.operation_type != UpdateOperationType::Replacement
             || !valid_hex(&self.operation_id, 32)
             || self.stage_name != format!(".thrn-update-{}-new", self.operation_id)
             || self.backup_name != format!(".thrn-update-{}-old", self.operation_id)
             || self.receipt_backup_name != format!(".thrn-update-{}-receipt-old", self.operation_id)
-            || self.old_receipt.schema_version() != 2
-            || self.new_receipt_intent.schema_version() != 1
+            || self.old_receipt.schema_version() != expected_receipt_schema
+            || self.new_receipt_intent.schema_version() != expected_intent_schema
             || self.old_receipt.catalog_resource_id()
                 != self.new_receipt_intent.catalog_resource_id()
             || self.old_receipt.skill_name() != self.new_receipt_intent.skill_name()
@@ -582,7 +616,8 @@ impl UpdateRecord {
             || self.old_receipt.scope() != self.new_receipt_intent.scope()
             || self.old_receipt.destination_path() != self.new_receipt_intent.destination_path()
             || self.old_receipt.root_path() != self.new_receipt_intent.root_path()
-            || self.old_receipt.project_identity() != self.new_receipt_intent.project_identity()
+            || self.old_receipt.scope_root_identity()
+                != self.new_receipt_intent.scope_root_identity()
             || self.old_receipt.source_owner() != self.new_receipt_intent.source_owner()
             || self.old_receipt.source_repository() != self.new_receipt_intent.source_repository()
             || self.old_receipt.source_directory() != self.new_receipt_intent.source_directory()
@@ -602,7 +637,7 @@ impl UpdateRecord {
             return Err(UpdateJournalError::InvalidRecord);
         }
         self.new_receipt_intent
-            .validate()
+            .validate_install_intent()
             .map_err(|_| UpdateJournalError::InvalidRecord)?;
         if let Some(receipt) = &self.new_receipt {
             receipt
@@ -611,7 +646,7 @@ impl UpdateRecord {
             let Some(identity) = self.stage_identity else {
                 return Err(UpdateJournalError::InvalidRecord);
             };
-            if receipt.schema_version() != 2
+            if receipt.schema_version() != expected_receipt_schema
                 || self
                     .new_receipt_intent
                     .clone()
@@ -821,8 +856,13 @@ impl UpdateJournalStore {
         let directory = SecureDir::open_or_create_absolute(&self.directory)
             .map_err(|error| update_journal_io("create update journal storage", error))?;
         let operation_id = plan.operation_id.clone();
+        let schema_version = if plan.old.receipt().scope() == "user" {
+            USER_UPDATE_JOURNAL_SCHEMA_VERSION
+        } else {
+            PROJECT_UPDATE_JOURNAL_SCHEMA_VERSION
+        };
         let record = UpdateRecord {
-            schema_version: UPDATE_JOURNAL_SCHEMA_VERSION,
+            schema_version,
             operation_type: UpdateOperationType::Replacement,
             operation_id: operation_id.clone(),
             sequence: 0,
@@ -1301,6 +1341,10 @@ pub(crate) struct UpdateSummary {
 }
 
 impl UpdateSummary {
+    pub(crate) fn scope(&self) -> &str {
+        self.receipt.scope()
+    }
+
     pub(crate) fn resource_id(&self) -> &str {
         &self.resource_id
     }
@@ -1342,7 +1386,7 @@ pub(super) fn execute_locked(
     let new_receipt_intent = InstallationReceipt::from_committed_plan(
         plan.replacement(),
         plan.inventory(),
-        plan.receipt().project_identity(),
+        plan.receipt().scope_root_identity(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| UpdateError::Conflict("system clock is before the Unix epoch".to_owned()))?
@@ -2926,7 +2970,7 @@ fn open_plan_parents(plan: &RemovalPlan) -> Result<(SecureDir, SecureDir, Secure
             "could not identify project root ({})",
             error.kind()
         ))
-    })? != plan.receipt().project_identity()
+    })? != plan.receipt().scope_root_identity()
     {
         return Err(UpdateError::Conflict(
             "project root identity changed after update planning".to_owned(),
@@ -2964,7 +3008,7 @@ fn open_update_parents(record: &UpdateRecord) -> Result<(SecureDir, SecureDir, S
     if project
         .identity()
         .map_err(|error| format!("could not identify project root ({})", error.kind()))?
-        != record.old_receipt.project_identity()
+        != record.old_receipt.scope_root_identity()
     {
         return Err("project root identity differs from the update journal".to_owned());
     }
@@ -3079,11 +3123,13 @@ mod tests {
             command::prepare_install_session,
             commit::InstallFaultInjector,
             journal::NoJournalFaults,
+            plan::InstallScope,
             receipt_store::{NoReceiptFaults, ReceiptStore, ReceiptStoreError},
             removal::NoRemovalFaults,
+            scope::ResolvedScope,
             update::{
                 NoUpdateFaults, UpdateError, UpdateFaultInjector, UpdateOperation,
-                UpdatePreparation, format_dry_run, prepare_update,
+                UpdatePreparation, format_dry_run, prepare_update, prepare_update_in_scope,
             },
         },
         registry::catalog::parse_catalog_json,
@@ -3099,6 +3145,7 @@ mod tests {
     struct Fixture {
         _parent: Option<TempDir>,
         project: PathBuf,
+        home: PathBuf,
         staging: PathBuf,
         store: ReceiptStore,
         data: PathBuf,
@@ -3114,13 +3161,16 @@ mod tests {
         fn from_root(root: PathBuf, parent: Option<TempDir>) -> Self {
             let root = root.canonicalize().expect("canonical fixture root");
             let project = root.join("project");
+            let home = root.join("home");
             let staging = root.join("staging");
             let data = root.join("data");
             fs::create_dir_all(&project).expect("project");
+            fs::create_dir_all(&home).expect("home");
             fs::create_dir_all(&staging).expect("staging parent");
             Self {
                 _parent: parent,
                 project,
+                home,
                 staging,
                 store: ReceiptStore::new(data.join("receipts")),
                 data,
@@ -3144,6 +3194,26 @@ mod tests {
                 .expect("install old version")
         }
 
+        fn user_scope(&self) -> ResolvedScope {
+            ResolvedScope::for_test(InstallScope::User, self.home.clone())
+        }
+
+        fn install_old_user(&self) -> crate::install::receipt::InstallationReceipt {
+            let catalog = catalog(OLD_REVISION, "1.0.0");
+            let session = super::super::command::prepare_install_session_in_scope(
+                &catalog,
+                "uncharted",
+                "codex",
+                &self.user_scope(),
+                &TestTransport,
+                &TestFactory(self.staging.clone()),
+            )
+            .expect("validated user install session");
+            session
+                .commit_and_record_at(&self.store, 100, &NoInstallFaults, &NoReceiptFaults)
+                .expect("install old user version")
+        }
+
         fn prepare_new(&self) -> UpdatePlan {
             match prepare_update(
                 &catalog(NEW_REVISION, "1.1.0"),
@@ -3156,6 +3226,23 @@ mod tests {
                 &TestFactory(self.staging.clone()),
             )
             .expect("prepare update")
+            {
+                UpdatePreparation::Ready(plan) => *plan,
+                UpdatePreparation::AlreadyUpToDate(_) => panic!("new pin differs"),
+            }
+        }
+
+        fn prepare_new_user(&self) -> UpdatePlan {
+            match prepare_update_in_scope(
+                &catalog(NEW_REVISION, "1.1.0"),
+                "uncharted",
+                "codex",
+                &self.user_scope(),
+                &self.store,
+                &TestTransport,
+                &TestFactory(self.staging.clone()),
+            )
+            .expect("prepare user update")
             {
                 UpdatePreparation::Ready(plan) => *plan,
                 UpdatePreparation::AlreadyUpToDate(_) => panic!("new pin differs"),
@@ -3662,7 +3749,12 @@ mod tests {
         };
         let operation = parse_crash_operation(&operation).expect("known crash boundary");
         let fixture = Fixture::from_root(PathBuf::from(root), None);
-        let plan = fixture.prepare_new();
+        let user_scope = std::env::var_os("THRN_UPDATE_CRASH_SCOPE").is_some();
+        let plan = if user_scope {
+            fixture.prepare_new_user()
+        } else {
+            fixture.prepare_new()
+        };
         let _ = fixture.store.update(&plan, &CrashAfter(operation));
         panic!("fault injector did not terminate at {operation:?}");
     }
@@ -3782,6 +3874,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn user_scope_update_crash_recovers_schema_v3_receipt_without_touching_project_scope() {
+        let fixture = Fixture::new();
+        let project_receipt = fixture.install_old();
+        let user_receipt = fixture.install_old_user();
+        let project_skill_md = fs::read(project_receipt.destination_path().join("SKILL.md"))
+            .expect("project skill before user update");
+        assert_eq!(user_receipt.scope(), "user");
+        assert_eq!(user_receipt.schema_version(), 3);
+
+        let status = Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("install::update::tests::update_crash_child")
+            .arg("--nocapture")
+            .env(
+                "THRN_UPDATE_CRASH_ROOT",
+                fixture._parent.as_ref().expect("fixture root").path(),
+            )
+            .env("THRN_UPDATE_CRASH_AFTER", "CommitReplacement")
+            .env("THRN_UPDATE_CRASH_SCOPE", "user")
+            .status()
+            .expect("user update crash child starts");
+        assert_eq!(status.code(), Some(79));
+        assert!(fixture.store.list().is_err());
+        fixture
+            .store
+            .recover_with_faults(&NoJournalFaults, &NoReceiptFaults)
+            .expect("user update crash recovers");
+
+        let receipts = fixture.store.list().expect("receipts after recovery");
+        assert_eq!(receipts.len(), 2);
+        let user = receipts
+            .iter()
+            .find(|receipt| receipt.scope() == "user")
+            .expect("user receipt remains");
+        let project = receipts
+            .iter()
+            .find(|receipt| receipt.scope() == "project")
+            .expect("project receipt remains");
+        assert_eq!(user.schema_version(), 3);
+        assert_eq!(user.source_commit(), NEW_REVISION);
+        assert_eq!(project.source_commit(), OLD_REVISION);
+        assert_eq!(
+            project.destination_path(),
+            project_receipt.destination_path()
+        );
+        assert_eq!(
+            fs::read(project_receipt.destination_path().join("SKILL.md"))
+                .expect("project tree remains old"),
+            project_skill_md
+        );
+        fixture
+            .store
+            .recover_with_faults(&NoJournalFaults, &NoReceiptFaults)
+            .expect("user update recovery is idempotent");
     }
 
     #[test]

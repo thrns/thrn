@@ -29,16 +29,13 @@ pub struct CatalogCache {
 
 impl CatalogCache {
     pub fn for_system() -> Result<Self, CacheError> {
-        if let Some(path) = std::env::var_os("THRN_CACHE_DIR") {
-            let path = PathBuf::from(path);
-            if !path.is_absolute() {
-                return Err(CacheError::RelativeDirectoryOverride);
-            }
-            return Ok(Self::new(path));
-        }
-        let directories = directories::ProjectDirs::from("im", "thrn", "thrn")
-            .ok_or(CacheError::DirectoryUnavailable)?;
-        Ok(Self::new(directories.cache_dir().to_path_buf()))
+        let paths = crate::os_paths::OsPaths::for_system().map_err(map_os_path_error)?;
+        Ok(Self::new(
+            paths
+                .catalog_cache_dir()
+                .map_err(map_os_path_error)?
+                .to_path_buf(),
+        ))
     }
 
     pub fn new(directory: PathBuf) -> Self {
@@ -271,6 +268,8 @@ pub enum CacheError {
     DirectoryUnavailable,
     #[error("THRN_CACHE_DIR must be an absolute path")]
     RelativeDirectoryOverride,
+    #[error("could not resolve the operating-system catalog cache path: {0}")]
+    PathResolution(String),
     #[error("could not {action} the catalog cache ({source})")]
     Io {
         action: &'static str,
@@ -291,6 +290,16 @@ pub enum CacheError {
     WrongSource,
     #[error("catalog cache timestamp is invalid")]
     InvalidTimestamp,
+}
+
+fn map_os_path_error(error: crate::os_paths::OsPathError) -> CacheError {
+    match error {
+        crate::os_paths::OsPathError::DirectoryUnavailable => CacheError::DirectoryUnavailable,
+        crate::os_paths::OsPathError::RelativeCacheOverride => {
+            CacheError::RelativeDirectoryOverride
+        }
+        other => CacheError::PathResolution(other.to_string()),
+    }
 }
 
 #[cfg(test)]
