@@ -1778,6 +1778,7 @@ mod install_tests {
             .env("THRN_M3_PAUSED_REMOVE_CURRENT", &fixture.current)
             .env("THRN_M3_PAUSED_REMOVE_ENTERED", &entered)
             .env("THRN_M3_PAUSED_REMOVE_RELEASE", &release)
+            .env("THRN_DEBUG_WINDOWS_RENAME", "1")
             .spawn()
             .expect("launch removal-lock subprocess");
         let _release_on_drop = ReleaseRemovalOnDrop(release.clone());

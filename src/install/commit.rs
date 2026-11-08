@@ -2374,7 +2374,16 @@ impl SecureDir {
             ));
         }
         self.ensure_current_path()?;
-        rename_handle_child_noreplace(source, &self.file, std::ffi::OsStr::new(new_name))
+        let destination = self.path.join(new_name);
+        let result = rename_handle_noreplace(source, &destination);
+        #[cfg(test)]
+        if result.is_err() && std::env::var_os("THRN_DEBUG_WINDOWS_RENAME").is_some() {
+            eprintln!(
+                "Windows no-replace file rename failed: parent={:?} source={old_name:?} target={new_name:?}",
+                self.path
+            );
+        }
+        result
     }
 
     pub(super) fn rename_directory_child_noreplace(
@@ -2571,70 +2580,6 @@ fn rename_handle_noreplace(source: &fs::File, destination: &Path) -> io::Result<
             FILE_RENAME_INFO {
                 Anonymous: windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO_0 { Flags: 0 },
                 RootDirectory: ptr::null_mut::<std::ffi::c_void>() as HANDLE,
-                FileNameLength: name_bytes,
-                FileName: [0],
-            },
-        );
-        ptr::copy_nonoverlapping(
-            wide.as_ptr(),
-            info.cast::<u8>().add(header_size).cast::<u16>(),
-            wide.len(),
-        );
-        let result = SetFileInformationByHandle(
-            source.as_raw_handle() as HANDLE,
-            FileRenameInfoEx,
-            info.cast(),
-            u32::try_from(byte_len)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename data too long"))?,
-        );
-        if result == 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn rename_handle_child_noreplace(
-    source: &fs::File,
-    parent: &fs::File,
-    new_name: &std::ffi::OsStr,
-) -> io::Result<()> {
-    use std::{
-        mem::{offset_of, size_of},
-        os::windows::{ffi::OsStrExt, io::AsRawHandle},
-        ptr,
-    };
-    use windows_sys::Win32::{
-        Foundation::HANDLE,
-        Storage::FileSystem::{FILE_RENAME_INFO, FileRenameInfoEx, SetFileInformationByHandle},
-    };
-    let wide = new_name.encode_wide().collect::<Vec<_>>();
-    if wide.is_empty() || wide.contains(&0) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid child name for secure rename",
-        ));
-    }
-    let name_bytes = u32::try_from(wide.len().saturating_mul(size_of::<u16>()))
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target name too long"))?;
-    let header_size = offset_of!(FILE_RENAME_INFO, FileName);
-    let byte_len = header_size
-        .checked_add(name_bytes as usize)
-        .map(|len| len.max(size_of::<FILE_RENAME_INFO>()))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target name too long"))?;
-    let words = byte_len.div_ceil(size_of::<usize>());
-    let mut buffer = vec![0_usize; words];
-    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-    // SAFETY: The aligned buffer contains the fixed structure and complete UTF-16 child name;
-    // both handles remain live for the documented Win32 call. A directory handle anchors the
-    // rename to the already-verified parent instead of resolving an absolute path again.
-    unsafe {
-        ptr::write(
-            info,
-            FILE_RENAME_INFO {
-                Anonymous: windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO_0 { Flags: 0 },
-                RootDirectory: parent.as_raw_handle() as HANDLE,
                 FileNameLength: name_bytes,
                 FileName: [0],
             },
