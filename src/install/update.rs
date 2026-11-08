@@ -1676,10 +1676,10 @@ fn open_relative_parent(
 ) -> io::Result<(SecureDir, String)> {
     if relative.is_empty()
         || relative.starts_with('/')
-        || relative.contains('\\')
         || relative
-            .split('/')
+            .split(['/', '\\'])
             .any(|part| part.is_empty() || part == "." || part == "..")
+        || Path::new(relative).is_absolute()
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
