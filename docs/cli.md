@@ -1,6 +1,6 @@
 # CLI contract
 
-This page describes the executable that exists today. The CLI supports offline catalog discovery and installed-resource listing, explicit catalog refresh, local skill validation, `doctor`, Codex project installation planning and installation, and receipt-backed Codex project update and removal. User scope, other agents, configuration, completions, JSON output, and noninteractive options are not implemented.
+This page describes the executable that exists today. The CLI supports offline catalog discovery, installed-resource listing and update checking, explicit catalog refresh, local skill validation, `doctor`, Codex project installation planning and installation, and receipt-backed Codex project update and removal. User scope, other agents, configuration, completions, JSON output, and noninteractive options are not implemented.
 
 ## Available commands
 
@@ -25,8 +25,11 @@ This page describes the executable that exists today. The CLI supports offline c
 | `thrn skills remove <canonical-id> --agent codex --dry-run` | Print the exact verified destination, receipt-listed files, counts, and bytes without changing the project or receipt store. |
 | `thrn skills remove <canonical-id> --agent codex --project <path> --dry-run` | Print a read-only removal plan for the selected project. |
 | `thrn skills update <canonical-id> --agent codex --dry-run` | Verify the current receipt and complete tree, fetch the local catalog's exact pinned replacement if needed, and print the file-level comparison without project or receipt-store writes. |
-| `thrn skills update <canonical-id> --agent codex` | Replace the exactly verified project installation with the newer full commit pinned by the validated local catalog, using a versioned update journal and receipt transition. |
+| `thrn skills update <canonical-id> --agent codex` | Replace the exactly verified project installation with the different full commit pinned by the validated local catalog, using a versioned update journal and receipt transition. |
 | `thrn skills update <canonical-id> --agent codex --project <path>` | Update the selected existing project instead of the current directory. |
+| `thrn skills check` | Compare current-project THRN-managed Codex installations with the selected local catalog; never uses the network or changes files. |
+| `thrn skills check --project <path>` | Check one other existing project without inspecting installation trees from other projects. |
+| `thrn skills check --agent codex` | Explicitly select the only currently supported agent; agent autodetection is not performed. |
 
 The root parser requires a subcommand. Clap also supplies its normal short-help and short-version aliases.
 
@@ -53,7 +56,7 @@ renamed skills, changed source directories, same-length edits, replacement direc
 ambiguous object are conflicts. A matching catalog pin reports `Already up to date` without a fetch,
 project mutation, or receipt rewrite.
 
-For a newer pin, THRN fetches only that exact full GitHub commit and uses the existing archive and
+For a different catalog-pinned revision, THRN fetches only that exact full GitHub commit and uses the existing archive and
 staged skill validation. Dry-run lists each added, removed, changed, and unchanged file, old/new
 revisions, destination, replacement file count and bytes, and verified ownership. The exact pinned
 source can be downloaded for this comparison; dry-run does not alter project or receipt storage.
@@ -71,10 +74,60 @@ directory just because hashes match. If a conflict prevents recovery, the old/ne
 backup, and journal remain for manual inspection. See the [update state machine](recovery.md#receipt-backed-update-state-machine).
 
 On success, stdout includes the resource ID, skill name, destination, previous/new pinned revisions,
-updated file count and bytes, and confirmation that the new ownership receipt was recorded. An
+updated file count and bytes, and confirmation that the new ownership receipt was recorded. The new
+revision is the full SHA in the selected catalog; check does not infer Git ancestry or chronology. An
 interrupted/partially committed update exits nonzero and does not print this success block. The
 current Windows secure handle layer cannot flush directory-entry metadata, and no cross-filesystem
 power-loss atomicity is claimed.
+
+### Read-only update check
+
+```sh
+thrn skills check
+thrn skills check --project ./my-project
+thrn skills check --agent codex
+```
+
+The command checks only THRN-managed Codex project installations whose receipt names the selected
+canonical project root. `--project` must identify an existing real directory; it defaults to the
+current directory. `--agent codex` is optional and is the only accepted agent selection. THRN does
+not autodetect agents.
+
+Check reads the validated local catalog through the existing `CatalogService` discovery path, which
+uses the local cache when valid and otherwise bundled metadata. It never refreshes stale data,
+contacts GitHub, invokes source fetching or staging, starts install/update/removal transactions,
+executes skill files, or attempts recovery. It does not create application-data directories or lock
+files, rewrite receipts or journals, or modify projects. When the receipt store already has its
+persistent writer lock, check briefly acquires that existing lock while it validates journals,
+reads receipt storage, and verifies trees for the selected project. An active writer, pending
+install/remove/update journal, corrupt store, or unsafe receipt storage makes the command fail
+closed. With no receipts, the project gets a successful empty result.
+
+Each result prints the canonical resource ID, installed skill name, installed full SHA, catalog SHA
+when present, and one classification:
+
+- **Up to date:** the v2 receipt identity and complete installed tree verify, the source identity
+  matches, and the installed SHA equals the selected catalog SHA.
+- **Update available:** the v2 receipt identity and complete installed tree verify, the resource
+  ID, GitHub owner/repository, source directory, and skill name match, and the catalog pins a
+  different full SHA. The differing SHA identifies another catalog-pinned revision; THRN does not
+  infer Git ancestry or claim it is chronologically newer.
+- **Not in catalog:** the installed canonical resource ID has no exact entry in the selected catalog.
+- **Source mismatch:** the exact catalog entry exists but changes an identity field that automatic
+  update requires to remain unchanged.
+- **Legacy receipt:** the schema-v1 receipt and recorded inventory verify, but the receipt has no
+  installation-time directory identity and cannot use automatic update.
+- **Modified or unsafe installation:** the receipt-backed directory identity, contents, or
+  structure do not verify. This finding is never eligible for automatic update.
+
+Only the local catalog pin is compared. The command exits `0` for completed checks, including
+available updates and missing catalog entries; data-integrity, filesystem, catalog, or recovery
+errors exit `1`; usage errors exit `2`. Catalog output labels the source and freshness. A stale
+cache or bundled catalog is not authoritative information about the latest GitHub state.
+
+To act on an **Update available** result, run the explicit update command after reviewing the
+resource: `thrn skills update <canonical-id> --agent codex`. Update performs its own ownership and
+tree verification and fetches the exact locally pinned GitHub source; check does neither.
 
 ### Installation planning and installation
 

@@ -9,6 +9,7 @@ use crate::{
     doctor,
     error::Result,
     install::{
+        check::{self, CheckFinding},
         command::{
             InstallCommandError, format_dry_run, prepare_install_plan, prepare_install_session,
         },
@@ -113,6 +114,15 @@ enum SkillsCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Compare current-project Codex installations with local catalog pins without network access.
+    Check {
+        /// Select an existing project directory (defaults to the current directory).
+        #[arg(long, value_name = "PATH")]
+        project: Option<std::path::PathBuf>,
+        /// Select the only currently supported agent (codex).
+        #[arg(long, value_name = "AGENT", value_parser = ["codex"])]
+        agent: Option<String>,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -144,8 +154,70 @@ pub fn run() -> Result<()> {
                 project,
                 dry_run,
             } => update_skill(&id, &agent, project.as_deref(), dry_run),
+            SkillsCommand::Check { project, agent: _ } => check_skills(project.as_deref()),
         },
     }
+}
+
+fn check_skills(project: Option<&Path>) -> Result<()> {
+    let current_directory = std::env::current_dir().map_err(|error| {
+        crate::error::ThrnError::InstalledListing(ReceiptStoreError::ProjectInspection(format!(
+            "current directory could not be read ({})",
+            error.kind()
+        )))
+    })?;
+    let selection = CatalogService::for_system().discover()?;
+    let store = ReceiptStore::for_system()?;
+    let snapshot = store.inspect_project(project, &current_directory)?;
+    let findings = check::classify(&selection.catalog, snapshot.installations);
+    report_cache_warning(selection.cache_warning.as_deref())?;
+    write_stdout(&format_skill_check(
+        &selection,
+        &snapshot.project_root,
+        &findings,
+    ))
+}
+
+fn format_skill_check(
+    selection: &CatalogSelection,
+    project_root: &Path,
+    findings: &[CheckFinding],
+) -> String {
+    let mut output = format!(
+        "Offline skill update check\nProject: {}\n{}Catalog comparison uses the selected local metadata and installation receipts only; no network request was made.\n",
+        safe_path_display(project_root),
+        catalog_heading(selection),
+    );
+    if findings.is_empty() {
+        output.push_str("No THRN-managed Codex project skills are recorded in this project.\n");
+        return output;
+    }
+
+    output.push_str(&format!(
+        "THRN-managed Codex project skills checked: {}\n",
+        findings.len()
+    ));
+    for finding in findings {
+        let receipt = finding.receipt();
+        output.push('\n');
+        output.push_str(&format!(
+            "Resource: {}\nSkill name: {}\nInstalled SHA: {}\n",
+            receipt.catalog_resource_id(),
+            receipt.skill_name(),
+            receipt.source_commit(),
+        ));
+        match finding.catalog_commit() {
+            Some(commit) => output.push_str(&format!("Catalog SHA: {commit}\n")),
+            None => output
+                .push_str("Catalog SHA: unavailable (resource absent from selected catalog)\n"),
+        }
+        output.push_str(&format!(
+            "Status: {}\n  {}\n",
+            finding.status().label(),
+            finding.status().explanation(),
+        ));
+    }
+    output
 }
 
 fn remove_skill(

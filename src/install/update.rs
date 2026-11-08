@@ -3300,6 +3300,52 @@ mod tests {
     }
 
     #[test]
+    fn read_only_check_rejects_a_pending_update_without_recovery_or_mutation() {
+        let fixture = Fixture::new();
+        let receipt = fixture.install_old();
+        let plan = fixture.prepare_new();
+        let old_content =
+            fs::read(receipt.destination_path().join("SKILL.md")).expect("old installed file");
+        fixture
+            .store
+            .update(&plan, &FailBefore(UpdateOperation::CreateStage))
+            .expect_err("injected stage failure leaves a pending update journal");
+
+        let journal_directory = fixture.data.join("updates");
+        let journal_snapshot = fs::read_dir(&journal_directory)
+            .expect("pending update journal directory")
+            .map(|entry| {
+                let entry = entry.expect("journal entry");
+                (
+                    entry.file_name(),
+                    fs::read(entry.path()).expect("journal bytes"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(!journal_snapshot.is_empty());
+        let error = fixture
+            .store
+            .inspect_project(None, &fixture.project)
+            .expect_err("check must fail while update recovery is pending");
+        assert!(error.to_string().contains("recovery is required"));
+        assert_eq!(
+            fs::read(receipt.destination_path().join("SKILL.md")).expect("old file remains"),
+            old_content
+        );
+        let journal_after = fs::read_dir(&journal_directory)
+            .expect("journal remains")
+            .map(|entry| {
+                let entry = entry.expect("journal entry");
+                (
+                    entry.file_name(),
+                    fs::read(entry.path()).expect("journal bytes"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(journal_after, journal_snapshot);
+    }
+
+    #[test]
     fn successful_update_replaces_tree_and_records_new_schema_v2_identity() {
         let fixture = Fixture::new();
         let old_receipt = fixture.install_old();

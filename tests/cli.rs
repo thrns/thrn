@@ -341,11 +341,247 @@ fn write_cache(directory: &TestDir, catalog: &[u8]) {
     fs::write(cache_file, contents).expect("test cache should be written");
 }
 
+fn write_check_receipt(
+    directory: &TestDir,
+    project: &std::path::Path,
+    resource_id: &str,
+    source_commit: &str,
+) {
+    let root = fs::canonicalize(project).expect("canonical project root");
+    let destination = root.join(".agents/skills/uncharted-ideation");
+    fs::create_dir_all(&destination).expect("skill destination");
+    fs::write(destination.join("SKILL.md"), b"abc").expect("skill file");
+    let mut receipt: serde_json::Value =
+        serde_json::from_slice(&receipt_json_with_install_identity(
+            root.to_str().expect("UTF-8 project root"),
+            resource_id,
+            "uncharted-ideation",
+            project_filesystem_identity(&root),
+            project_filesystem_identity(&destination),
+        ))
+        .expect("valid receipt fixture");
+    receipt["sourceOwner"] = serde_json::json!("Example-Org");
+    receipt["sourceCommit"] = serde_json::json!(source_commit);
+    let receipts = receipt_directory(directory);
+    fs::create_dir_all(&receipts).expect("receipt storage");
+    let writer_lock = receipts.join(".writer.lock");
+    if !writer_lock.exists() {
+        fs::write(writer_lock, []).expect("persistent writer lock fixture");
+    }
+    fs::write(
+        receipts.join(receipt_filename(
+            root.to_str().expect("UTF-8 project root"),
+            resource_id,
+        )),
+        serde_json::to_vec(&receipt).expect("receipt JSON"),
+    )
+    .expect("write check receipt");
+}
+
+fn recursive_snapshot(root: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut result = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).expect("read snapshot directory") {
+            let entry = entry.expect("snapshot entry");
+            let path = entry.path();
+            let kind = entry.file_type().expect("snapshot type");
+            if kind.is_dir() {
+                result.push((path.clone(), Vec::new()));
+                pending.push(path);
+            } else if kind.is_file() {
+                result.push((path.clone(), fs::read(path).expect("snapshot file")));
+            }
+        }
+    }
+    result.sort_by(|left, right| left.0.cmp(&right.0));
+    result
+}
+
 fn run_cli(args: &[&str]) -> Output {
     let directory = TestDir::new();
     command_in(&directory, args)
         .output()
         .expect("the compiled thrn binary should start")
+}
+
+#[test]
+fn skills_check_empty_project_uses_bundled_metadata_offline_without_creating_storage() {
+    let directory = TestDir::new();
+    let before = recursive_snapshot(directory.root());
+    let output = command_in(&directory, &["skills", "check"])
+        .output()
+        .expect("compiled CLI starts with network disabled");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Offline skill update check"));
+    assert!(stdout.contains("Catalog source: bundled metadata; freshness: unknown"));
+    assert!(stdout.contains("No THRN-managed Codex project skills are recorded"));
+    assert!(stdout.contains("no network request was made"));
+    assert!(output.stderr.is_empty());
+    assert_eq!(recursive_snapshot(directory.root()), before);
+    assert!(!directory.root().join("thrn-cache").exists());
+    assert!(!data_directory(&directory).exists());
+}
+
+#[test]
+fn skills_check_compiled_cli_is_deterministic_and_limits_results_to_selected_project() {
+    let directory = TestDir::new();
+    let other_project = directory.path().join("other-project");
+    fs::create_dir(&other_project).expect("second project");
+    write_cache(
+        &directory,
+        include_bytes!("fixtures/catalog/test-only-valid-v1.json"),
+    );
+    write_check_receipt(
+        &directory,
+        directory.path(),
+        "uncharted",
+        "2f68bee292a8c68346b4294fb31d9563eefe1ade",
+    );
+    write_check_receipt(
+        &directory,
+        &other_project,
+        "other-project-skill",
+        "2f68bee292a8c68346b4294fb31d9563eefe1ade",
+    );
+    let before = recursive_snapshot(directory.root());
+
+    let first = command_in(&directory, &["skills", "check", "--agent", "codex"])
+        .output()
+        .expect("compiled CLI starts");
+    let second = command_in(&directory, &["skills", "check", "--agent", "codex"])
+        .output()
+        .expect("compiled CLI starts again");
+    assert_eq!(first.status.code(), Some(0));
+    assert_eq!(first.stdout, second.stdout);
+    let stdout = String::from_utf8_lossy(&first.stdout);
+    assert!(stdout.contains("Catalog source: local cache; freshness: fresh"));
+    assert!(stdout.contains("Resource: uncharted"));
+    assert!(stdout.contains("Skill name: uncharted-ideation"));
+    assert!(stdout.contains("Installed SHA: 2f68bee292a8c68346b4294fb31d9563eefe1ade"));
+    assert!(stdout.contains("Catalog SHA: 2f68bee292a8c68346b4294fb31d9563eefe1ade"));
+    assert!(stdout.contains("Status: Up to date"));
+    assert!(!stdout.contains("other-project-skill"));
+    assert!(first.stderr.is_empty());
+
+    let project_arg = "./other-project";
+    let selected = command_in(&directory, &["skills", "check", "--project", project_arg])
+        .output()
+        .expect("explicit project check starts");
+    assert_eq!(selected.status.code(), Some(0));
+    let selected_stdout = String::from_utf8_lossy(&selected.stdout);
+    let canonical_other_project = fs::canonicalize(&other_project).expect("canonical project");
+    assert!(selected_stdout.contains(&format!("Project: {}", canonical_other_project.display())));
+    assert!(selected_stdout.contains("Resource: other-project-skill"));
+    assert!(selected_stdout.contains("Status: Not in catalog"));
+    assert!(!selected_stdout.contains("Resource: uncharted"));
+    assert!(selected.stderr.is_empty());
+    assert_eq!(recursive_snapshot(directory.root()), before);
+}
+
+#[test]
+fn skills_check_reports_different_catalog_pin_and_stale_local_catalog() {
+    let directory = TestDir::new();
+    let mut catalog: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/catalog/test-only-valid-v1.json"))
+            .expect("catalog fixture JSON");
+    catalog["resources"][0]["source"]["commit"] =
+        serde_json::json!("3f68bee292a8c68346b4294fb31d9563eefe1ade");
+    write_cache(
+        &directory,
+        &serde_json::to_vec(&catalog).expect("edited catalog JSON"),
+    );
+    write_check_receipt(
+        &directory,
+        directory.path(),
+        "uncharted",
+        "2f68bee292a8c68346b4294fb31d9563eefe1ade",
+    );
+    let before = recursive_snapshot(directory.root());
+
+    let output = command_in(&directory, &["skills", "check"])
+        .output()
+        .expect("compiled CLI starts");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Catalog source: local cache; freshness: fresh"));
+    assert!(stdout.contains("Status: Update available"));
+    assert!(stdout.contains("catalog pins a different revision; Git ancestry is not inferred"));
+    assert!(stdout.contains("Installed SHA: 2f68bee292a8c68346b4294fb31d9563eefe1ade"));
+    assert!(stdout.contains("Catalog SHA: 3f68bee292a8c68346b4294fb31d9563eefe1ade"));
+    assert!(output.stderr.is_empty());
+    assert_eq!(recursive_snapshot(directory.root()), before);
+
+    let stale = TestDir::new();
+    let cache = cache_file(&stale);
+    fs::create_dir_all(cache.parent().expect("cache parent")).unwrap();
+    let mut bytes = b"THRN-CATALOG-CACHE 1\nsource=https://raw.githubusercontent.com/thrns/thrn/main/src/registry/builtin-v1.json\nrefreshed_at_unix_seconds=1\n\n".to_vec();
+    bytes.extend_from_slice(include_bytes!("fixtures/catalog/test-only-valid-v1.json"));
+    fs::write(cache, bytes).unwrap();
+    let output = command_in(&stale, &["skills", "check"])
+        .output()
+        .expect("offline stale-catalog check starts");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("Catalog source: local cache; freshness: stale")
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn skills_check_labels_modified_installation_and_still_exits_successfully() {
+    let directory = TestDir::new();
+    write_cache(
+        &directory,
+        include_bytes!("fixtures/catalog/test-only-valid-v1.json"),
+    );
+    write_check_receipt(
+        &directory,
+        directory.path(),
+        "uncharted",
+        "2f68bee292a8c68346b4294fb31d9563eefe1ade",
+    );
+    fs::write(
+        directory
+            .path()
+            .join(".agents/skills/uncharted-ideation/SKILL.md"),
+        b"xyz",
+    )
+    .expect("same-length modification");
+    let before = recursive_snapshot(directory.root());
+
+    let output = command_in(&directory, &["skills", "check"])
+        .output()
+        .expect("compiled CLI starts");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Status: Modified or unsafe installation"));
+    assert!(stdout.contains("automatic update is not eligible"));
+    assert!(output.stderr.is_empty());
+    assert_eq!(recursive_snapshot(directory.root()), before);
+}
+
+#[test]
+fn skills_check_usage_and_project_errors_have_expected_exit_codes() {
+    let directory = TestDir::new();
+    let invalid_agent = command_in(&directory, &["skills", "check", "--agent", "claude"])
+        .output()
+        .expect("compiled CLI starts");
+    assert_eq!(invalid_agent.status.code(), Some(2));
+    assert!(invalid_agent.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&invalid_agent.stderr).contains("invalid value"));
+
+    let missing_project = directory.root().join("missing-project");
+    let project_arg = missing_project.to_string_lossy().into_owned();
+    let invalid_project = command_in(&directory, &["skills", "check", "--project", &project_arg])
+        .output()
+        .expect("compiled CLI starts");
+    assert_eq!(invalid_project.status.code(), Some(1));
+    assert!(invalid_project.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&invalid_project.stderr).contains("selected project"));
 }
 
 #[test]
