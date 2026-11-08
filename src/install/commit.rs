@@ -2111,6 +2111,7 @@ fn rustix_error(error: rustix::io::Errno) -> io::Error {
 pub(super) struct SecureDir {
     file: std::sync::Arc<fs::File>,
     path: PathBuf,
+    delete_access: bool,
 }
 
 #[cfg(windows)]
@@ -2143,10 +2144,14 @@ impl SecureDir {
                 ));
             }
         }
-        let file = open_windows_directory(&current)?;
+        // An absolute directory may be the process current directory. Keep this initial handle
+        // free of DELETE to avoid Windows current-directory sharing conflicts; child handles
+        // opened specifically for rename carry DELETE access.
+        let file = open_windows_directory_with_delete_access(&current, false)?;
         Ok(Self {
             file: std::sync::Arc::new(file),
             path: current,
+            delete_access: false,
         })
     }
 
@@ -2195,20 +2200,22 @@ impl SecureDir {
     pub(super) fn open_directory(&self, name: &std::ffi::OsStr) -> io::Result<Self> {
         self.ensure_current_path()?;
         let path = self.path.join(name);
-        let file = open_windows_directory(&path)?;
+        let file = open_windows_directory_with_delete_access(&path, true)?;
         Ok(Self {
             file: std::sync::Arc::new(file),
             path,
+            delete_access: true,
         })
     }
 
     fn open_directory_for_rename(&self, name: &std::ffi::OsStr) -> io::Result<Self> {
         self.ensure_current_path()?;
         let path = self.path.join(name);
-        let file = open_windows_directory_for_rename(&path)?;
+        let file = open_windows_directory_with_delete_access(&path, true)?;
         Ok(Self {
             file: std::sync::Arc::new(file),
             path,
+            delete_access: true,
         })
     }
 
@@ -2541,7 +2548,7 @@ impl SecureDir {
     }
 
     fn ensure_current_path(&self) -> io::Result<()> {
-        let current = open_windows_directory(&self.path)?;
+        let current = open_windows_directory_with_delete_access(&self.path, self.delete_access)?;
         if windows_identity(&current)? != windows_identity(&self.file)? {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -2605,16 +2612,6 @@ fn rename_handle_noreplace(source: &fs::File, destination: &Path) -> io::Result<
         }
     }
     Ok(())
-}
-
-#[cfg(windows)]
-fn open_windows_directory(path: &Path) -> io::Result<fs::File> {
-    open_windows_directory_with_delete_access(path, false)
-}
-
-#[cfg(windows)]
-fn open_windows_directory_for_rename(path: &Path) -> io::Result<fs::File> {
-    open_windows_directory_with_delete_access(path, true)
 }
 
 #[cfg(windows)]
