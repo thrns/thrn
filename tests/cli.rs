@@ -224,6 +224,127 @@ fn write_claude_receipt(directory: &TestDir, root: &std::path::Path, scope: &str
     path
 }
 
+fn write_adapter_receipt(directory: &TestDir, agent: &str, scope: &str) -> PathBuf {
+    let root_path = if scope == "project" {
+        directory.path()
+    } else {
+        directory.root()
+    };
+    let root = fs::canonicalize(root_path).expect("canonical adapter scope root");
+    let root_text = root.to_str().expect("UTF-8 adapter root");
+    let layout = match agent {
+        "cursor" => "cursor-default-v1",
+        "gemini" => "gemini-cli-default-v1",
+        _ => panic!("unsupported adapter fixture agent"),
+    };
+    let adapter_directory = match agent {
+        "cursor" => ".cursor",
+        "gemini" => ".gemini",
+        _ => unreachable!(),
+    };
+    let destination = root
+        .join(adapter_directory)
+        .join("skills/uncharted-ideation");
+    fs::create_dir_all(&destination).expect("adapter skill destination");
+    let content = b"abc";
+    fs::write(destination.join("SKILL.md"), content).expect("adapter skill file");
+    let root_identity = project_filesystem_identity(&root);
+    let destination_identity = project_filesystem_identity(&destination);
+
+    let mut content_context = Context::new(&SHA256);
+    content_context.update(b"THRN-CONTENT-INVENTORY-V5\0");
+    for field in [
+        agent.as_bytes(),
+        scope.as_bytes(),
+        layout.as_bytes(),
+        root_text.as_bytes(),
+    ] {
+        digest_field(&mut content_context, field);
+    }
+    content_context.update(&root_identity.0.to_be_bytes());
+    content_context.update(&root_identity.1.to_be_bytes());
+    content_context.update(&destination_identity.0.to_be_bytes());
+    content_context.update(&destination_identity.1.to_be_bytes());
+    content_context.update(&0_u64.to_be_bytes());
+    content_context.update(&1_u64.to_be_bytes());
+    content_context.update(b"F");
+    digest_field(&mut content_context, b"SKILL.md");
+    content_context.update(&(content.len() as u64).to_be_bytes());
+    content_context.update(digest(&SHA256, content).as_ref());
+    let content_digest = format!("sha256:{}", digest_hex(content_context.finish().as_ref()));
+
+    let mut identity_context = Context::new(&SHA256);
+    identity_context.update(b"THRN-RECEIPT-IDENTITY-V5\0");
+    for field in [
+        agent.as_bytes(),
+        scope.as_bytes(),
+        layout.as_bytes(),
+        root_text.as_bytes(),
+    ] {
+        digest_field(&mut identity_context, field);
+    }
+    identity_context.update(&root_identity.0.to_be_bytes());
+    identity_context.update(&root_identity.1.to_be_bytes());
+    digest_field(&mut identity_context, agent.as_bytes());
+    digest_field(&mut identity_context, b"uncharted");
+    let receipt_name = format!("v5-{}.json", digest_hex(identity_context.finish().as_ref()));
+
+    let mut receipt = serde_json::json!({
+        "schemaVersion": 5,
+        "destinationLayout": layout,
+        "catalogResourceId": "uncharted",
+        "skillName": "uncharted-ideation",
+        "agent": agent,
+        "scope": scope,
+        "destination": destination.to_string_lossy(),
+        "installedAtUnixSeconds": 1,
+        "sourceOwner": "Example-Org",
+        "sourceRepository": "catalog-test-fixtures",
+        "sourceCommit": "2f68bee292a8c68346b4294fb31d9563eefe1ade",
+        "sourceDirectory": "skills/uncharted-ideation",
+        "resourceVersion": "1.0.0",
+        "installedDirectoryIdentity": {
+            "volume": destination_identity.0,
+            "object": destination_identity.1
+        },
+        "directories": [],
+        "files": [{
+            "path": "SKILL.md",
+            "byteCount": content.len(),
+            "sha256": format!("sha256:{}", sha256_hex(content))
+        }],
+        "fileCount": 1,
+        "byteCount": content.len(),
+        "contentDigest": content_digest
+    });
+    if scope == "project" {
+        receipt["canonicalProjectRoot"] = serde_json::json!(root_text);
+        receipt["projectRootIdentity"] = serde_json::json!({
+            "volume": root_identity.0,
+            "object": root_identity.1
+        });
+    } else {
+        receipt["canonicalScopeRoot"] = serde_json::json!(root_text);
+        receipt["scopeRootIdentity"] = serde_json::json!({
+            "volume": root_identity.0,
+            "object": root_identity.1
+        });
+    }
+    let receipts = receipt_directory(directory);
+    fs::create_dir_all(&receipts).expect("adapter receipt storage");
+    let lock = receipts.join(".writer.lock");
+    if !lock.exists() {
+        fs::write(lock, []).expect("persistent adapter writer lock");
+    }
+    let path = receipts.join(receipt_name);
+    fs::write(
+        &path,
+        serde_json::to_vec(&receipt).expect("adapter receipt JSON"),
+    )
+    .expect("write adapter receipt");
+    path
+}
+
 fn receipt_json(project_root: &str, resource_id: &str, skill_name: &str, identity: u64) -> Vec<u8> {
     let content = b"abc";
     let file_digest = digest(&SHA256, content);
@@ -558,6 +679,147 @@ fn skills_check_user_scope_is_offline_read_only_and_uses_the_isolated_home() {
     assert!(!directory.root().join(".agents").exists());
     assert!(!data_directory(&directory).exists());
     assert!(!directory.root().join("thrn-cache").exists());
+}
+
+#[test]
+fn cursor_and_gemini_checks_are_offline_read_only_for_project_and_user_scopes() {
+    for agent in ["cursor", "gemini"] {
+        for scope in ["project", "user"] {
+            let directory = TestDir::new();
+            let before = recursive_snapshot(directory.root());
+            let output = command_in(
+                &directory,
+                &["skills", "check", "--agent", agent, "--scope", scope],
+            )
+            .output()
+            .expect("compiled check runs with network unavailable");
+
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "agent={agent} scope={scope}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.contains(&format!("Agent: {agent}")));
+            if scope == "user" {
+                assert!(stdout.contains("Scope: user"));
+            } else {
+                assert!(stdout.contains(&format!("Project: {}", directory.path().display())));
+            }
+            assert!(stdout.contains("no network request was made"));
+            assert!(stdout.contains(&format!(
+                "No THRN-managed {agent} {scope} skills are recorded"
+            )));
+            assert!(output.stderr.is_empty());
+            assert_eq!(recursive_snapshot(directory.root()), before);
+            assert!(!directory.root().join(".cursor").exists());
+            assert!(!directory.root().join(".gemini").exists());
+            assert!(!directory.root().join(".agents").exists());
+            assert!(!data_directory(&directory).exists());
+            assert!(!directory.root().join("thrn-cache").exists());
+        }
+    }
+}
+
+#[test]
+fn cursor_and_gemini_compiled_cli_lifecycles_are_scoped_and_receipt_backed() {
+    for agent in ["cursor", "gemini"] {
+        for scope in ["project", "user"] {
+            let directory = TestDir::new();
+            write_cache(
+                &directory,
+                include_bytes!("fixtures/catalog/test-only-valid-v1.json"),
+            );
+            let destination = if scope == "project" {
+                directory
+                    .path()
+                    .join(if agent == "cursor" {
+                        ".cursor"
+                    } else {
+                        ".gemini"
+                    })
+                    .join("skills/uncharted-ideation")
+            } else {
+                directory
+                    .root()
+                    .join(if agent == "cursor" {
+                        ".cursor"
+                    } else {
+                        ".gemini"
+                    })
+                    .join("skills/uncharted-ideation")
+            };
+            let receipt = write_adapter_receipt(&directory, agent, scope);
+
+            let listing = command_in(&directory, &["skills", "list", "--installed"])
+                .output()
+                .expect("compiled installed listing starts");
+            assert_eq!(listing.status.code(), Some(0));
+            let listing_stdout = String::from_utf8_lossy(&listing.stdout);
+            assert!(listing_stdout.contains(&format!("Agent: {agent}")));
+            assert!(listing_stdout.contains(&format!("Scope: {scope}")));
+            assert!(listing_stdout.contains(&destination.display().to_string()));
+            assert!(listing_stdout.contains("current content integrity: not checked"));
+            assert!(listing.stderr.is_empty());
+
+            let mut check_args = vec!["skills", "check", "--agent", agent];
+            if scope == "user" {
+                check_args.extend(["--scope", "user"]);
+            }
+            let before_check = recursive_snapshot(directory.root());
+            let check = command_in(&directory, &check_args)
+                .output()
+                .expect("compiled adapter check starts with network disabled");
+            assert_eq!(check.status.code(), Some(0));
+            let check_stdout = String::from_utf8_lossy(&check.stdout);
+            assert!(check_stdout.contains(&format!("Agent: {agent}")));
+            assert!(check_stdout.contains("Status: Up to date"));
+            assert!(check_stdout.contains("no network request was made"));
+            assert!(check.stderr.is_empty());
+            assert_eq!(recursive_snapshot(directory.root()), before_check);
+
+            let mut update_args = vec!["skills", "update", "uncharted", "--agent", agent];
+            if scope == "user" {
+                update_args.extend(["--scope", "user"]);
+            }
+            let update = command_in(&directory, &update_args)
+                .output()
+                .expect("compiled adapter same-pin update starts");
+            assert_eq!(
+                update.status.code(),
+                Some(0),
+                "agent={agent} scope={scope}: {}",
+                String::from_utf8_lossy(&update.stderr)
+            );
+            let update_stdout = String::from_utf8_lossy(&update.stdout);
+            assert!(update_stdout.contains("Already up to date"));
+            assert!(update_stdout.contains(&format!("Agent: {agent}")));
+            assert!(update.stderr.is_empty());
+
+            let mut remove_args = vec!["skills", "remove", "uncharted", "--agent", agent];
+            if scope == "user" {
+                remove_args.extend(["--scope", "user"]);
+            }
+            let remove = command_in(&directory, &remove_args)
+                .output()
+                .expect("compiled adapter removal starts");
+            assert_eq!(
+                remove.status.code(),
+                Some(0),
+                "agent={agent} scope={scope}: {}",
+                String::from_utf8_lossy(&remove.stderr)
+            );
+            let remove_stdout = String::from_utf8_lossy(&remove.stdout);
+            assert!(remove_stdout.contains("Removed THRN skill"));
+            assert!(remove_stdout.contains(&format!("Agent: {agent}")));
+            assert!(remove_stdout.contains(&format!("Scope: {scope}")));
+            assert!(remove_stdout.contains("Ownership receipt: retired"));
+            assert!(remove.stderr.is_empty());
+            assert!(!destination.exists());
+            assert!(!receipt.exists());
+        }
+    }
 }
 
 #[test]
@@ -1427,7 +1689,7 @@ fn unsupported_agent_and_invalid_id_fail_without_success_output_or_project_write
             "install",
             "frontend",
             "--agent",
-            "cursor",
+            "unsupported-agent",
             "--dry-run",
         ],
     )
@@ -1472,7 +1734,7 @@ fn install_help_distinguishes_planning_from_installation() {
 }
 
 #[test]
-fn update_help_exposes_only_explicit_codex_project_options() {
+fn update_help_exposes_only_explicit_agent_project_options() {
     let output = run_cli(&["skills", "update", "--help"]);
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1493,7 +1755,13 @@ fn update_cli_reports_usage_and_runtime_failures_on_stderr_without_partial_stdou
     let directory = TestDir::new();
     let unsupported = command_in(
         &directory,
-        &["skills", "update", "uncharted", "--agent", "cursor"],
+        &[
+            "skills",
+            "update",
+            "uncharted",
+            "--agent",
+            "unsupported-agent",
+        ],
     )
     .output()
     .expect("CLI process starts");
@@ -1734,7 +2002,7 @@ fn version_comes_from_the_crate_metadata() {
 }
 
 #[test]
-fn doctor_reports_only_read_only_build_diagnostics() {
+fn doctor_reports_read_only_build_and_agent_cli_capabilities() {
     let output = run_cli(&["doctor"]);
 
     assert_eq!(output.status.code(), Some(0));
@@ -1747,8 +2015,44 @@ fn doctor_reports_only_read_only_build_diagnostics() {
         std::env::consts::ARCH
     )));
     assert!(stdout.contains("not a full target triple"));
-    assert!(stdout.contains("build metadata only"));
-    assert!(stdout.contains("no filesystem or network checks"));
+    assert!(stdout.contains("read-only PATH executable inspection"));
+    assert!(stdout.contains("no agent configuration or skill paths checked"));
+    assert!(stdout.contains("no network requests"));
+    assert!(stdout.contains("codex: not found"));
+    assert!(stdout.contains("claude-code: not found"));
+    assert!(stdout.contains("cursor: not found"));
+    assert!(stdout.contains("gemini: not found"));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn doctor_distinguishes_agent_binary_presence_from_skill_destination_loadability() {
+    let directory = TestDir::new();
+    let bin = directory.root().join("isolated-bin");
+    fs::create_dir(&bin).expect("isolated PATH directory");
+    #[cfg(windows)]
+    let gemini = bin.join("gemini.exe");
+    #[cfg(not(windows))]
+    let gemini = bin.join("gemini");
+    fs::write(&gemini, b"not executed by doctor").expect("fake Gemini executable");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&gemini, fs::Permissions::from_mode(0o755))
+            .expect("mark fake Gemini executable");
+    }
+
+    let output = command_in(&directory, &["doctor"])
+        .env("PATH", &bin)
+        .output()
+        .expect("compiled doctor starts");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("gemini: present"));
+    assert!(stdout.contains("cursor: not found"));
+    assert!(stdout.contains("PATH only; informational, not target selection"));
+    assert!(!directory.path().join(".gemini/skills").exists());
+    assert!(!directory.path().join(".cursor/skills").exists());
     assert!(output.stderr.is_empty());
 }
 

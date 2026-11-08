@@ -2,16 +2,15 @@
 
 ## Current exposure
 
-THRN is under development and has no supported package-manager release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, reads validated local catalog data, offers an explicit HTTPS catalog refresh, performs read-only local `SKILL.md` validation, lists validated receipt-backed installations, checks selected Codex or Claude Code project/user skills offline, and plans/installs or updates/removes exactly verified receipt-backed skills in either explicitly selected scope. Project scope remains the default. User scope is selected only with `--scope user`. Default discovery, both `skills list` modes, `skills check`, and `skills remove` never use the network. Explicit refresh contacts one fixed THRN-operated HTTPS endpoint, validates the response, and writes only the catalog cache. Install and update commands read the local catalog without refreshing it, then fetch the selected skill at its pinned public GitHub commit and validate it privately. Install/update dry-runs print plans without changing skill or receipt data. Both agents and scopes use the same commit, receipt, journal, lock, and recovery boundaries. No retrieved or installed content, script, or subprocess is executed. Installed listing reads only THRN's application-data receipt directory: it does not inspect agent skill folders, create receipt storage, fetch the catalog, open receipt-referenced destinations, or mutate recovery state. It labels current content integrity as unchecked and fails closed while lifecycle recovery is pending. See [the recovery protocol](recovery.md) for transaction and durability limits.
+THRN is under development and has no supported package-manager release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, reads validated local catalog data, offers an explicit HTTPS catalog refresh, performs read-only local `SKILL.md` validation, lists validated receipt-backed installations, checks selected Codex, Claude Code, Cursor, or Gemini CLI project/user skills offline, and plans/installs or updates/removes exactly verified receipt-backed skills in either explicitly selected scope. Project scope remains the default. User scope is selected only with `--scope user`. Default discovery, both `skills list` modes, `skills check`, and `skills remove` never use the network. Explicit refresh contacts one fixed THRN-operated HTTPS endpoint, validates the response, and writes only the catalog cache. Install and update commands read the local catalog without refreshing it, then fetch the selected skill at its pinned public GitHub commit and validate it privately. Install/update dry-runs print plans without changing skill or receipt data. All four agents and both scopes use the same commit, receipt, journal, lock, and recovery boundaries. No retrieved or installed content, script, or subprocess is executed. Installed listing reads only THRN's application-data receipt directory: it does not inspect agent skill folders, create receipt storage, fetch the catalog, open receipt-referenced destinations, or mutate recovery state. It labels current content integrity as unchecked and fails closed while lifecycle recovery is pending. See [the recovery protocol](recovery.md) for transaction and durability limits.
 
 ## Scope and operating-system paths
 
 `InstallScope` is a typed selection shared by install planning, install commit, read-only check,
 receipt lookup, update, removal, and recovery. Project remains the default and resolves the selected
-existing project (current directory unless `--project` is supplied). Codex uses
-`<project>/.agents/skills/<validated-skillName>` and `<home>/.agents/skills/<validated-skillName>`;
-Claude Code uses `<project>/.claude/skills/<validated-skillName>` and
-`<home>/.claude/skills/<validated-skillName>`. Explicit user scope resolves only the validated
+existing project (current directory unless `--project` is supplied). Codex uses `<project>/.agents/skills/<validated-skillName>` and
+`<home>/.agents/skills/<validated-skillName>`; Claude Code uses `.claude/skills`, Cursor uses
+`.cursor/skills`, and Gemini CLI uses `.gemini/skills`, each below the selected project or validated home. Explicit user scope resolves only the validated
 OS home; it does not use the working directory.
 `--scope user --project <path>` is rejected. The catalog resource ID remains separate from the
 validated skill directory name. No scope is inferred from an existing skill.
@@ -25,19 +24,43 @@ components are opened without following Unix symlinks or Windows reparse points.
 arbitrary destination override and does not fall back to another folder if the expected user skill
 root is unavailable.
 
-Codex user ownership uses schema-v3 receipts; Claude Code project and user ownership use schema-v4
-receipts that bind agent, scope, destination layout, root and destination identities, provenance,
-and the complete hash inventory. Existing Codex project schema-v1/v2 keys remain unchanged. Both
-agents and scopes use the same receipt store, OS-backed writer lock, install/remove/update journals,
+Codex user ownership uses schema-v3 receipts; Claude Code project/user ownership uses schema-v4;
+Cursor and Gemini CLI use schema-v5 receipts that bind agent, scope, destination layout, root and
+destination identities, provenance, and the complete hash inventory. Existing Codex project
+schema-v1/v2 keys remain unchanged. All agents and scopes use the same receipt store, OS-backed
+writer lock, install/remove/update journals,
 no-replace operations, object-specific cleanup intents, and recovery algorithms. Existing unmanaged
 skills and legacy command files are never adopted. `$CODEX_HOME/skills` is not a THRN destination.
-No agent auto-detection or destination migration is performed.
+Agent selection remains explicit. Read-only PATH capability inspection reports command-line executable presence only; it is not used for auto-selection and does not prove that an agent loads a destination. No destination migration is performed.
 
 Claude Code destinations are fixed to `.claude/skills` in the selected project or user home.
 `CLAUDE_CONFIG_DIR` is not treated as a skill-root override: official settings documentation says
 it relocates settings, session history, and plugins, but does not document relocation of standalone
 skills. THRN therefore continues to use `.claude/skills` and `~/.claude/skills`. The Claude adapter
 rejects host-reserved skill names, including `synced` and the `anthropic-skills` namespace.
+
+## Shared Cursor and Gemini discovery
+
+The official [Cursor skills documentation](https://cursor.com/docs/skills) and
+[customization help](https://cursor.com/help/customization/skills) document `.agents/skills`
+compatibility alongside `.cursor/skills`. Cursor's native user skill directory is used for cloud
+skill sync; shared `.agents/skills` is not automatically synced to Cursor Cloud Agents. Because the
+documentation does not establish same-name precedence, THRN fails closed on a shared same-name
+collision rather than choosing which copy Cursor loads.
+
+Gemini CLI's official [skills documentation](https://geminicli.com/docs/cli/skills/) and
+[repository](https://github.com/google-gemini/gemini-cli) document `.agents/skills` compatibility
+and precedence over `.gemini/skills` within the same discovery tier. THRN therefore rejects a native
+Gemini install when the same skill name already exists at `.agents/skills` in that selected scope.
+
+For either adapter, compatibility inspection is bounded, no-follow, read-only, and limited to the
+explicitly targeted skill name. It distinguishes an exact shared skill verified against a Codex
+receipt, unmanaged external content, and an absent shared path. A Codex-managed skill may already be
+discoverable by Cursor or Gemini, but its update and removal remain Codex-owned operations. THRN
+never adopts, overwrites, moves, links, clones, removes, or creates another receipt for shared
+content. The shared-path snapshot is checked before mutation and revalidated at commit; a changed
+shared directory fails closed. Visibility through another agent's root is not reported as THRN
+ownership by the selected agent.
 
 Path tests inject isolated `HOME`, `USERPROFILE`, platform data/cache variables, and THRN data roots.
 The CLI tests do not read or write the developer's real user skill directory.
@@ -46,7 +69,7 @@ The CLI tests do not read or write the developer's real user skill directory.
 
 `thrn skills check` compares receipts and installed trees for the selected agent and scope with the
 catalog selected by `CatalogService::discover()`. Codex remains the default when `--agent` is
-omitted; Claude Code requires `--agent claude-code`.
+omitted; other agents require their explicit `--agent` IDs. There is no interactive or automatic target selection.
 `--scope user` selects receipts rooted at the validated OS home. It uses a validated local cache when
 available and otherwise bundled metadata; stale cache data remains usable but is labeled stale.
 Bundled metadata and stale cache values are not claims about the latest GitHub state. The check
@@ -79,7 +102,7 @@ For each installation it reports the installed receipt SHA and local catalog SHA
 `skills check` exits `0` after a completed check even when an update is available or a resource is
 not cataloged. Integrity, filesystem, catalog, and recovery errors exit `1`; usage errors exit `2`.
 To perform an explicit update, review the finding and run
-`thrn skills update <canonical-id> --agent codex`. Update repeats receipt/tree checks and may fetch
+`thrn skills update <canonical-id> --agent <codex|claude-code|cursor|gemini>`. Update repeats receipt/tree checks and may fetch
 the exact locally pinned archive; check does neither.
 
 ## Current installation security boundaries
@@ -91,18 +114,18 @@ The enabled installation path follows these source and filesystem boundaries:
 - Catalog refresh is limited to `https://raw.githubusercontent.com/thrns/thrn/main/src/registry/builtin-v1.json`; require HTTPS certificate verification, reject redirects, use explicit timeouts, and enforce the 1 MiB limit while streaming. Validate UTF-8 and the full catalog schema before caching. This endpoint is curated by THRN, but HTTPS and catalog inclusion do not authenticate or establish the safety of individual skill publishers. Skill fetching uses public GitHub sources at exact, full commit hashes and independently validates source origin and immutable revision. A checksum from the same registry can detect accidental changes but does not prove publisher identity if that registry is compromised.
 - Bound network time, response size, archive size, expanded bytes, file count, per-file size, and path depth. Reject malformed metadata, absolute or traversal paths, drive/UNC prefixes, unsupported file types, case-fold collisions, and symlinks or hardlinks that escape the staging or target root.
 - Validate Agent Skills frontmatter and the skill directory/name relationship before installation, while preserving legitimate supporting files.
-- Treat an existing unreceipted target as externally managed. Never overwrite or recursively remove unrelated or user-modified paths. Install, update, and removal require explicit `--agent codex` or `--agent claude-code`; project is the default scope, and user scope requires explicit `--scope user`. Destination conflicts fail without overwrite.
+- Treat an existing unreceipted target as externally managed. Never overwrite or recursively remove unrelated or user-modified paths. Install, update, and removal require an explicit supported `--agent`; project is the default scope, and user scope requires explicit `--scope user`. Destination conflicts fail without overwrite.
 - Stage complete content near each destination and use atomic rename where the filesystem supports it. Multiple destinations are a recoverable sequence, not one cross-target atomic transaction. Write durable ownership receipts only after successful commits; preserve recovery state and report incomplete rollback.
 - Avoid logging credentials, tokens, environment secrets, private skill content, or unnecessary personal paths. The v1 public-source workflow should not require a GitHub token. Any future credential support needs an explicit design and redaction tests.
 - Make supply-chain claims proportionate to evidence. Pinned commits identify source revisions, not author identity. Stronger publisher authenticity requires a separately reviewed signing or attestation design; do not imply that TLS or a same-origin digest provides it.
 
 The removal path adds its own checks and has narrower authorization than a catalog install:
 
-- Require explicit `--agent codex` or `--agent claude-code`, an explicitly resolved scope, and an exact canonical resource ID from one
+- Require an explicit supported `--agent` and an explicitly resolved scope, and an exact canonical resource ID from one
   validated ownership receipt. Removal does not load catalog data, accept aliases, infer identity
   from `skillName`, or operate on unreceipted content.
 - Match the selected scope root and its recorded filesystem identity, receipt agent and
-  scope, and exact agent-specific destination (`.agents/skills` for Codex or `.claude/skills` for Claude Code). Open every path component
+  scope, and exact agent-specific native destination (`.agents/skills` for Codex, `.claude/skills` for Claude Code, `.cursor/skills` for Cursor, or `.gemini/skills` for Gemini CLI). Open every path component
   without following links/reparse points. Reject case-insensitive collisions, unexpected object
   types, duplicate filesystem identities, hard-linked files, missing/extra entries, changed bytes,
   and file hashes or lengths that differ from the receipt.
@@ -119,7 +142,7 @@ The removal path adds its own checks and has narrower authorization than a catal
 
 The update path has its own constraints:
 
-- Require an exact canonical resource ID and matching Codex project schema-v2/user schema-v3 or Claude schema-v4 receipt, with matching scope root, agent,
+- Require an exact canonical resource ID and matching Codex project schema-v2/user schema-v3, Claude schema-v4, or Cursor/Gemini schema-v5 receipt, with matching scope root, agent,
   scope, source owner/repository/directory, skill name, and installation-time destination identity.
   Do not refresh the catalog or accept caller-supplied URLs.
 - Verify every current object identity, file length, and SHA-256 against the receipt before fetching
@@ -143,7 +166,7 @@ transaction from substitutions. Proposed ADR-013 leaves the sufficiency of that 
 for independent architectural review. On Windows, the current secure handle layer cannot portably
 flush directory-entry metadata; a power loss can therefore leave rename/unlink durability uncertain.
 
-M2-03 implements read-only destination checks and an immutable proposal. M2-04 adds the initial Codex project directory commit; M2-05 adds post-commit ownership receipts and receipt-backed listing; M2-06 adds journaled recovery; M2-07 connects project install to `prepare_install_session()` and `commit_and_record()`. M3-01 adds receipt-backed removal, M3-02 adds verified update, and M3-03 adds offline read-only check. M3-04 extends the lifecycle to explicitly selected Codex user scope and centralizes OS path resolution. M3-05 adds Claude Code project/user support using the same engine. Aliases and unreceipted directories are not resolved or adopted, and no command refreshes the catalog implicitly. Codex project schema-v1/v2 and user schema-v3 receipts and identity formats remain unchanged; Claude uses strict schema v4. Lifecycle operations use separate versioned journals and report incomplete transactions without a success block. ADR-015 is approved; ADR-016 remains proposed pending independent architectural review. This documentation does not claim an accepted M3-05 design or supported package release.
+M2-03 implements read-only destination checks and an immutable proposal. M2-04 adds the initial Codex project directory commit; M2-05 adds post-commit ownership receipts and receipt-backed listing; M2-06 adds journaled recovery; M2-07 connects project install to `prepare_install_session()` and `commit_and_record()`. M3-01 adds receipt-backed removal, M3-02 adds verified update, and M3-03 adds offline read-only check. M3-04 extends the lifecycle to explicitly selected Codex user scope and centralizes OS path resolution. M3-05 adds Claude Code and M3-06 adds Cursor/Gemini project/user support using the same engine. Aliases and unreceipted directories are not resolved or adopted, and no command refreshes the catalog implicitly. Codex project schema-v1/v2 and user schema-v3 receipts and identity formats remain unchanged; Claude uses strict schema v4 and Cursor/Gemini use strict schema v5. Lifecycle operations use separate versioned journals and report incomplete transactions without a success block. ADR-015 and ADR-016 are approved; ADR-017 remains proposed pending independent architectural review. This documentation does not claim M3-06 architectural acceptance or a supported package release.
 
 ## Milestone status
 
@@ -273,9 +296,10 @@ Current implementation boundaries through M2-07:
   and never silently refreshes stale content.
 - **Listing boundary:** M1-05's catalog list reuses the validated local catalog selection and exact
   resolver. The installed list parses strict Codex project schema-v1/v2, Codex user schema-v3, and
-  Claude schema-v4 receipts from the OS application-data
+  Claude schema-v4 and Cursor/Gemini schema-v5 receipts from the OS application-data
   `receipts` directory. It treats missing or empty storage as no recorded installations and rejects
-  corrupt, unsupported, duplicated, conflicting, linked, nonregular, or unknown content. Listing
+  corrupt, unsupported, duplicated, conflicting, linked, nonregular, or unknown content. Schema-v5
+  identities keep Cursor and Gemini distinct from each other and existing agents. Listing
   creates no directories, writes no files, opens no referenced destination paths, and reports current
   file integrity as unchecked. It does not infer ownership from catalog data or agent folders.
 - **Archive boundary:** M2-01 applies the ZIP-only validation described above. The validator
@@ -294,15 +318,14 @@ Current implementation boundaries through M2-07:
   changed, missing, extra, linked or unsupported objects. CRC-32 here detects accidental or
   post-stage changes; it is not cryptographic authentication.
 - **Agent destination boundary:** M2-03 introduced the typed agent target and M3-04 added explicit
-  Codex user scope. M3-05 adds Claude Code using the same resolver and filesystem engine. The project
+  Codex user scope. M3-05 adds Claude Code and M3-06 adds Cursor and Gemini CLI using the same resolver and filesystem engine. The project
   root is the current directory unless `--project` selects another existing directory; the user
   root is the validated OS home and never comes from the working directory. THRN inspects the
-  selected agent directory (`.agents` or `.claude`), its `skills` child, and the selected skill
+  selected agent directory (`.agents`, `.claude`, `.cursor`, or `.gemini`), its `skills` child, and the selected skill
   entry without creating them or following destination symlinks. Inspected directory listings are
   bounded to 16,384 entries each. Non-directory components, symlinks/reparse points, exact target
   paths, and case-insensitive collisions become conflicts. Existing content is externally managed.
-  The destination uses validated `skillName`, not the catalog ID or alias. Claude Code follows the
-  fixed `.claude/skills` paths; THRN does not interpret `CLAUDE_CONFIG_DIR` as changing that location.
+  The destination uses validated `skillName`, not the catalog ID or alias. Claude Code follows `.claude/skills`; Cursor uses `.cursor/skills`; Gemini CLI uses `.gemini/skills`. THRN does not interpret `CLAUDE_CONFIG_DIR` as changing Claude skill locations. Cursor and Gemini shared-path compatibility is checked separately before native mutation.
 - **Immutable-plan boundary:** `src/install/plan.rs` is a pure builder over a validated staged
   inventory and a read-only destination snapshot. The plan retains canonical resource identity,
   actual skill name, pinned source identity, target selection, directories, files, expected sizes,
@@ -323,7 +346,7 @@ validated `StagedSkill`, its staged inventory and digests, and the corresponding
 the full commit operation. The session rejects mismatched catalog resource, skill name, source
 owner/repository/path/revision, target agent/scope, inventory, file list, or destination identity.
 The original M2-04 Codex adapter supported project scope only. M3-04 added explicitly selected
-Codex user scope, and M3-05 adds Claude Code project/user scope. Both use the validated catalog
+Codex user scope, M3-05 adds Claude Code, and M3-06 adds Cursor/Gemini project and user scope. All use the validated catalog
 `skillName`; IDs and aliases are never path components. The adapter does not auto-detect targets or
 write other-agent paths.
 
@@ -395,8 +418,9 @@ Remaining requirements:
 - **M3-03:** read-only `skills check` is implemented on local cache/bundled metadata and
   receipt/inventory verification paths; independent architectural review remains required.
 - **M3-04:** accepted at `43c5e5639a57c44346b17e91e2245e0591c0a3bb`; ADR-015 is approved.
-- **M3-05:** Claude Code project/user lifecycle is implemented on `feature/m3-claude-adapter`;
-  ADR-016 remains proposed. Independent architectural review, verification, and CI are required.
-- **Remaining M3:** other agents, JSON and noninteractive behavior.
+- **M3-05:** Claude Code project/user lifecycle was accepted at
+  `58f8fd962c7837bb5f1ca2fad965fbb5161ad897`; ADR-016 is approved.
+- **M3-06:** Cursor and Gemini CLI project/user lifecycle is implemented on `feature/m3-cursor-gemini`; schema-v5 receipts, schema-v4 lifecycle journals, shared-path collision checks, and offline capability inspection use the shared engine. ADR-017 remains proposed pending independent review and five-job CI.
+- **Remaining M3:** multi-agent targeting, JSON and noninteractive behavior.
 
 Security-sensitive parsing and writes require negative tests with hostile fixtures, isolated temporary directories, and deterministic network mocks. See the [roadmap](ROADMAP.md) and [repository security policy](../SECURITY.md) for project status.

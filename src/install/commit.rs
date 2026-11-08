@@ -14,6 +14,7 @@ use ring::{
 };
 use thiserror::Error;
 
+use crate::agents::AgentId;
 use crate::sources::staging::StagedSkill;
 
 use super::{
@@ -88,6 +89,7 @@ impl InstallationSession {
         receipt_faults: &dyn super::receipt_store::ReceiptFaultInjector,
         journal_faults: &dyn JournalFaultInjector,
     ) -> Result<super::receipt::InstallationReceipt, InstallationCompletionError> {
+        validate_shared_path_snapshot(&self.plan).map_err(InstallationCompletionError::Commit)?;
         let project_identity = self
             .plan
             .destination_snapshot()
@@ -291,6 +293,10 @@ pub(crate) enum CommitError {
     DestinationChanged,
     #[error("the selected agent destination has an existing or case-insensitive collision")]
     DestinationConflict,
+    #[error("a same-named skill is already present through the shared .agents/skills path")]
+    SharedPathCollision,
+    #[error("the shared .agents/skills path changed after installation planning")]
+    SharedPathChanged,
     #[error("this platform does not provide the required safe no-replace directory commit")]
     UnsupportedPlatform,
     #[error(
@@ -357,6 +363,7 @@ fn commit_session_inner(
         })?;
 
     let snapshot = session.plan.destination_snapshot();
+    validate_shared_path_snapshot(&session.plan)?;
     let current = inspect_destination_for_agent(
         session.plan.agent(),
         Some(session.plan.scope_root()),
@@ -677,6 +684,16 @@ fn commit_session_inner(
         ));
     }
 
+    if let Err(error) = validate_shared_path_snapshot(&session.plan) {
+        let cleanup_errors = cleanup_failed_commit(
+            &mut created_parents,
+            Some(&mut temp),
+            faults,
+            recovery_cleanup_required,
+        );
+        return Err(with_cleanup(error, cleanup_errors));
+    }
+
     if let Err(error) = faults
         .before(InstallOperation::CommitNoReplace)
         .and_then(|()| {
@@ -764,6 +781,17 @@ fn validate_session_identity(session: &InstallationSession) -> Result<(), Commit
         || inventory.skill_name() != plan.skill_name()
         || inventory.revision() != plan.source_commit()
         || plan.destination_snapshot().agent() != plan.agent()
+        || plan.agent().adapter().discovers_shared_agents_skills()
+            != plan.shared_path_snapshot().is_some()
+        || plan.shared_path_snapshot().is_some_and(|shared| {
+            shared.agent() != AgentId::Codex
+                || shared.project_root() != plan.scope_root()
+                || shared.destination()
+                    != AgentId::Codex
+                        .adapter()
+                        .skills_root(plan.scope_root().to_path_buf())
+                        .join(plan.skill_name().as_str())
+        })
         || plan.destination() != expected_destination
         || !plan.destination().starts_with(plan.scope_root())
         || inventory.total_bytes() != plan.total_file_bytes()
@@ -797,6 +825,29 @@ fn validate_session_identity(session: &InstallationSession) -> Result<(), Commit
         {
             return Err(CommitError::IdentityMismatch);
         }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_shared_path_snapshot(plan: &InstallPlan) -> Result<(), CommitError> {
+    let Some(expected) = plan.shared_path_snapshot() else {
+        return Ok(());
+    };
+    if !plan.shared_path_conflicts().is_empty() {
+        return Err(CommitError::SharedPathCollision);
+    }
+    let current = inspect_destination_for_agent(
+        AgentId::Codex,
+        Some(plan.scope_root()),
+        plan.scope_root(),
+        plan.skill_name().as_str(),
+    )
+    .map_err(|_| CommitError::SharedPathChanged)?;
+    if !expected.same_shared_path_state(&current)
+        || current.skill_state() != ComponentState::Missing
+        || !current.conflicts().is_empty()
+    {
+        return Err(CommitError::SharedPathChanged);
     }
     Ok(())
 }

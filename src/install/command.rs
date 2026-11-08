@@ -51,6 +51,8 @@ pub(crate) enum InstallCommandError {
         "an existing skill at this destination is not recorded as THRN-managed; it was left unchanged"
     )]
     ExistingUnmanagedSkill,
+    #[error("{0}")]
+    SharedPathCollision(String),
     #[error("THRN receipt store operation failed: {0}")]
     ReceiptStore(#[source] super::receipt_store::ReceiptStoreError),
     #[error(transparent)]
@@ -109,13 +111,22 @@ pub(crate) fn prepare_install_session<T: GithubTransport + ?Sized>(
         current_directory,
         staged.skill_name().as_str(),
     )?;
-    let plan = build_install_plan_for_agent_scope(
+    let mut plan = build_install_plan_for_agent_scope(
         &staged,
         &inventory,
         destination,
         agent,
         InstallScope::Project,
     )?;
+    if agent.adapter().discovers_shared_agents_skills() {
+        let shared = inspect_destination_for_agent(
+            AgentId::Codex,
+            Some(plan.scope_root()),
+            plan.scope_root(),
+            plan.skill_name().as_str(),
+        )?;
+        plan.set_shared_path_snapshot(shared);
+    }
     Ok(InstallationSession::new(staged, inventory, plan))
 }
 
@@ -144,13 +155,22 @@ pub(crate) fn prepare_install_session_in_scope<T: GithubTransport + ?Sized>(
         scope.root(),
         staged.skill_name().as_str(),
     )?;
-    let plan = build_install_plan_for_agent_scope(
+    let mut plan = build_install_plan_for_agent_scope(
         &staged,
         &inventory,
         destination,
         scope.agent(),
         scope.scope(),
     )?;
+    if agent.adapter().discovers_shared_agents_skills() {
+        let shared = inspect_destination_for_agent(
+            AgentId::Codex,
+            Some(scope.root()),
+            scope.root(),
+            staged.skill_name().as_str(),
+        )?;
+        plan.set_shared_path_snapshot(shared);
+    }
     Ok(InstallationSession::new(staged, inventory, plan))
 }
 
@@ -158,6 +178,8 @@ fn parse_agent(value: &str) -> Result<InstallAgent, InstallCommandError> {
     match value {
         "codex" => Ok(AgentId::Codex),
         "claude-code" => Ok(AgentId::ClaudeCode),
+        "cursor" => Ok(AgentId::Cursor),
+        "gemini" => Ok(AgentId::Gemini),
         _ => Err(InstallCommandError::UnsupportedAgent(value.to_owned())),
     }
 }
@@ -472,7 +494,7 @@ mod tests {
         ))
         .expect("catalog");
         for (id, agent, expected) in [
-            ("uncharted", "cursor", "unsupported agent"),
+            ("uncharted", "unsupported-agent", "unsupported agent"),
             ("bad--id", "codex", "invalid skill identifier"),
         ] {
             let error = prepare_install_plan(

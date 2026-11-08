@@ -99,6 +99,8 @@ pub struct InstallPlan {
     total_file_bytes: u64,
     conflicts: Vec<DestinationConflict>,
     destination_snapshot: DestinationSnapshot,
+    shared_path_snapshot: Option<DestinationSnapshot>,
+    shared_path_conflicts: Vec<DestinationConflict>,
 }
 
 impl InstallPlan {
@@ -168,6 +170,21 @@ impl InstallPlan {
 
     pub fn destination_snapshot(&self) -> &DestinationSnapshot {
         &self.destination_snapshot
+    }
+
+    pub(crate) fn shared_path_snapshot(&self) -> Option<&DestinationSnapshot> {
+        self.shared_path_snapshot.as_ref()
+    }
+
+    pub(crate) fn shared_path_conflicts(&self) -> &[DestinationConflict] {
+        &self.shared_path_conflicts
+    }
+
+    pub(crate) fn set_shared_path_snapshot(&mut self, snapshot: DestinationSnapshot) {
+        self.shared_path_conflicts = snapshot.conflicts().to_vec();
+        self.conflicts
+            .extend(self.shared_path_conflicts.iter().cloned());
+        self.shared_path_snapshot = Some(snapshot);
     }
 }
 
@@ -322,6 +339,8 @@ pub(crate) fn build_install_plan_for_agent_scope(
         total_file_bytes,
         conflicts: destination.conflicts().to_vec(),
         destination_snapshot: destination,
+        shared_path_snapshot: None,
+        shared_path_conflicts: Vec::new(),
     })
 }
 

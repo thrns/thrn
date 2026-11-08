@@ -37,6 +37,7 @@ use super::receipt_store::{ReceiptFaultInjector, ReceiptStore, WriterLock};
 const PROJECT_UPDATE_JOURNAL_SCHEMA_VERSION: u64 = 1;
 const USER_UPDATE_JOURNAL_SCHEMA_VERSION: u64 = 2;
 const CLAUDE_UPDATE_JOURNAL_SCHEMA_VERSION: u64 = 3;
+const ADAPTER_UPDATE_JOURNAL_SCHEMA_VERSION: u64 = 4;
 const MAX_UPDATE_JOURNAL_BYTES: usize = 12 * 1024 * 1024;
 const MAX_UPDATE_JOURNAL_FILES: usize = 16_384;
 const MAX_UPDATE_JOURNAL_TOTAL_BYTES: u64 = 384 * 1024 * 1024;
@@ -303,6 +304,8 @@ pub(crate) fn prepare_update_in_scope<T: GithubTransport + ?Sized>(
     let selected_agent = match agent {
         "codex" => crate::agents::AgentId::Codex,
         "claude-code" => crate::agents::AgentId::ClaudeCode,
+        "cursor" => crate::agents::AgentId::Cursor,
+        "gemini" => crate::agents::AgentId::Gemini,
         _ => return Err(UpdateError::UnsupportedAgent),
     };
     if selected_agent != scope.agent() {
@@ -360,13 +363,57 @@ pub(crate) fn prepare_update_in_scope<T: GithubTransport + ?Sized>(
             "the selected project, agent, scope, or destination differs from the recorded installation".to_owned(),
         ));
     }
-    let replacement = build_update_install_plan_for_agent_scope(
+    let mut replacement = build_update_install_plan_for_agent_scope(
         &staged,
         &inventory,
         destination,
         scope.agent(),
         scope.scope(),
     )?;
+    if scope.agent().adapter().discovers_shared_agents_skills() {
+        let shared = super::destination::inspect_destination_for_agent(
+            crate::agents::AgentId::Codex,
+            Some(scope.root()),
+            scope.root(),
+            staged.skill_name().as_str(),
+        )?;
+        replacement.set_shared_path_snapshot(shared);
+        if !replacement.shared_path_conflicts().is_empty() {
+            let status = store
+                .inspect_shared_skill(
+                    scope.scope(),
+                    scope.root(),
+                    staged.skill_name().as_str(),
+                    replacement.shared_path_snapshot().ok_or_else(|| {
+                        UpdateError::Conflict("shared-path evidence is missing".to_owned())
+                    })?,
+                )
+                .map_err(|error| UpdateError::Store(error.to_string()))?;
+            let ownership = match status {
+                super::receipt_store::SharedSkillStatus::ManagedByCodex => {
+                    "A verified THRN-managed Codex skill may already be discoverable there; update/removal remain Codex-owned."
+                }
+                super::receipt_store::SharedSkillStatus::UnverifiedCodexReceipt => {
+                    "A Codex receipt exists but the shared tree does not verify; preserve it and resolve through Codex."
+                }
+                super::receipt_store::SharedSkillStatus::Unmanaged => {
+                    "The shared skill is unmanaged external content and remains untouched."
+                }
+                super::receipt_store::SharedSkillStatus::Absent
+                | super::receipt_store::SharedSkillStatus::ChangedSincePlanning => {
+                    "The shared path changed during inspection; it remains untouched."
+                }
+            };
+            let precedence = if scope.agent() == crate::agents::AgentId::Gemini {
+                "Gemini gives .agents/skills precedence over .gemini/skills."
+            } else {
+                "Cursor documents both paths but does not establish their same-name precedence."
+            };
+            return Err(UpdateError::Conflict(format!(
+                "update is blocked by same-named skill in shared .agents/skills; {precedence} {ownership}"
+            )));
+        }
+    }
     if !replacement.conflicts().is_empty() {
         return Err(UpdateError::Conflict(
             "destination parents contain an unexpected or ambiguous object".to_owned(),
@@ -610,21 +657,28 @@ impl UpdateRecord {
     fn validate(&self) -> Result<(), UpdateJournalError> {
         let user_scope = self.old_receipt.scope() == "user";
         let claude = self.old_receipt.agent() == "claude-code";
-        let expected_journal_schema = if claude {
+        let cursor_or_gemini = matches!(self.old_receipt.agent(), "cursor" | "gemini");
+        let expected_journal_schema = if cursor_or_gemini {
+            ADAPTER_UPDATE_JOURNAL_SCHEMA_VERSION
+        } else if claude {
             CLAUDE_UPDATE_JOURNAL_SCHEMA_VERSION
         } else if user_scope {
             USER_UPDATE_JOURNAL_SCHEMA_VERSION
         } else {
             PROJECT_UPDATE_JOURNAL_SCHEMA_VERSION
         };
-        let expected_receipt_schema = if claude {
+        let expected_receipt_schema = if cursor_or_gemini {
+            5
+        } else if claude {
             4
         } else if user_scope {
             3
         } else {
             2
         };
-        let expected_intent_schema = if claude {
+        let expected_intent_schema = if cursor_or_gemini {
+            5
+        } else if claude {
             4
         } else if user_scope {
             3
@@ -886,7 +940,9 @@ impl UpdateJournalStore {
         let directory = SecureDir::open_or_create_absolute(&self.directory)
             .map_err(|error| update_journal_io("create update journal storage", error))?;
         let operation_id = plan.operation_id.clone();
-        let schema_version = if plan.old.receipt().agent() == "claude-code" {
+        let schema_version = if matches!(plan.old.receipt().agent(), "cursor" | "gemini") {
+            ADAPTER_UPDATE_JOURNAL_SCHEMA_VERSION
+        } else if plan.old.receipt().agent() == "claude-code" {
             CLAUDE_UPDATE_JOURNAL_SCHEMA_VERSION
         } else if plan.old.receipt().scope() == "user" {
             USER_UPDATE_JOURNAL_SCHEMA_VERSION
@@ -1838,6 +1894,7 @@ fn drive_forward(
             }
             UpdateState::BackupRenamePending => {
                 let record = journal.record().clone();
+                ensure_adapter_shared_name_absent(&record.old_receipt)?;
                 let (_, _, skills) = open_update_parents(&record)?;
                 let stage = verify_stage_at(&skills, &record, &record.stage_name)?
                     .ok_or_else(|| "verified replacement stage is missing".to_owned())?;
@@ -1913,6 +1970,7 @@ fn drive_forward(
             }
             UpdateState::NewCommitPending => {
                 let record = journal.record().clone();
+                ensure_adapter_shared_name_absent(&record.old_receipt)?;
                 let (_, _, skills) = open_update_parents(&record)?;
                 verify_old_at(&skills, &record, &record.backup_name)?
                     .ok_or_else(|| "verified old installation backup is missing".to_owned())?;
@@ -2377,6 +2435,41 @@ fn complete_receipt_transition(
     journal
         .set_state(UpdateState::NewReceiptPublished)
         .map_err(|error| format!("new receipt is published but journal update failed: {error}"))
+}
+
+fn ensure_adapter_shared_name_absent(receipt: &InstallationReceipt) -> Result<(), String> {
+    let agent = crate::agents::AgentId::from_identifier(receipt.agent())
+        .ok_or_else(|| "update journal has an unsupported agent".to_owned())?;
+    if !agent.adapter().discovers_shared_agents_skills() {
+        return Ok(());
+    }
+    let scope = match receipt.scope() {
+        "project" => super::plan::InstallScope::Project,
+        "user" => super::plan::InstallScope::User,
+        _ => return Err("update receipt has an unsupported scope".to_owned()),
+    };
+    let root = receipt.root_path();
+    let shared = super::destination::inspect_destination_for_agent(
+        crate::agents::AgentId::Codex,
+        Some(&root),
+        &root,
+        receipt.skill_name(),
+    )
+    .map_err(|error| format!("could not recheck shared skill visibility: {error}"))?;
+    if shared.skill_state() != super::destination::ComponentState::Missing
+        || !shared.conflicts().is_empty()
+    {
+        let precedence = if agent == crate::agents::AgentId::Gemini {
+            "Gemini would load the shared .agents/skills copy before its native .gemini/skills copy"
+        } else {
+            "Cursor's documented precedence between shared and native copies is unclear"
+        };
+        return Err(format!(
+            "same-named shared skill appeared before update recovery; {precedence}; preserve the pending update and shared content"
+        ));
+    }
+    let _ = scope;
+    Ok(())
 }
 
 fn verify_receipt_file_matches(
@@ -3160,6 +3253,7 @@ mod tests {
 
     use crate::{
         install::{
+            check::{CheckStatus, classify},
             command::prepare_install_session,
             commit::InstallFaultInjector,
             journal::NoJournalFaults,
@@ -3256,6 +3350,29 @@ mod tests {
             session
                 .commit_and_record_at(&self.store, 100, &NoInstallFaults, &NoReceiptFaults)
                 .expect("install old Claude version")
+        }
+
+        fn install_old_adapter(
+            &self,
+            agent: InstallAgent,
+        ) -> crate::install::receipt::InstallationReceipt {
+            let scope = ResolvedScope::from_agent_validated(
+                agent,
+                InstallScope::Project,
+                self.project.clone(),
+            );
+            let session = super::super::command::prepare_install_session_in_scope(
+                &catalog(OLD_REVISION, "1.0.0"),
+                "uncharted",
+                agent.as_str(),
+                &scope,
+                &TestTransport,
+                &TestFactory(self.staging.clone()),
+            )
+            .expect("validated adapter install session");
+            session
+                .commit_and_record_at(&self.store, 100, &NoInstallFaults, &NoReceiptFaults)
+                .expect("install old adapter version")
         }
 
         fn user_scope(&self) -> ResolvedScope {
@@ -3829,6 +3946,88 @@ mod tests {
         assert!(!fixture.home.join("SKILL-WAS-EXECUTED").exists());
     }
 
+    #[test]
+    fn cursor_and_gemini_project_and_user_updates_use_v5_receipts() {
+        for agent in [InstallAgent::Cursor, InstallAgent::Gemini] {
+            let fixture = Fixture::new();
+            let scopes = [
+                ResolvedScope::from_agent_validated(
+                    agent,
+                    InstallScope::Project,
+                    fixture.project.clone(),
+                ),
+                ResolvedScope::from_agent_validated(
+                    agent,
+                    InstallScope::User,
+                    fixture.home.clone(),
+                ),
+            ];
+
+            for scope in &scopes {
+                let session = super::super::command::prepare_install_session_in_scope(
+                    &catalog(OLD_REVISION, "1.0.0"),
+                    "uncharted",
+                    agent.as_str(),
+                    scope,
+                    &TestTransport,
+                    &TestFactory(fixture.staging.clone()),
+                )
+                .expect("adapter install session");
+                let installed = session
+                    .commit_and_record_at(&fixture.store, 100, &NoInstallFaults, &NoReceiptFaults)
+                    .expect("adapter install");
+                assert_eq!(installed.schema_version(), 5);
+                assert_eq!(installed.agent(), agent.as_str());
+                assert!(
+                    installed
+                        .receipt_filename()
+                        .expect("v5 key")
+                        .starts_with("v5-")
+                );
+            }
+
+            for scope in &scopes {
+                let inspected = fixture.store.inspect_scope(scope).expect("offline check");
+                let findings = classify(&catalog(NEW_REVISION, "1.1.0"), inspected.installations);
+                assert_eq!(findings.len(), 1);
+                assert_eq!(findings[0].status(), CheckStatus::UpdateAvailable);
+
+                let plan = match prepare_update_in_scope(
+                    &catalog(NEW_REVISION, "1.1.0"),
+                    "uncharted",
+                    agent.as_str(),
+                    scope,
+                    &fixture.store,
+                    &TestTransport,
+                    &TestFactory(fixture.staging.clone()),
+                )
+                .expect("adapter update plan")
+                {
+                    UpdatePreparation::Ready(plan) => *plan,
+                    UpdatePreparation::AlreadyUpToDate(_) => panic!("different pin must update"),
+                };
+                let summary = fixture
+                    .store
+                    .update(&plan, &NoUpdateFaults)
+                    .expect("adapter update");
+                assert_eq!(summary.agent(), agent.as_str());
+                assert_eq!(summary.scope(), scope.scope().as_str());
+                let after = fixture.store.inspect_scope(scope).expect("updated check");
+                let findings = classify(&catalog(NEW_REVISION, "1.1.0"), after.installations);
+                assert_eq!(findings.len(), 1);
+                assert_eq!(findings[0].status(), CheckStatus::UpToDate);
+            }
+
+            let receipts = fixture.store.list().expect("updated adapter receipts");
+            assert_eq!(receipts.len(), 2);
+            assert!(receipts.iter().all(|receipt| {
+                receipt.agent() == agent.as_str()
+                    && receipt.schema_version() == 5
+                    && receipt.source_commit() == NEW_REVISION
+            }));
+        }
+    }
+
     struct NeverTransport;
     impl GithubTransport for NeverTransport {
         fn get(&self, _: &str) -> Result<GithubResponse, TransportError> {
@@ -3937,15 +4136,21 @@ mod tests {
         let fixture = Fixture::from_root(PathBuf::from(root), None);
         let user_scope = std::env::var_os("THRN_UPDATE_CRASH_SCOPE").is_some();
         let agent = std::env::var("THRN_UPDATE_CRASH_AGENT").unwrap_or_else(|_| "codex".into());
-        let plan = if agent == "claude-code" {
+        let plan = if let Some(agent_id) = crate::agents::AgentId::from_identifier(&agent)
+            .filter(|agent_id| *agent_id != crate::agents::AgentId::Codex)
+        {
             let scope = if user_scope {
                 ResolvedScope::from_agent_validated(
-                    InstallAgent::ClaudeCode,
+                    agent_id,
                     InstallScope::User,
                     fixture.home.clone(),
                 )
             } else {
-                fixture.claude_project_scope()
+                ResolvedScope::from_agent_validated(
+                    agent_id,
+                    InstallScope::Project,
+                    fixture.project.clone(),
+                )
             };
             match prepare_update_in_scope(
                 &catalog(NEW_REVISION, "1.1.0"),
@@ -3956,7 +4161,7 @@ mod tests {
                 &TestTransport,
                 &TestFactory(fixture.staging.clone()),
             )
-            .expect("prepare Claude crash update")
+            .expect("prepare adapter crash update")
             {
                 UpdatePreparation::Ready(plan) => *plan,
                 UpdatePreparation::AlreadyUpToDate(_) => panic!("new pin differs"),
@@ -4211,6 +4416,83 @@ mod tests {
     }
 
     #[test]
+    fn cursor_and_gemini_update_crashes_recover_only_the_selected_v5_receipt() {
+        for agent in [InstallAgent::Cursor, InstallAgent::Gemini] {
+            for operation in [
+                UpdateOperation::ReceiptBackupRename,
+                UpdateOperation::PublishReceipt,
+            ] {
+                let fixture = Fixture::new();
+                let old_adapter = fixture.install_old_adapter(agent);
+                assert_eq!(old_adapter.schema_version(), 5);
+
+                let status = Command::new(std::env::current_exe().expect("test executable"))
+                    .arg("--exact")
+                    .arg("install::update::tests::update_crash_child")
+                    .arg("--nocapture")
+                    .env(
+                        "THRN_UPDATE_CRASH_ROOT",
+                        fixture._parent.as_ref().expect("fixture root").path(),
+                    )
+                    .env("THRN_UPDATE_CRASH_AFTER", format!("{operation:?}"))
+                    .env("THRN_UPDATE_CRASH_AGENT", agent.as_str())
+                    .status()
+                    .expect("adapter update crash child starts");
+                assert_eq!(
+                    status.code(),
+                    Some(79),
+                    "agent={} op={operation:?}",
+                    agent.as_str()
+                );
+                assert!(fixture.store.list().is_err());
+
+                let journal_path = fs::read_dir(fixture.data.join("updates"))
+                    .expect("pending adapter update journal directory")
+                    .next()
+                    .expect("pending adapter journal")
+                    .expect("journal entry")
+                    .path();
+                let journal: serde_json::Value = serde_json::from_slice(
+                    &fs::read(journal_path).expect("adapter update journal bytes"),
+                )
+                .expect("adapter update journal JSON");
+                assert_eq!(journal["schemaVersion"], 4);
+                assert_eq!(journal["oldReceipt"]["schemaVersion"], 5);
+                assert_eq!(journal["oldReceipt"]["agent"], agent.as_str());
+                assert_eq!(journal["oldReceipt"]["scope"], "project");
+
+                let scope = ResolvedScope::from_agent_validated(
+                    agent,
+                    InstallScope::Project,
+                    fixture.project.clone(),
+                );
+                fixture
+                    .store
+                    .recover_scope_with_faults(&scope, &NoJournalFaults, &NoReceiptFaults)
+                    .unwrap_or_else(|error| {
+                        panic!("recover {} update {operation:?}: {error}", agent.as_str())
+                    });
+                fixture
+                    .store
+                    .recover_scope_with_faults(&scope, &NoJournalFaults, &NoReceiptFaults)
+                    .expect("adapter update recovery is idempotent");
+
+                let receipts = fixture
+                    .store
+                    .list()
+                    .expect("all adapter receipts recovered");
+                assert_eq!(receipts.len(), 1);
+                let updated = receipts
+                    .iter()
+                    .find(|receipt| receipt.agent() == agent.as_str())
+                    .expect("selected adapter receipt");
+                assert_eq!(updated.schema_version(), 5);
+                assert_eq!(updated.source_commit(), NEW_REVISION);
+            }
+        }
+    }
+
+    #[test]
     fn update_install_remove_listing_lock_contention_is_bounded_and_exclusive() {
         let fixture = Fixture::new();
         let old = fixture.install_old();
@@ -4268,6 +4550,110 @@ mod tests {
             .store
             .update(&plan, &NoUpdateFaults)
             .expect("update after release");
+    }
+
+    #[test]
+    fn cursor_and_gemini_updates_and_removals_share_the_os_writer_lock() {
+        for agent in [InstallAgent::Cursor, InstallAgent::Gemini] {
+            let fixture = Fixture::new();
+            let old = fixture.install_old_adapter(agent);
+            let scope = ResolvedScope::from_agent_validated(
+                agent,
+                InstallScope::Project,
+                fixture.project.clone(),
+            );
+            let plan = match prepare_update_in_scope(
+                &catalog(NEW_REVISION, "1.1.0"),
+                "uncharted",
+                agent.as_str(),
+                &scope,
+                &fixture.store,
+                &TestTransport,
+                &TestFactory(fixture.staging.clone()),
+            )
+            .expect("adapter update plan")
+            {
+                UpdatePreparation::Ready(plan) => *plan,
+                UpdatePreparation::AlreadyUpToDate(_) => panic!("new pin must differ"),
+            };
+            let lock_path = fixture.data.join("receipts/.writer.lock");
+            let ready_path = fixture.data.join("lock-ready");
+            let mut child = Command::new(std::env::current_exe().expect("test executable"))
+                .arg("--exact")
+                .arg("install::update::tests::update_lock_child")
+                .arg("--nocapture")
+                .env("THRN_UPDATE_LOCK_PATH", &lock_path)
+                .env("THRN_UPDATE_LOCK_READY", &ready_path)
+                .spawn()
+                .expect("adapter lock child starts");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !ready_path.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                ready_path.exists(),
+                "agent={} lock acquired",
+                agent.as_str()
+            );
+
+            assert!(fixture.store.update(&plan, &NoUpdateFaults).is_err());
+            assert!(matches!(
+                fixture.store.reserve(old.clone(), &NoReceiptFaults),
+                Err(ReceiptStoreError::BusyOrInterrupted)
+            ));
+            assert!(
+                fixture
+                    .store
+                    .remove_by_id_in_scope("uncharted", &scope, &NoRemovalFaults)
+                    .is_err()
+            );
+            let other_agent = if agent == InstallAgent::Cursor {
+                InstallAgent::Gemini
+            } else {
+                InstallAgent::Cursor
+            };
+            let other_scope = ResolvedScope::from_agent_validated(
+                other_agent,
+                InstallScope::Project,
+                fixture.project.clone(),
+            );
+            assert!(
+                fixture
+                    .store
+                    .remove_by_id_in_scope("uncharted", &other_scope, &NoRemovalFaults)
+                    .is_err()
+            );
+            assert!(old.destination_path().join("SKILL.md").is_file());
+            assert!(
+                !other_scope
+                    .root()
+                    .join(other_agent.adapter().skill_directory())
+                    .exists()
+            );
+            assert!(fixture.store.list().is_err());
+
+            let wait_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let status = loop {
+                if let Some(status) = child.try_wait().expect("poll adapter lock child") {
+                    break status;
+                }
+                if std::time::Instant::now() >= wait_deadline {
+                    let _ = child.kill();
+                    panic!("adapter lock child did not exit before deadline");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert!(status.success());
+            fixture
+                .store
+                .update(&plan, &NoUpdateFaults)
+                .unwrap_or_else(|error| panic!("agent={} update: {error}", agent.as_str()));
+            fixture
+                .store
+                .remove_by_id_in_scope("uncharted", &scope, &NoRemovalFaults)
+                .unwrap_or_else(|error| panic!("agent={} removal: {error}", agent.as_str()));
+            assert!(fixture.store.list().expect("receipts retired").is_empty());
+        }
     }
 
     #[test]
