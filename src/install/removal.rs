@@ -517,8 +517,9 @@ pub(super) fn resolve_project_root(
         .map_err(removal_io("resolve selected project"))?;
     let _secure = SecureDir::open_absolute(&canonical).map_err(|error| {
         RemovalError::Conflict(format!(
-            "project path contains an unsafe component ({})",
-            error.kind()
+            "project path contains an unsafe component ({}; os_error={:?})",
+            error.kind(),
+            error.raw_os_error()
         ))
     })?;
     Ok(canonical)
