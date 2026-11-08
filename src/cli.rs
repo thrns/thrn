@@ -1375,7 +1375,7 @@ mod install_tests {
         );
 
         let transport = FixtureTransport::archive();
-        let _error = fixture
+        let error = fixture
             .execute("uncharted", None, &transport)
             .expect_err("junction destination must not produce installation success");
         assert!(
