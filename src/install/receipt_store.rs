@@ -675,6 +675,10 @@ fn map_os_path_error(error: crate::os_paths::OsPathError) -> ReceiptStoreError {
         crate::os_paths::OsPathError::RelativeCacheOverride => {
             ReceiptStoreError::PathResolution("THRN_CACHE_DIR must be absolute".to_owned())
         }
+        #[cfg(windows)]
+        crate::os_paths::OsPathError::RelativePlatformDirectory { variable } => {
+            ReceiptStoreError::PathResolution(format!("{variable} must be absolute"))
+        }
         crate::os_paths::OsPathError::Io { action, kind } => {
             ReceiptStoreError::PathResolution(format!("could not {action} ({kind})"))
         }

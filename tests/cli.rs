@@ -60,6 +60,7 @@ fn command_in(directory: &TestDir, args: &[&str]) -> Command {
     command.env("XDG_CONFIG_HOME", directory.root().join("xdg-config"));
     command.env("XDG_DATA_HOME", directory.root().join("xdg-data"));
     command.env("XDG_CACHE_HOME", directory.root().join("xdg-cache"));
+    command.env("APPDATA", directory.root().join("app-data"));
     command.env("LOCALAPPDATA", directory.root().join("local-app-data"));
     command.env("THRN_CACHE_DIR", directory.root().join("thrn-cache"));
     command.env("THRN_DATA_DIR", directory.root().join("thrn-data"));
@@ -479,10 +480,15 @@ fn user_scope_rejects_project_path_and_unsafe_home_before_writing() {
     );
     assert_eq!(recursive_snapshot(directory.root()), before);
 
-    let invalid_home = command_in(&directory, &["skills", "check", "--scope", "user"])
-        .env("HOME", "relative-home")
-        .output()
-        .expect("compiled CLI starts");
+    #[cfg(windows)]
+    let mut invalid_home_command = command_in(&directory, &["skills", "check", "--scope", "user"]);
+    #[cfg(windows)]
+    invalid_home_command.env("USERPROFILE", "relative-home");
+    #[cfg(not(windows))]
+    let mut invalid_home_command = command_in(&directory, &["skills", "check", "--scope", "user"]);
+    #[cfg(not(windows))]
+    invalid_home_command.env("HOME", "relative-home");
+    let invalid_home = invalid_home_command.output().expect("compiled CLI starts");
     assert_eq!(invalid_home.status.code(), Some(1));
     assert!(invalid_home.stdout.is_empty());
     assert!(

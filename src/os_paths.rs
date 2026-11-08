@@ -18,32 +18,65 @@ pub(crate) struct OsPaths {
 
 impl OsPaths {
     pub(crate) fn for_system() -> Result<Self, OsPathError> {
-        let base = directories::BaseDirs::new().ok_or(OsPathError::DirectoryUnavailable)?;
-        let project = directories::ProjectDirs::from("im", "thrn", "thrn")
-            .ok_or(OsPathError::DirectoryUnavailable)?;
-
         #[cfg(windows)]
-        let user_home = std::env::var_os("USERPROFILE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| base.home_dir().to_path_buf());
+        {
+            let profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
+            let roaming = std::env::var_os("APPDATA")
+                .map(|value| absolute_environment_path("APPDATA", value))
+                .transpose()?;
+            let local = std::env::var_os("LOCALAPPDATA")
+                .map(|value| absolute_environment_path("LOCALAPPDATA", value))
+                .transpose()?;
+            let base = if profile.is_none() || roaming.is_none() || local.is_none() {
+                Some(directories::BaseDirs::new().ok_or(OsPathError::DirectoryUnavailable)?)
+            } else {
+                None
+            };
+            let user_home = profile
+                .or_else(|| base.as_ref().map(|dirs| dirs.home_dir().to_path_buf()))
+                .ok_or(OsPathError::DirectoryUnavailable)?;
+            let roaming = roaming
+                .or_else(|| base.as_ref().map(|dirs| dirs.config_dir().to_path_buf()))
+                .ok_or(OsPathError::DirectoryUnavailable)?;
+            let local = local
+                .or_else(|| base.as_ref().map(|dirs| dirs.cache_dir().to_path_buf()))
+                .ok_or(OsPathError::DirectoryUnavailable)?;
+            let app_fragment = Path::new("thrn").join("thrn");
+            let application_data_dir = std::env::var_os("THRN_DATA_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| roaming.join(&app_fragment).join("data"));
+            let catalog_cache_dir = std::env::var_os("THRN_CACHE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| local.join(&app_fragment).join("cache"));
+            return Ok(Self {
+                user_home,
+                application_config_dir: roaming.join(app_fragment).join("config"),
+                application_data_dir,
+                catalog_cache_dir,
+            });
+        }
+
         #[cfg(not(windows))]
-        let user_home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| base.home_dir().to_path_buf());
-
-        let application_data_dir = std::env::var_os("THRN_DATA_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| project.data_dir().to_path_buf());
-        let catalog_cache_dir = std::env::var_os("THRN_CACHE_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| project.cache_dir().to_path_buf());
-
-        Ok(Self {
-            user_home,
-            application_config_dir: project.config_dir().to_path_buf(),
-            application_data_dir,
-            catalog_cache_dir,
-        })
+        {
+            let base = directories::BaseDirs::new().ok_or(OsPathError::DirectoryUnavailable)?;
+            let project = directories::ProjectDirs::from("im", "thrn", "thrn")
+                .ok_or(OsPathError::DirectoryUnavailable)?;
+            let user_home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| base.home_dir().to_path_buf());
+            let application_data_dir = std::env::var_os("THRN_DATA_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| project.data_dir().to_path_buf());
+            let catalog_cache_dir = std::env::var_os("THRN_CACHE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| project.cache_dir().to_path_buf());
+            Ok(Self {
+                user_home,
+                application_config_dir: project.config_dir().to_path_buf(),
+                application_data_dir,
+                catalog_cache_dir,
+            })
+        }
     }
 
     pub(crate) fn user_home(&self) -> &Path {
@@ -78,6 +111,18 @@ impl OsPaths {
             catalog_cache_dir: PathBuf::new(),
         }
     }
+}
+
+#[cfg(windows)]
+fn absolute_environment_path(
+    variable: &'static str,
+    value: OsString,
+) -> Result<PathBuf, OsPathError> {
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(OsPathError::RelativePlatformDirectory { variable });
+    }
+    Ok(path)
 }
 
 /// Resolve the data-root aliases used by the existing receipt store without creating paths.
@@ -142,6 +187,9 @@ pub(crate) enum OsPathError {
     RelativeDataOverride,
     #[error("THRN_CACHE_DIR must be an absolute path")]
     RelativeCacheOverride,
+    #[cfg(windows)]
+    #[error("{variable} must be an absolute path")]
+    RelativePlatformDirectory { variable: &'static str },
     #[error("application data directory is unsafe")]
     UnsafeDataDirectory,
     #[error("could not {action} a THRN operating-system path ({kind})")]
