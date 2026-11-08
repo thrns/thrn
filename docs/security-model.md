@@ -2,7 +2,45 @@
 
 ## Current exposure
 
-THRN is under development and has no supported package-manager release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, reads validated local catalog data, offers an explicit HTTPS catalog refresh, performs read-only local `SKILL.md` validation, lists validated receipt-backed installations, plans/installs Codex project skills, and updates/removes exactly verified receipt-backed Codex project skills. Default discovery, both `skills list` modes, and `skills remove` never use the network. Explicit refresh contacts one fixed THRN-operated HTTPS endpoint, validates the response, and writes only the catalog cache. Install and update commands read the local catalog without refreshing it, then fetch the selected skill at its pinned public GitHub commit and validate it privately. Install/update dry-runs print plans without changing the project or receipt store. A real install uses the M2-04/M2-05/M2-06 commit, receipt, and recovery boundary. Update uses a distinct M3-02 journal and receipt transition. Both print success only after journal finalization. Removal validates a receipt and full current tree, then uses M3-01's separate removal journal, same-filesystem quarantine, and per-object cleanup intents. No retrieved or installed content, script, or subprocess is executed. Installed listing reads only THRN's application-data receipt directory: it does not inspect agent skill folders, create receipt storage, fetch the catalog, open receipt-referenced project paths, or mutate recovery state. It labels current content integrity as unchecked and fails closed while update/removal recovery is pending. See [the recovery protocol](recovery.md) for transaction and durability limits.
+THRN is under development and has no supported package-manager release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, reads validated local catalog data, offers an explicit HTTPS catalog refresh, performs read-only local `SKILL.md` validation, lists validated receipt-backed installations, checks Codex project skill updates offline, plans/installs Codex project skills, and updates/removes exactly verified receipt-backed Codex project skills. Default discovery, both `skills list` modes, `skills check`, and `skills remove` never use the network. Explicit refresh contacts one fixed THRN-operated HTTPS endpoint, validates the response, and writes only the catalog cache. Install and update commands read the local catalog without refreshing it, then fetch the selected skill at its pinned public GitHub commit and validate it privately. Install/update dry-runs print plans without changing the project or receipt store. A real install uses the M2-04/M2-05/M2-06 commit, receipt, and recovery boundary. Update uses a distinct M3-02 journal and receipt transition. Both print success only after journal finalization. Removal validates a receipt and full current tree, then uses M3-01's separate removal journal, same-filesystem quarantine, and per-object cleanup intents. No retrieved or installed content, script, or subprocess is executed. Installed listing reads only THRN's application-data receipt directory: it does not inspect agent skill folders, create receipt storage, fetch the catalog, open receipt-referenced project paths, or mutate recovery state. It labels current content integrity as unchecked and fails closed while lifecycle recovery is pending. See [the recovery protocol](recovery.md) for transaction and durability limits.
+
+## Read-only update checking
+
+`thrn skills check` compares the selected project's THRN receipts and installed Codex skill trees
+with the catalog selected by `CatalogService::discover()`. It uses a validated local cache when
+available and otherwise bundled metadata; stale cache data remains usable but is labeled stale.
+Bundled metadata and stale cache values are not claims about the latest GitHub state. The check
+never refreshes the catalog, sends network requests, stages GitHub content, executes skill files,
+starts lifecycle transactions, or attempts recovery. It creates no application-data directory or
+lock file and leaves project, receipt, and journal contents unchanged. It may temporarily acquire
+the existing OS-backed receipt-store lock. An active writer, pending install/remove/update journal,
+corrupt or unsafe receipt storage, or invalid catalog data prevents a trustworthy result and
+returns an error. A modified or structurally unsafe project installation is reported as an
+ineligible finding when its receipt metadata can be safely read.
+
+Check reads receipt metadata for storage validation but opens and verifies installed trees only
+for the selected canonical project. Results are ordered by canonical resource ID and skill name.
+For each installation it reports the installed receipt SHA and local catalog SHA when available:
+
+- **Up to date** means schema-v2 receipt identity and full tree verification succeed, catalog
+  identity fields match, and both pins are equal.
+- **Update available** means the v2 identity and full tree verify, resource ID, owner, repository,
+  source directory, and skill name match, and the local catalog pins a different full commit SHA.
+  A different SHA only means a different catalog-pinned revision; it does not establish Git
+  ancestry or commit chronology.
+- **Not in catalog** means the receipt's canonical ID has no exact entry in the selected catalog.
+- **Source mismatch** means the entry exists but its owner, repository, source directory, or skill
+  name changed. The automatic updater refuses that identity change.
+- **Legacy receipt** means a verified schema-v1 receipt has no installation-time destination
+  identity and cannot be used by the automatic updater.
+- **Modified or unsafe installation** means the receipt-backed destination identity, contents, or
+  structure did not verify. Such a finding is never eligible for automatic update.
+
+`skills check` exits `0` after a completed check even when an update is available or a resource is
+not cataloged. Integrity, filesystem, catalog, and recovery errors exit `1`; usage errors exit `2`.
+To perform an explicit update, review the finding and run
+`thrn skills update <canonical-id> --agent codex`. Update repeats receipt/tree checks and may fetch
+the exact locally pinned archive; check does neither.
 
 ## Current installation security boundaries
 
@@ -45,7 +83,7 @@ The update path has its own constraints:
   scope, source owner/repository/directory, skill name, and installation-time destination identity.
   Do not refresh the catalog or accept caller-supplied URLs.
 - Verify every current object identity, file length, and SHA-256 against the receipt before fetching
-  a newer source. Reject changed, extra, missing, linked, colliding, replaced, or ambiguous content,
+  a different catalog-pinned source. Reject changed, extra, missing, linked, colliding, replaced, or ambiguous content,
   schema-v1 receipts, repository transfers, and renamed sources.
 - Stage and verify the pinned replacement on the destination filesystem. Move the verified old tree
   to an operation-owned sibling backup with no-replace semantics, then commit the new tree with a
@@ -313,6 +351,8 @@ Remaining requirements:
   proposal. It uses a separate update journal, operation-owned old-directory and old-receipt
   backups, a no-replace receipt transition, and verified forward recovery. It preserves schema-v2
   destination identity and fails closed on schema-v1, modified, or ambiguous content.
-- **Remaining M3:** user scope, other agents, check command, JSON and noninteractive behavior.
+- **M3-03:** read-only `skills check` is implemented on the local cache/bundled metadata and
+  receipt/inventory verification paths; independent architectural review remains required.
+- **Remaining M3:** user scope, other agents, JSON and noninteractive behavior.
 
 Security-sensitive parsing and writes require negative tests with hostile fixtures, isolated temporary directories, and deterministic network mocks. See the [roadmap](ROADMAP.md) and [repository security policy](../SECURITY.md) for project status.

@@ -45,6 +45,18 @@ pub struct ReceiptStore {
     directory: PathBuf,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProjectInstallationInspection {
+    pub(crate) receipt: InstallationReceipt,
+    pub(crate) content: ReceiptContentState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProjectInspectionSnapshot {
+    pub(crate) project_root: PathBuf,
+    pub(crate) installations: Vec<ProjectInstallationInspection>,
+}
+
 impl ReceiptStore {
     pub fn for_system() -> Result<Self, ReceiptStoreError> {
         let data_directory = if let Some(path) = std::env::var_os("THRN_DATA_DIR") {
@@ -88,6 +100,69 @@ impl ReceiptStore {
                 .then_with(|| left.skill_name().cmp(right.skill_name()))
         });
         Ok(receipts)
+    }
+
+    /// Inspect only installations recorded for one existing project. The read reservation, when
+    /// present, is held while lifecycle journals, receipts, and selected project trees are read.
+    /// This path never creates storage and never invokes recovery.
+    pub(crate) fn inspect_project(
+        &self,
+        project: Option<&std::path::Path>,
+        current_directory: &std::path::Path,
+    ) -> Result<ProjectInspectionSnapshot, ReceiptStoreError> {
+        let project_root = super::removal::resolve_project_root(project, current_directory)
+            .map_err(|error| ReceiptStoreError::ProjectInspection(error.to_string()))?;
+        let Some(directory) = self.open_existing_directory()? else {
+            self.ensure_no_pending_operations()?;
+            return Ok(ProjectInspectionSnapshot {
+                project_root,
+                installations: Vec::new(),
+            });
+        };
+        let read_reservation = WriterLock::try_acquire_existing(directory.clone())?;
+        self.ensure_no_pending_operations()?;
+        let receipts = read_receipts(&directory, true)?;
+        if read_reservation.is_none() && !receipts.is_empty() {
+            return Err(ReceiptStoreError::WriterLockMissing);
+        }
+
+        let mut inspections = Vec::new();
+        for (_, receipt) in receipts {
+            if receipt.root_path() != project_root {
+                continue;
+            }
+            let content = if super::removal::verify_receipt_for_check(&receipt).is_ok() {
+                ReceiptContentState::Verified
+            } else {
+                ReceiptContentState::Modified
+            };
+            inspections.push(ProjectInstallationInspection { receipt, content });
+        }
+        if let Some(reservation) = read_reservation.as_ref() {
+            reservation.validate()?;
+        } else {
+            let current_directory = self
+                .open_existing_directory()?
+                .ok_or(ReceiptStoreError::SnapshotChanged)?;
+            if current_directory
+                .identity()
+                .map_err(|error| map_io("reidentify receipt storage", error))?
+                != directory
+                    .identity()
+                    .map_err(|error| map_io("identify receipt storage", error))?
+                || !current_directory
+                    .entries()
+                    .map_err(|error| map_io("recheck receipt storage", error))?
+                    .is_empty()
+            {
+                return Err(ReceiptStoreError::SnapshotChanged);
+            }
+        }
+        self.ensure_no_pending_operations()?;
+        Ok(ProjectInspectionSnapshot {
+            project_root,
+            installations: inspections,
+        })
     }
 
     /// Build a read-only removal plan from one exact canonical-ID receipt and its current tree.
@@ -2700,6 +2775,14 @@ pub enum ReceiptStoreError {
     DuplicateIdentity,
     #[error("receipt storage contains conflicting claims for the same Codex project destination")]
     DestinationConflict,
+    #[error(
+        "receipt storage has managed records but no persistent writer lock for a coherent read"
+    )]
+    WriterLockMissing,
+    #[error("receipt storage changed during read-only inspection; retry after writers are idle")]
+    SnapshotChanged,
+    #[error("selected project could not be inspected: {0}")]
+    ProjectInspection(String),
     #[error(
         "installation recovery is required before project changes can proceed; {operation_count} journal operation(s) remain"
     )]

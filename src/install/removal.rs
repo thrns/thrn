@@ -288,6 +288,47 @@ fn open_exact_directory(
         })
 }
 
+/// Reuse the removal ownership proof for read-only update inspection. Legacy receipts can prove
+/// their recorded project identity and inventory, but they lack the installation-time destination
+/// identity required by removal and update.
+pub(super) fn verify_receipt_for_check(receipt: &InstallationReceipt) -> Result<(), RemovalError> {
+    receipt.validate().map_err(|error| {
+        RemovalError::Conflict(format!("ownership receipt is invalid: {error}"))
+    })?;
+    let project = SecureDir::open_absolute(&receipt.root_path()).map_err(|error| {
+        RemovalError::Conflict(format!(
+            "project root is unavailable or unsafe ({})",
+            error.kind()
+        ))
+    })?;
+    if project
+        .identity()
+        .map_err(removal_io("identify project root"))?
+        != receipt.project_identity()
+    {
+        return Err(RemovalError::Conflict(
+            "canonical project path or filesystem identity differs from the receipt".to_owned(),
+        ));
+    }
+    let agents = open_exact_directory(&project, ".agents")?;
+    let skills = open_exact_directory(&agents, "skills")?;
+    let destination = open_exact_directory(&skills, receipt.skill_name())?;
+    let destination_identity = destination
+        .identity()
+        .map_err(removal_io("identify installed skill directory"))?;
+    if receipt
+        .installed_directory_identity()
+        .is_some_and(|identity| identity != destination_identity)
+    {
+        return Err(RemovalError::Conflict(
+            "installed directory identity differs from the installation-time receipt evidence"
+                .to_owned(),
+        ));
+    }
+    verify_inventory(receipt, destination)?;
+    Ok(())
+}
+
 pub(super) fn verify_inventory(
     receipt: &InstallationReceipt,
     root: SecureDir,

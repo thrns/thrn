@@ -1,3 +1,4 @@
+pub(crate) mod check;
 pub mod command;
 pub(crate) mod commit;
 pub mod destination;
