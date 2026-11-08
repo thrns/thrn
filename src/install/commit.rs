@@ -2375,15 +2375,7 @@ impl SecureDir {
         }
         self.ensure_current_path()?;
         let destination = self.path.join(new_name);
-        let result = rename_handle_noreplace(source, &destination);
-        #[cfg(test)]
-        if result.is_err() && std::env::var_os("THRN_DEBUG_WINDOWS_RENAME").is_some() {
-            eprintln!(
-                "Windows no-replace file rename failed: parent={:?} source={old_name:?} target={new_name:?}",
-                self.path
-            );
-        }
-        result
+        rename_handle_noreplace(source, &destination)
     }
 
     pub(super) fn rename_directory_child_noreplace(
@@ -2561,19 +2553,21 @@ fn rename_handle_noreplace(source: &fs::File, destination: &Path) -> io::Result<
         Foundation::HANDLE,
         Storage::FileSystem::{FILE_RENAME_INFO, FileRenameInfoEx, SetFileInformationByHandle},
     };
-    let wide = destination.as_os_str().encode_wide().collect::<Vec<_>>();
+    let mut wide = destination.as_os_str().encode_wide().collect::<Vec<_>>();
     let name_bytes = u32::try_from(wide.len().saturating_mul(size_of::<u16>()))
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target name too long"))?;
+    wide.push(0);
     let header_size = offset_of!(FILE_RENAME_INFO, FileName);
     let byte_len = header_size
-        .checked_add(name_bytes as usize)
+        .checked_add(wide.len().saturating_mul(size_of::<u16>()))
         .map(|len| len.max(size_of::<FILE_RENAME_INFO>()))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target name too long"))?;
     let words = byte_len.div_ceil(size_of::<usize>());
     let mut buffer = vec![0_usize; words];
     let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-    // SAFETY: The aligned buffer contains the fixed structure and complete UTF-16 path; the
-    // source handle remains live for the duration of the documented Win32 call.
+    // SAFETY: The aligned buffer contains the fixed structure and complete NUL-terminated UTF-16
+    // path; FileNameLength excludes the terminator, and the source handle remains live for the
+    // duration of the documented Win32 call.
     unsafe {
         ptr::write(
             info,

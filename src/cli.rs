@@ -1778,7 +1778,6 @@ mod install_tests {
             .env("THRN_M3_PAUSED_REMOVE_CURRENT", &fixture.current)
             .env("THRN_M3_PAUSED_REMOVE_ENTERED", &entered)
             .env("THRN_M3_PAUSED_REMOVE_RELEASE", &release)
-            .env("THRN_DEBUG_WINDOWS_RENAME", "1")
             .spawn()
             .expect("launch removal-lock subprocess");
         let _release_on_drop = ReleaseRemovalOnDrop(release.clone());
@@ -1827,20 +1826,7 @@ mod install_tests {
             removal_result.as_ref().is_ok_and(|status| status.success()),
             "removal subprocess must complete after release; result={removal_result:?}"
         );
-        let listed = fixture.store().list();
-        #[cfg(windows)]
-        if listed.is_err() {
-            let names = fs::read_dir(fixture.data.join("removals"))
-                .map(|entries| {
-                    entries
-                        .filter_map(Result::ok)
-                        .map(|entry| entry.file_name())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            eprintln!("Windows removal journal objects after subprocess: {names:?}");
-        }
-        assert!(listed.expect("receipt retired").is_empty());
+        assert!(fixture.store().list().expect("receipt retired").is_empty());
         assert!(
             !fixture
                 .project
