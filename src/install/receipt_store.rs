@@ -24,6 +24,10 @@ use super::{
     receipt::{
         InstallationReceipt, MAX_RECEIPT_BYTES, MAX_RECEIPTS, ReceiptFile, ReceiptValidationError,
     },
+    removal::{
+        NoRemovalFaults, RemovalError, RemovalFaultInjector, RemovalJournalStore, RemovalPlan,
+        RemovalSummary,
+    },
 };
 
 const IO_CHUNK_BYTES: usize = 8 * 1024;
@@ -62,9 +66,11 @@ impl ReceiptStore {
     /// Read and validate all stored receipts without creating or changing any storage.
     pub fn list(&self) -> Result<Vec<InstallationReceipt>, ReceiptStoreError> {
         let Some(directory) = self.open_existing_directory()? else {
+            self.ensure_no_pending_removals()?;
             return Ok(Vec::new());
         };
         let allow_idle_lock = check_idle_writer_lock(&directory)?;
+        self.ensure_no_pending_removals()?;
         let receipts = read_receipts(&directory, allow_idle_lock)?;
         validate_unique_destinations(&receipts)?;
         let mut receipts = receipts
@@ -78,6 +84,71 @@ impl ReceiptStore {
                 .then_with(|| left.skill_name().cmp(right.skill_name()))
         });
         Ok(receipts)
+    }
+
+    /// Build a read-only removal plan from one exact canonical-ID receipt and its current tree.
+    pub(crate) fn plan_removal(
+        &self,
+        resource_id: &str,
+        project: Option<&std::path::Path>,
+        current_directory: &std::path::Path,
+    ) -> Result<RemovalPlan, RemovalError> {
+        let project_root = super::removal::resolve_project_root(project, current_directory)?;
+        let directory = self
+            .open_existing_directory()
+            .map_err(|error| RemovalError::Store(error.to_string()))?
+            .ok_or(RemovalError::MissingReceipt)?;
+        check_idle_writer_lock(&directory)
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+        self.ensure_no_pending_operations()
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+        let receipts = read_receipts(&directory, true)
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+        build_removal_plan(&directory, &receipts, resource_id, &project_root)
+    }
+
+    /// Recover an interrupted removal and then remove one exact receipt-backed installation.
+    pub(crate) fn remove_by_id(
+        &self,
+        resource_id: &str,
+        project: Option<&std::path::Path>,
+        current_directory: &std::path::Path,
+        faults: &dyn RemovalFaultInjector,
+    ) -> Result<RemovalSummary, RemovalError> {
+        let project_root = super::removal::resolve_project_root(project, current_directory)?;
+        let directory = self
+            .open_existing_directory()
+            .map_err(|error| RemovalError::Store(error.to_string()))?
+            .ok_or(RemovalError::MissingReceipt)?;
+        let mut lock = WriterLock::acquire(directory.clone(), &NoReceiptFaults)
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+        lock.validate()
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+
+        let install_journals = self
+            .journal_store()
+            .map_err(|error| RemovalError::Store(error.to_string()))?
+            .read_all()
+            .map_err(|error| RemovalError::Journal(error.to_string()))?;
+        if !install_journals.is_empty() {
+            return Err(RemovalError::Store(format!(
+                "{} interrupted installation journal operation(s) must be recovered first",
+                install_journals.len()
+            )));
+        }
+        let removal_store = self
+            .removal_journal_store()
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+        super::removal::recover_all(&removal_store, &directory, &lock, faults)?;
+        lock.validate()
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+        let receipts = read_receipts(&directory, true)
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+        let plan = build_removal_plan(&directory, &receipts, resource_id, &project_root)?;
+        let summary = super::removal::remove_plan(&plan, &removal_store, directory, &lock, faults)?;
+        lock.release()
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+        Ok(summary)
     }
 
     /// Reserve the receipt store before the internal project commit so concurrent processes
@@ -112,9 +183,15 @@ impl ReceiptStore {
                 .map_err(|error| ReceiptStoreError::Journal {
                     detail: error.to_string(),
                 })?;
-        if !journal_records.is_empty() {
+        let removal_count = self
+            .removal_journal_store()?
+            .pending_count()
+            .map_err(|error| ReceiptStoreError::Journal {
+                detail: error.to_string(),
+            })?;
+        if !journal_records.is_empty() || removal_count != 0 {
             return Err(ReceiptStoreError::RecoveryRequired {
-                operation_count: journal_records.len(),
+                operation_count: journal_records.len() + removal_count,
             });
         }
         let existing = read_receipts(&reservation.directory, true);
@@ -139,6 +216,50 @@ impl ReceiptStore {
             .parent()
             .ok_or(ReceiptStoreError::UnsafeDirectory)?;
         Ok(JournalStore::new(data_directory.join("operations")))
+    }
+
+    pub(crate) fn removal_journal_store(&self) -> Result<RemovalJournalStore, ReceiptStoreError> {
+        let data_directory = self
+            .directory
+            .parent()
+            .ok_or(ReceiptStoreError::UnsafeDirectory)?;
+        Ok(RemovalJournalStore::new(data_directory.join("removals")))
+    }
+
+    fn ensure_no_pending_operations(&self) -> Result<(), ReceiptStoreError> {
+        let install_count = self
+            .journal_store()?
+            .read_all()
+            .map_err(|error| ReceiptStoreError::Journal {
+                detail: error.to_string(),
+            })?
+            .len();
+        let removal_count = self
+            .removal_journal_store()?
+            .pending_count()
+            .map_err(|error| ReceiptStoreError::Journal {
+                detail: error.to_string(),
+            })?;
+        let operation_count = install_count + removal_count;
+        if operation_count != 0 {
+            return Err(ReceiptStoreError::RecoveryRequired { operation_count });
+        }
+        Ok(())
+    }
+
+    fn ensure_no_pending_removals(&self) -> Result<(), ReceiptStoreError> {
+        let removal_count = self
+            .removal_journal_store()?
+            .pending_count()
+            .map_err(|error| ReceiptStoreError::Journal {
+                detail: error.to_string(),
+            })?;
+        if removal_count != 0 {
+            return Err(ReceiptStoreError::RecoveryRequired {
+                operation_count: removal_count,
+            });
+        }
+        Ok(())
     }
 
     /// Internal startup/retry API. Recovery and installation share the same OS-backed writer lock.
@@ -180,6 +301,9 @@ impl ReceiptStore {
                     receipt_faults,
                 )?);
             }
+            let removal_store = self.removal_journal_store().map_err(RecoveryError::Store)?;
+            super::removal::recover_all(&removal_store, &directory, &lock, &NoRemovalFaults)
+                .map_err(|error| RecoveryError::Removal(error.to_string()))?;
             Ok(outcomes)
         })();
         match result {
@@ -261,6 +385,93 @@ fn resolve_data_directory(path: &std::path::Path) -> Result<PathBuf, ReceiptStor
     }
 }
 
+fn build_removal_plan(
+    directory: &SecureDir,
+    receipts: &[(String, InstallationReceipt)],
+    resource_id: &str,
+    project_root: &std::path::Path,
+) -> Result<RemovalPlan, RemovalError> {
+    use std::str::FromStr;
+
+    let requested = crate::models::catalog::SkillId::from_str(resource_id).map_err(|_| {
+        RemovalError::Conflict("resource ID is not a valid canonical catalog ID".to_owned())
+    })?;
+    if requested.as_str() != resource_id {
+        return Err(RemovalError::Conflict(
+            "resource ID must be the exact canonical catalog ID recorded in the receipt".to_owned(),
+        ));
+    }
+    let project_text = project_root.to_str().ok_or_else(|| {
+        RemovalError::Conflict("canonical project path is not valid UTF-8".to_owned())
+    })?;
+    let matches = receipts
+        .iter()
+        .filter(|(_, receipt)| {
+            receipt.catalog_resource_id() == requested.as_str()
+                && receipt.root_path() == project_root
+        })
+        .collect::<Vec<_>>();
+    let [(name, receipt)] = matches.as_slice() else {
+        if matches.is_empty() {
+            return Err(RemovalError::MissingReceipt);
+        }
+        return Err(RemovalError::Conflict(
+            "multiple ownership receipts claim this canonical resource and project".to_owned(),
+        ));
+    };
+    if receipt.agent() != "codex"
+        || receipt.scope() != "project"
+        || receipt.root_path().to_str() != Some(project_text)
+    {
+        return Err(RemovalError::Conflict(
+            "receipt agent, scope, or canonical project path differs from the selected target"
+                .to_owned(),
+        ));
+    }
+    let file = directory.open_regular_file(name).map_err(|error| {
+        RemovalError::Store(format!(
+            "could not open validated ownership receipt ({})",
+            error.kind()
+        ))
+    })?;
+    if SecureDir::hard_link_count(&file).map_err(|error| {
+        RemovalError::Store(format!(
+            "could not inspect ownership receipt links ({})",
+            error.kind()
+        ))
+    })? != 1
+    {
+        return Err(RemovalError::Conflict(
+            "ownership receipt is hard-linked and cannot be retired safely".to_owned(),
+        ));
+    }
+    let current_receipt = read_receipt_file(directory, name)
+        .map_err(|error| RemovalError::Store(error.to_string()))?;
+    if current_receipt != *receipt {
+        return Err(RemovalError::Conflict(
+            "ownership receipt changed while removal planning was in progress".to_owned(),
+        ));
+    }
+    let receipt_file_identity = SecureDir::file_identity(&file).map_err(|error| {
+        RemovalError::Store(format!(
+            "could not identify ownership receipt ({})",
+            error.kind()
+        ))
+    })?;
+    let receipt_directory_identity = directory.identity().map_err(|error| {
+        RemovalError::Store(format!(
+            "could not identify receipt storage ({})",
+            error.kind()
+        ))
+    })?;
+    RemovalPlan::verify(
+        (*receipt).clone(),
+        (*name).clone(),
+        receipt_directory_identity,
+        receipt_file_identity,
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum ReceiptOperation {
     CreateStore,
@@ -318,10 +529,20 @@ impl ReceiptReservation {
             committed.project_identity(),
             self.receipt.installed_at_unix_seconds(),
         )
+        .and_then(|receipt| {
+            receipt.with_installed_directory_identity(committed.destination_identity())
+        })
         .map_err(|source| validation_error("committed receipt", source))?;
-        if expected != self.receipt {
+        let reserved_intent = self.receipt.clone();
+        if expected
+            != reserved_intent
+                .clone()
+                .with_installed_directory_identity(committed.destination_identity())
+                .map_err(|source| validation_error("committed receipt", source))?
+        {
             return Err(ReceiptStoreError::CommittedIdentityMismatch);
         }
+        self.receipt = expected.clone();
         match verify_receipt_tree(&self.receipt, Some(committed.destination_identity()))? {
             ReceiptContentState::Verified => {}
             ReceiptContentState::Missing => return Err(ReceiptStoreError::CommittedContentMissing),
@@ -456,7 +677,7 @@ impl Drop for ReceiptReservation {
     }
 }
 
-struct WriterLock {
+pub(super) struct WriterLock {
     directory: SecureDir,
     file: fs::File,
     identity: FileIdentity,
@@ -503,7 +724,7 @@ impl WriterLock {
         Ok(lock)
     }
 
-    fn validate(&self) -> Result<(), ReceiptStoreError> {
+    pub(super) fn validate(&self) -> Result<(), ReceiptStoreError> {
         let current = self
             .directory
             .open_lock_file(WRITER_LOCK_NAME)
@@ -2208,6 +2429,8 @@ pub(crate) enum RecoveryError {
     Store(#[source] ReceiptStoreError),
     #[error("installation journal is invalid: {0}")]
     Journal(#[source] JournalError),
+    #[error("removal recovery is incomplete or conflicted: {0}")]
+    Removal(String),
     #[error(
         "operation {operation_id} conflicts with current filesystem or receipt state: {detail}; preserve the content and inspect it manually"
     )]
@@ -2449,7 +2672,14 @@ fn verify_receipt_tree(
     let Some(root) = open_directory_status(&skills, receipt.skill_name())? else {
         return Ok(ReceiptContentState::Missing);
     };
-    if expected_destination_identity.is_some_and(|identity| root.identity().ok() != Some(identity))
+    let current_destination_identity = root
+        .identity()
+        .map_err(|error| content_error("identify installed directory", error))?;
+    if receipt
+        .installed_directory_identity()
+        .is_some_and(|identity| identity != current_destination_identity)
+        || expected_destination_identity
+            .is_some_and(|identity| current_destination_identity != identity)
     {
         return Ok(ReceiptContentState::Modified);
     }
@@ -2822,7 +3052,7 @@ mod tests {
                 self.resume
                     .lock()
                     .map_err(|_| io::Error::other("writer-lock barrier poisoned"))?
-                    .recv()
+                    .recv_timeout(std::time::Duration::from_secs(15))
                     .map_err(|error| io::Error::other(error.to_string()))?;
             }
             Ok(())
@@ -2853,7 +3083,7 @@ mod tests {
                 self.resume
                     .lock()
                     .map_err(|_| io::Error::other("prepared-journal barrier poisoned"))?
-                    .recv()
+                    .recv_timeout(std::time::Duration::from_secs(15))
                     .map_err(|error| io::Error::other(error.to_string()))?;
             }
             Ok(())
@@ -3179,6 +3409,19 @@ mod tests {
         let receipt = session
             .commit_and_record_at(&store, 1_800_000_000, &NoInstallFaults, &NoReceiptFaults)
             .expect("commit and receipt");
+        assert!(
+            !receipt.is_legacy(),
+            "new installations use receipt schema v2"
+        );
+        assert_eq!(
+            receipt.installed_directory_identity(),
+            Some(
+                super::SecureDir::open_absolute(&receipt.destination_path())
+                    .expect("installed destination handle")
+                    .identity()
+                    .expect("committed destination identity")
+            )
+        );
         assert_eq!(receipt.catalog_resource_id(), "uncharted");
         assert_eq!(receipt.skill_name(), "uncharted-ideation");
         assert_eq!(
@@ -3190,6 +3433,114 @@ mod tests {
             store.verify_current_content(&receipt).expect("verify"),
             ReceiptContentState::Verified
         );
+    }
+
+    #[test]
+    fn identity_recording_failure_keeps_install_unmanaged_until_recovery_proves_it() {
+        let (_parent, project, staging, data) = setup();
+        let store = ReceiptStore::new(data.join("receipts"));
+        let result = session(&project, &staging).commit_and_record_at_with_journal(
+            &store,
+            1,
+            &NoInstallFaults,
+            &NoReceiptFaults,
+            &FailJournalAt(JournalOperation::SetDestinationIdentity),
+        );
+        assert!(matches!(
+            result,
+            Err(
+                crate::install::commit::InstallationCompletionError::JournalAfterDirectoryCommit(_)
+            )
+        ));
+        let destination = project.join(".agents/skills/uncharted-ideation");
+        assert!(destination.join("SKILL.md").is_file());
+        assert!(
+            store
+                .list()
+                .expect("legacy receipt is not published")
+                .is_empty()
+        );
+        let pending = store
+            .journal_store()
+            .expect("journal store")
+            .read_all()
+            .expect("journal");
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].receipt().is_legacy());
+        assert_eq!(pending[0].destination_identity(), None);
+
+        assert_eq!(
+            store
+                .recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults)
+                .expect("recovery captures the committed installation identity"),
+            vec![super::RecoveryOutcome::FinalizedReceipt]
+        );
+        let receipts = store.list().expect("recovered schema-v2 receipt");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            receipts[0].installed_directory_identity(),
+            Some(
+                super::SecureDir::open_absolute(&destination)
+                    .expect("destination handle")
+                    .identity()
+                    .expect("destination identity")
+            )
+        );
+    }
+
+    #[test]
+    fn subprocess_crash_after_identity_recording_recovers_a_v2_receipt() {
+        if std::env::var_os("THRN_M2_OWNERSHIP_CRASH_AFTER_IDENTITY").is_some() {
+            let project =
+                PathBuf::from(std::env::var_os("THRN_M2_OWNERSHIP_PROJECT").expect("project"));
+            let staging =
+                PathBuf::from(std::env::var_os("THRN_M2_OWNERSHIP_STAGING").expect("staging"));
+            let data = PathBuf::from(std::env::var_os("THRN_M2_OWNERSHIP_DATA").expect("data"));
+            let _ = session(&project, &staging).commit_and_record_at_with_journal(
+                &ReceiptStore::new(data.join("receipts")),
+                1,
+                &NoInstallFaults,
+                &NoReceiptFaults,
+                &ExitAfterJournal(JournalOperation::SetDestinationIdentity),
+            );
+            panic!("child should exit immediately after durable identity recording");
+        }
+
+        let (_parent, project, staging, data) = setup();
+        let status = Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("install::receipt_store::tests::subprocess_crash_after_identity_recording_recovers_a_v2_receipt")
+            .arg("--nocapture")
+            .env("THRN_M2_OWNERSHIP_CRASH_AFTER_IDENTITY", "1")
+            .env("THRN_M2_OWNERSHIP_PROJECT", &project)
+            .env("THRN_M2_OWNERSHIP_STAGING", &staging)
+            .env("THRN_M2_OWNERSHIP_DATA", &data)
+            .status()
+            .expect("launch identity-recording crash simulation");
+        assert_eq!(status.code(), Some(88));
+
+        let store = ReceiptStore::new(data.join("receipts"));
+        assert!(store.list().expect("no premature publication").is_empty());
+        let journals = store
+            .journal_store()
+            .expect("journal store")
+            .read_all()
+            .expect("journal");
+        assert_eq!(journals.len(), 1);
+        assert!(!journals[0].receipt().is_legacy());
+        assert_eq!(
+            journals[0].destination_identity(),
+            journals[0].receipt().installed_directory_identity()
+        );
+        assert_eq!(
+            store
+                .recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults)
+                .expect("recover interrupted publication"),
+            vec![super::RecoveryOutcome::FinalizedReceipt]
+        );
+        let receipts = store.list().expect("completed receipt");
+        assert_eq!(receipts.len(), 1);
+        assert!(!receipts[0].is_legacy());
     }
 
     #[test]

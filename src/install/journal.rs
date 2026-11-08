@@ -167,6 +167,14 @@ impl JournalRecord {
         self.receipt
             .validate()
             .map_err(|_| JournalError::InvalidRecord)?;
+        if let Some(receipt_identity) = self.receipt.installed_directory_identity()
+            && self.destination_identity.map(Into::into) != Some(receipt_identity)
+        {
+            return Err(JournalError::InvalidRecord);
+        }
+        if !self.receipt.is_legacy() && self.destination_identity.is_none() {
+            return Err(JournalError::InvalidRecord);
+        }
         if self
             .receipt
             .to_json()
@@ -252,6 +260,7 @@ pub(crate) enum JournalOperation {
     PublishRecord,
     SyncStore,
     CleanupRecord,
+    SetDestinationIdentity,
 }
 
 pub(crate) trait JournalFaultInjector: Send + Sync {
@@ -423,7 +432,13 @@ impl JournalStore {
                     if !contiguous && !terminal {
                         return Err(JournalError::SequenceGap);
                     }
-                    if previous_record.receipt != record.receipt
+                    if (previous_record.receipt != record.receipt
+                        && !record.receipt.is_identity_upgrade_of(
+                            &previous_record.receipt,
+                            record
+                                .destination_identity()
+                                .ok_or(JournalError::InvalidTransition)?,
+                        ))
                         || previous_record.staging_name != record.staging_name
                         || previous_record.create_agents_directory != record.create_agents_directory
                         || previous_record.create_skills_directory != record.create_skills_directory
@@ -702,8 +717,29 @@ impl OperationJournal {
         identity: FileIdentity,
         faults: &dyn JournalFaultInjector,
     ) -> Result<(), JournalError> {
+        faults
+            .before(JournalOperation::SetDestinationIdentity)
+            .map_err(|error| map_io("record committed destination identity", error))?;
+        if let Some(existing) = self.record.destination_identity()
+            && existing != identity
+        {
+            return Err(JournalError::InvalidRecord);
+        }
+        if self.record.receipt.is_legacy() {
+            self.record.receipt = self
+                .record
+                .receipt
+                .clone()
+                .with_installed_directory_identity(identity)
+                .map_err(|_| JournalError::InvalidRecord)?;
+        } else if self.record.receipt.installed_directory_identity() != Some(identity) {
+            return Err(JournalError::InvalidRecord);
+        }
         self.record.destination_identity = Some(identity.into());
-        self.persist_update(faults)
+        self.persist_update(faults)?;
+        faults
+            .after(JournalOperation::SetDestinationIdentity)
+            .map_err(|error| map_io("record committed destination identity", error))
     }
 
     pub(crate) fn record_file(

@@ -1,8 +1,10 @@
 # Installation receipts
 
-M2-05 introduced a private, local, schema-v1 record for each THRN-managed Codex project skill
-commit. M2-07 connects real CLI installation to that receipt boundary. The store is separate from
-catalog cache data and lives under the OS application-data directory's `receipts` child.
+M2-05 introduced private schema-v1 receipts for THRN-managed Codex project skills. New installs now
+publish schema-v2 receipts, which add the final destination directory's installation-time
+filesystem identity. Schema-v1 remains readable for offline listing and interrupted-install
+compatibility, but it cannot authorize a new removal. The store is separate from catalog cache data
+and lives under the OS application-data directory's `receipts` child.
 `THRN_DATA_DIR` can select an alternate absolute data directory for isolated use and tests. Its
 existing ancestor path is canonicalized without creating missing components, while the configured
 data root itself and the `receipts` child are rejected if linked.
@@ -29,6 +31,11 @@ Every receipt contains:
 - `fileCount` and `byteCount`: exact regular-file count and summed byte length.
 - `contentDigest`: `sha256:<lowercase hex>` over the canonical inventory encoding below.
 
+Schema-v1 records remain valid historical claims. They do not contain installation-time destination
+identity, so `skills list --installed` can display them but `skills remove` refuses them. THRN never
+fills in that missing field from a directory observed during removal, and never rewrites a v1
+receipt to claim ownership of its current directory.
+
 Input is capped at 8 MiB, at 4,096 combined inventory entries, at the archive validator's per-file,
 total-byte, path-length, and path-depth limits, and at explicit metadata/path lengths. Receipt paths
 must pass the same lexical validation as staged archive paths. The parser rejects relative path
@@ -36,6 +43,19 @@ traversal, absolute paths, Windows drive/UNC forms, non-ASCII paths unsupported 
 archive contract, case-insensitive collisions, file/directory overlap, and missing parent
 directories. Canonical project path strings also reject control characters and noncanonical
 separators or dot components.
+
+## Current schema v2
+
+Schema v2 contains all schema-v1 fields and requires `installedDirectoryIdentity`, with `volume` and
+`object` values captured from the secure handle to the final committed destination. A v2 receipt is
+published only after the install journal durably records the same identity. New installs compare the
+current destination identity with this evidence before removal planning; quarantine and cleanup
+continue to revalidate the journaled identity at every destructive boundary.
+
+Schema-v2 `contentDigest` uses a distinct domain separator and includes the installation-time volume
+and object values before the canonical inventory. Changing or removing the identity therefore
+invalidates the digest. Parsers reject v1 records that contain this field, v2 records that omit it,
+unknown fields, unsupported versions, and mismatched digests.
 
 ## Identity and aggregate digest
 
@@ -57,7 +77,9 @@ The aggregate content digest uses SHA-256 over `THRN-CONTENT-INVENTORY-V1\0`, th
    digest of that file.
 
 Every entry has a type tag, every path has a length, and every file carries its byte length and
-digest. The encoding does not depend on JSON key order or ambiguous string concatenation.
+digest. The encoding does not depend on JSON key order or ambiguous string concatenation. Schema v2
+uses its version-2 domain separator and prefixes this inventory with the recorded destination volume
+and object values.
 
 ## Storage and publication
 
@@ -71,10 +93,12 @@ Receipt creation is available only behind the internal commit/receipt boundary. 
 store with the persistent `.writer.lock` file and an exclusive OS file lock, validates existing
 receipts, and rejects a key or destination conflict before the project commit. The lock file is
 never removed based on age or PID; a live OS lock excludes competing install and recovery work. The
-same lock coordinates the journaled recovery API. After a successful no-replace directory commit,
-the writer reopens the committed tree without following links, checks the project and destination
-identities, compares the complete directory/file inventory, and rehashes every regular file. It
-then serializes within the size limit, creates an unpredictable temporary file exclusively in
+same lock coordinates the journaled recovery API. Before commit, the operation journal records the
+legacy-shaped receipt intent. After a successful no-replace directory commit, the writer reopens
+the committed destination through the secure directory-handle layer, captures its filesystem
+identity, and durably records that identity with the upgraded v2 receipt in the next journal
+snapshot. It then compares the complete directory/file inventory and rehashes every regular file
+before publishing that receipt. The writer creates an unpredictable temporary file exclusively in
 receipt storage, writes and flushes the complete JSON, syncs the file, parses it back, and publishes
 it with a platform no-replace rename. A pre-existing receipt is never overwritten. A temporary
 receipt is recoverable only when its complete strict contents equal the journal's receipt and the
@@ -108,9 +132,39 @@ compare paths case-insensitively and also compare the stored project identity. R
 different machine is not supported as proof that the target directory is the same object.
 
 Receipts do not upgrade manually installed or otherwise unreceipted skills into THRN-owned content.
-Corrupt records never authorize removal. The CLI currently supports only Codex project
-installations; it does not provide public remove or update commands. Installed listing is offline
-and read-only, and does not verify current content integrity. A complete installation success
-requires receipt publication and journal cleanup. If either becomes incomplete after directory
-commitment, the command returns nonzero and describes the partial state; recovery preserves content
-whose ownership cannot be proven.
+Corrupt records never authorize removal. The CLI supports Codex project install and removal, but no
+update command, user scope, or other agent. `skills remove` does not need the current catalog: it
+selects one exact canonical resource ID from the receipt and verifies the recorded project identity,
+installation-time destination identity, exact destination path, every directory and file, and each
+file's byte count and SHA-256 before building a read-only plan. Extra, missing, linked, hard-linked,
+replaced, modified, or unsupported objects block removal.
+
+## Compatibility and migration
+
+Existing schema-v1 receipt bytes are preserved. Listing continues to parse them, while automatic
+removal refuses because installation-time directory ownership cannot be established. No migration
+or adoption shortcut is performed. New installs write schema v2.
+
+Install operation-journal schema v1 remains readable. Its historical receipt intent is schema v1;
+an interrupted installation can still recover under its original journal identity and inventory
+checks. Existing v1 receipts are never rewritten. When an interrupted filesystem commit has no
+published receipt yet, recovery may upgrade the journal intent only from the destination identity
+that matches the operation's recorded staging identity. New operations persist the identity-bound
+v2 receipt in the journal before receipt publication and success.
+
+An interrupted pre-v2 removal journal cannot authorize new destructive recovery because it lacks
+installation-time evidence. Nonterminal legacy removal journals are left intact with content
+preserved and require independent inspection. Terminal journal cleanup remains verifiable without
+deleting project content.
+
+Removal uses the same exclusive writer lock as installation. It journals intent, moves the verified
+directory to an operation-private sibling quarantine with a no-replace rename, removes only
+receipt-listed verified regular files and empty recorded directories, and retires the ownership
+receipt only after the content-removal evidence is durable to the level supported by the platform.
+An interrupted removal blocks new install admission and installed listing until recovery finishes.
+Read-only `--dry-run` creates no journal and changes neither project nor receipt storage. See the
+[recovery protocol](recovery.md) for the state machine and recovery behavior. Installed listing is
+offline and read-only; it reports receipt ownership and does not verify current content integrity.
+A complete installation success still requires receipt publication and install-journal cleanup. If
+an install becomes incomplete after directory commitment, the command returns nonzero and recovery
+preserves content whose ownership cannot be proven.

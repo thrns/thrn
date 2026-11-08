@@ -2006,6 +2006,24 @@ impl SecureDir {
         .map_err(rustix_error)
     }
 
+    /// Move a verified directory entry to a sibling without replacing anything at the target.
+    /// The opened source identity is checked against the named entry immediately before rename.
+    pub(super) fn rename_directory_child_noreplace(
+        &self,
+        old_name: &str,
+        new_name: &str,
+        expected_identity: FileIdentity,
+    ) -> io::Result<()> {
+        let source = self.open_directory(std::ffi::OsStr::new(old_name))?;
+        if source.identity()? != expected_identity {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "directory rename source identity changed",
+            ));
+        }
+        self.rename_child_noreplace(old_name, new_name, &source)
+    }
+
     pub(super) fn sync_directory(&self) -> io::Result<()> {
         self.ensure_current_path()?;
         self.file.sync_all()
@@ -2021,6 +2039,27 @@ impl SecureDir {
         self.ensure_current_path()?;
         use rustix::fs::{AtFlags, unlinkat};
         unlinkat(&self.file, name, AtFlags::REMOVEDIR).map_err(rustix_error)
+    }
+
+    pub(super) fn remove_regular_file_if_identity(
+        &self,
+        name: &str,
+        expected_identity: FileIdentity,
+    ) -> io::Result<()> {
+        let file = self.open_regular_file(name)?;
+        if Self::file_identity(&file)? != expected_identity || Self::hard_link_count(&file)? != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "file identity or link count changed before removal",
+            ));
+        }
+        drop(file);
+        self.remove_file(name)
+    }
+
+    pub(super) fn hard_link_count(file: &fs::File) -> io::Result<u64> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(file.metadata()?.nlink())
     }
 
     fn rename_child_noreplace(
@@ -2072,6 +2111,7 @@ fn rustix_error(error: rustix::io::Errno) -> io::Error {
 pub(super) struct SecureDir {
     file: std::sync::Arc<fs::File>,
     path: PathBuf,
+    delete_access: bool,
 }
 
 #[cfg(windows)]
@@ -2104,10 +2144,14 @@ impl SecureDir {
                 ));
             }
         }
-        let file = open_windows_directory(&current)?;
+        // An absolute directory may be the process current directory. Keep this initial handle
+        // free of DELETE to avoid Windows current-directory sharing conflicts; child handles
+        // opened specifically for rename carry DELETE access.
+        let file = open_windows_directory_with_delete_access(&current, false)?;
         Ok(Self {
             file: std::sync::Arc::new(file),
             path: current,
+            delete_access: false,
         })
     }
 
@@ -2156,10 +2200,22 @@ impl SecureDir {
     pub(super) fn open_directory(&self, name: &std::ffi::OsStr) -> io::Result<Self> {
         self.ensure_current_path()?;
         let path = self.path.join(name);
-        let file = open_windows_directory(&path)?;
+        let file = open_windows_directory_with_delete_access(&path, true)?;
         Ok(Self {
             file: std::sync::Arc::new(file),
             path,
+            delete_access: true,
+        })
+    }
+
+    fn open_directory_for_rename(&self, name: &std::ffi::OsStr) -> io::Result<Self> {
+        self.ensure_current_path()?;
+        let path = self.path.join(name);
+        let file = open_windows_directory_with_delete_access(&path, true)?;
+        Ok(Self {
+            file: std::sync::Arc::new(file),
+            path,
+            delete_access: true,
         })
     }
 
@@ -2335,7 +2391,24 @@ impl SecureDir {
             ));
         }
         self.ensure_current_path()?;
-        rename_handle_noreplace(source, &self.path.join(new_name))
+        let destination = self.path.join(new_name);
+        rename_handle_noreplace(source, &destination)
+    }
+
+    pub(super) fn rename_directory_child_noreplace(
+        &self,
+        old_name: &str,
+        new_name: &str,
+        expected_identity: FileIdentity,
+    ) -> io::Result<()> {
+        let source = self.open_directory_for_rename(std::ffi::OsStr::new(old_name))?;
+        if source.identity()? != expected_identity {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "directory rename source identity changed",
+            ));
+        }
+        self.rename_child_noreplace(old_name, new_name, &source)
     }
 
     /// Windows does not expose a portable directory-entry fsync through the handle flags used
@@ -2352,6 +2425,59 @@ impl SecureDir {
     pub(super) fn remove_directory(&self, name: &str) -> io::Result<()> {
         self.ensure_current_path()?;
         fs::remove_dir(self.path.join(name))
+    }
+
+    pub(super) fn remove_regular_file_if_identity(
+        &self,
+        name: &str,
+        expected_identity: FileIdentity,
+    ) -> io::Result<()> {
+        let file = self.open_regular_file_for_rename(name)?;
+        if Self::file_identity(&file)? != expected_identity || Self::hard_link_count(&file)? != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "file identity or link count changed before removal",
+            ));
+        }
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{
+                FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+            },
+        };
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: the disposition structure is initialized and the file handle remains live.
+        let result = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle() as HANDLE,
+                FileDispositionInfo,
+                (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+        if result == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub(super) fn hard_link_count(file: &fs::File) -> io::Result<u64> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
+        };
+        let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+        // SAFETY: `information` points to writable storage for the documented output structure.
+        let result = unsafe {
+            GetFileInformationByHandle(file.as_raw_handle() as HANDLE, information.as_mut_ptr())
+        };
+        if result == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the Win32 call succeeded and initialized the structure.
+        Ok(unsafe { information.assume_init() }.nNumberOfLinks as u64)
     }
 
     fn rename_child_noreplace(
@@ -2422,7 +2548,7 @@ impl SecureDir {
     }
 
     fn ensure_current_path(&self) -> io::Result<()> {
-        let current = open_windows_directory(&self.path)?;
+        let current = open_windows_directory_with_delete_access(&self.path, self.delete_access)?;
         if windows_identity(&current)? != windows_identity(&self.file)? {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -2444,19 +2570,21 @@ fn rename_handle_noreplace(source: &fs::File, destination: &Path) -> io::Result<
         Foundation::HANDLE,
         Storage::FileSystem::{FILE_RENAME_INFO, FileRenameInfoEx, SetFileInformationByHandle},
     };
-    let wide = destination.as_os_str().encode_wide().collect::<Vec<_>>();
+    let mut wide = destination.as_os_str().encode_wide().collect::<Vec<_>>();
     let name_bytes = u32::try_from(wide.len().saturating_mul(size_of::<u16>()))
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target name too long"))?;
+    wide.push(0);
     let header_size = offset_of!(FILE_RENAME_INFO, FileName);
     let byte_len = header_size
-        .checked_add(name_bytes as usize)
+        .checked_add(wide.len().saturating_mul(size_of::<u16>()))
         .map(|len| len.max(size_of::<FILE_RENAME_INFO>()))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target name too long"))?;
     let words = byte_len.div_ceil(size_of::<usize>());
     let mut buffer = vec![0_usize; words];
     let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-    // SAFETY: The aligned buffer contains the fixed structure and complete UTF-16 path; the
-    // source handle remains live for the duration of the documented Win32 call.
+    // SAFETY: The aligned buffer contains the fixed structure and complete NUL-terminated UTF-16
+    // path; FileNameLength excludes the terminator, and the source handle remains live for the
+    // duration of the documented Win32 call.
     unsafe {
         ptr::write(
             info,
@@ -2487,26 +2615,27 @@ fn rename_handle_noreplace(source: &fs::File, destination: &Path) -> io::Result<
 }
 
 #[cfg(windows)]
-fn open_windows_directory(path: &Path) -> io::Result<fs::File> {
+fn open_windows_directory_with_delete_access(
+    path: &Path,
+    delete_access: bool,
+) -> io::Result<fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
         FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, SYNCHRONIZE,
     };
+    let mut access =
+        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY;
+    if delete_access {
+        access |= DELETE;
+    }
+    access |= FILE_TRAVERSE | SYNCHRONIZE;
     let mut options = fs::OpenOptions::new();
     options
         .read(true)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .access_mode(
-            FILE_LIST_DIRECTORY
-                | FILE_READ_ATTRIBUTES
-                | FILE_ADD_FILE
-                | FILE_ADD_SUBDIRECTORY
-                | FILE_TRAVERSE
-                | DELETE
-                | SYNCHRONIZE,
-        )
+        .access_mode(access)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
     let file = options.open(path)?;
     let metadata = file.metadata()?;
@@ -2613,6 +2742,33 @@ impl SecureDir {
         ))
     }
     pub(super) fn remove_directory(&self, _name: &str) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unsupported platform",
+        ))
+    }
+    pub(super) fn rename_directory_child_noreplace(
+        &self,
+        _old_name: &str,
+        _new_name: &str,
+        _expected_identity: FileIdentity,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unsupported platform",
+        ))
+    }
+    pub(super) fn remove_regular_file_if_identity(
+        &self,
+        _name: &str,
+        _expected_identity: FileIdentity,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unsupported platform",
+        ))
+    }
+    pub(super) fn hard_link_count(_file: &fs::File) -> io::Result<u64> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "unsupported platform",

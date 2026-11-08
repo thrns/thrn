@@ -17,6 +17,7 @@ use crate::{
         journal::NoJournalFaults,
         receipt::InstallationReceipt,
         receipt_store::{NoReceiptFaults, ReceiptStore, ReceiptStoreError},
+        removal::{NoRemovalFaults, RemovalError, RemovalPlan, RemovalSummary},
     },
     registry::{
         catalog_service::{CatalogSelection, CatalogService, Freshness},
@@ -80,6 +81,20 @@ enum SkillsCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Remove one exactly verified THRN-managed Codex project skill.
+    Remove {
+        /// Exact canonical resource ID recorded in a THRN ownership receipt.
+        id: String,
+        /// Select the only currently supported agent (codex).
+        #[arg(long, required = true, value_name = "AGENT")]
+        agent: String,
+        /// Select an existing project directory (defaults to the current directory).
+        #[arg(long, value_name = "PATH")]
+        project: Option<std::path::PathBuf>,
+        /// Print the verified removal plan without changing the project or receipt store.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -99,8 +114,90 @@ pub fn run() -> Result<()> {
                 project,
                 dry_run,
             } => install_skill(&id, &agent, project.as_deref(), dry_run),
+            SkillsCommand::Remove {
+                id,
+                agent,
+                project,
+                dry_run,
+            } => remove_skill(&id, &agent, project.as_deref(), dry_run),
         },
     }
+}
+
+fn remove_skill(
+    identifier: &str,
+    agent: &str,
+    project: Option<&Path>,
+    dry_run: bool,
+) -> Result<()> {
+    let current_directory =
+        std::env::current_dir().map_err(|error| RemovalError::CurrentDirectory(error.kind()))?;
+    let store =
+        ReceiptStore::for_system().map_err(|error| RemovalError::Store(error.to_string()))?;
+    let output = execute_remove_with(
+        identifier,
+        agent,
+        project,
+        &current_directory,
+        &store,
+        dry_run,
+        &NoRemovalFaults,
+    )?;
+    write_stdout(&output)
+}
+
+fn execute_remove_with(
+    identifier: &str,
+    agent: &str,
+    project: Option<&Path>,
+    current_directory: &Path,
+    store: &ReceiptStore,
+    dry_run: bool,
+    faults: &dyn crate::install::removal::RemovalFaultInjector,
+) -> std::result::Result<String, RemovalError> {
+    if agent != "codex" {
+        return Err(RemovalError::Conflict(
+            "only explicit --agent codex is supported for removal".to_owned(),
+        ));
+    }
+    if dry_run {
+        let plan = store.plan_removal(identifier, project, current_directory)?;
+        Ok(format_removal_dry_run(&plan))
+    } else {
+        let summary = store.remove_by_id(identifier, project, current_directory, faults)?;
+        Ok(format_removal_success(&summary))
+    }
+}
+
+fn format_removal_success(summary: &RemovalSummary) -> String {
+    let receipt = summary.receipt();
+    format!(
+        "Removed THRN skill\nResource: {}\nSkill name: {}\nAgent: codex\nScope: project\nDestination: {}\nFiles removed: {}\nBytes removed: {}\nOwnership receipt: retired\n",
+        receipt.catalog_resource_id(),
+        receipt.skill_name(),
+        safe_path_display(&receipt.destination_path()),
+        summary.files_removed(),
+        summary.bytes_removed(),
+    )
+}
+
+fn format_removal_dry_run(plan: &RemovalPlan) -> String {
+    let receipt = plan.receipt();
+    let mut output = format!(
+        "Verified THRN skill removal plan\nResource: {}\nSkill name: {}\nAgent: codex\nScope: project\nDestination: {}\nFiles:\n",
+        receipt.catalog_resource_id(),
+        receipt.skill_name(),
+        safe_path_display(&receipt.destination_path()),
+    );
+    for file in plan.files() {
+        output.push_str(&format!("- {} ({})\n", file.path(), file.byte_count()));
+    }
+    output.push_str(&format!(
+        "Files to remove: {}\nBytes to remove: {}\nVerification: complete receipt and current content match\nProject and receipt store unchanged.\n",
+        plan.file_count(),
+        plan.byte_count(),
+    ));
+    output
 }
 
 fn install_skill(
@@ -482,6 +579,7 @@ mod install_tests {
         fs,
         io::{self, Cursor, Write},
         path::{Path, PathBuf},
+        process::{Child, Command, ExitStatus},
         sync::{
             Arc, Barrier,
             atomic::{AtomicUsize, Ordering},
@@ -495,13 +593,14 @@ mod install_tests {
 
     use super::{
         InstallCommandError, InstallContext, InstallationSession, ReceiptStore,
-        execute_install_with, installed_listing_with,
+        execute_install_with, execute_remove_with, installed_listing_with,
     };
     use crate::{
         install::{
             commit::InstallFaultInjector,
             journal::NoJournalFaults,
             receipt_store::{NoReceiptFaults, ReceiptFaultInjector, ReceiptOperation},
+            removal::{NoRemovalFaults, RemovalFaultInjector, RemovalOperation},
         },
         registry::catalog::parse_catalog_json,
         sources::{
@@ -717,6 +816,160 @@ mod install_tests {
 
     use crate::install::commit::InstallationCompletionError;
 
+    struct FailRemovalBefore(RemovalOperation);
+
+    impl RemovalFaultInjector for FailRemovalBefore {
+        fn before(&self, operation: RemovalOperation) -> io::Result<()> {
+            if operation == self.0 {
+                Err(io::Error::other("injected removal failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum FaultTiming {
+        Before,
+        After,
+    }
+
+    struct FailRemovalBoundary {
+        operation: RemovalOperation,
+        timing: FaultTiming,
+        fired: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailRemovalBoundary {
+        fn check(&self, operation: RemovalOperation, timing: FaultTiming) -> io::Result<()> {
+            if operation == self.operation
+                && timing == self.timing
+                && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                Err(io::Error::other("injected removal boundary failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl RemovalFaultInjector for FailRemovalBoundary {
+        fn before(&self, operation: RemovalOperation) -> io::Result<()> {
+            self.check(operation, FaultTiming::Before)
+        }
+
+        fn after(&self, operation: RemovalOperation) -> io::Result<()> {
+            self.check(operation, FaultTiming::After)
+        }
+    }
+
+    struct ExitAfterRemoval(RemovalOperation);
+
+    impl RemovalFaultInjector for ExitAfterRemoval {
+        fn after(&self, operation: RemovalOperation) -> io::Result<()> {
+            if operation == self.0 {
+                std::process::exit(89);
+            }
+            Ok(())
+        }
+    }
+
+    struct PauseBeforeRemovalRename {
+        entered: PathBuf,
+        release: PathBuf,
+    }
+
+    impl RemovalFaultInjector for PauseBeforeRemovalRename {
+        fn before(&self, operation: RemovalOperation) -> io::Result<()> {
+            if operation == RemovalOperation::RenameToQuarantine {
+                fs::write(&self.entered, b"entered rename boundary")?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                while !self.release.exists() {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "timed out waiting for the removal test release signal",
+                        ));
+                    }
+                    thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn wait_for_child(child: &mut Child, timeout: std::time::Duration) -> io::Result<ExitStatus> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill()?;
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for a concurrency-test subprocess",
+                ));
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn release_removal(path: &Path) {
+        let _ = fs::write(path, b"release removal test subprocess");
+    }
+
+    struct ReleaseRemovalOnDrop(PathBuf);
+
+    impl Drop for ReleaseRemovalOnDrop {
+        fn drop(&mut self) {
+            release_removal(&self.0);
+        }
+    }
+
+    struct SubstituteAfterRemovalPlanning {
+        destination: PathBuf,
+        displaced: PathBuf,
+        substituted: std::sync::Mutex<bool>,
+    }
+
+    impl RemovalFaultInjector for SubstituteAfterRemovalPlanning {
+        fn before(&self, operation: RemovalOperation) -> io::Result<()> {
+            if operation != RemovalOperation::Revalidate {
+                return Ok(());
+            }
+            let mut substituted = self
+                .substituted
+                .lock()
+                .map_err(|_| io::Error::other("substitution test lock"))?;
+            if *substituted {
+                return Ok(());
+            }
+            fs::rename(&self.destination, &self.displaced)?;
+            copy_fixture_tree(&self.displaced, &self.destination)?;
+            *substituted = true;
+            Ok(())
+        }
+    }
+
+    fn copy_fixture_tree(source: &Path, destination: &Path) -> io::Result<()> {
+        fs::create_dir(destination)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            let target = destination.join(entry.file_name());
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if metadata.is_dir() {
+                copy_fixture_tree(&entry.path(), &target)?;
+            } else if metadata.is_file() {
+                fs::copy(entry.path(), target)?;
+            } else {
+                return Err(io::Error::other("unexpected fixture object"));
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(windows)]
     fn assert_junction_rejected_by_inspection_and_orchestration(
         fixture: &InstallFixture,
@@ -872,6 +1125,800 @@ mod install_tests {
             1
         );
         assert!(fixture.store().list().expect("receipt listing").is_empty());
+    }
+
+    #[test]
+    fn removal_dry_run_verifies_nested_binary_and_inert_script_files_read_only() {
+        let fixture = InstallFixture::new();
+        let transport = FixtureTransport::archive();
+        fixture
+            .execute("uncharted", None, &transport)
+            .expect("install fixture");
+        let destination = fixture.project.join(".agents/skills/uncharted-ideation");
+        fs::write(fixture.project.join("keep.txt"), b"unrelated project data")
+            .expect("unrelated file");
+
+        let plan = fixture
+            .store()
+            .plan_removal("uncharted", Some(&fixture.project), &fixture.current)
+            .expect("complete receipt and current inventory verify");
+        let output = super::format_removal_dry_run(&plan);
+        assert!(output.contains("Resource: uncharted\n"));
+        assert!(output.contains("Skill name: uncharted-ideation\n"));
+        assert!(output.contains("- references/guide.md ("));
+        assert!(output.contains("- assets/blob.bin (6)"));
+        assert!(output.contains("- scripts/not-run.sh ("));
+        assert!(output.contains("Verification: complete receipt and current content match"));
+        assert!(output.contains("Project and receipt store unchanged."));
+        assert_eq!(transport.call_count(), 1, "removal makes no source request");
+        assert_eq!(
+            fs::read(destination.join("assets/blob.bin")).unwrap(),
+            BINARY
+        );
+        assert_eq!(fixture.store().list().expect("receipt remains").len(), 1);
+        assert!(!fixture.project.join("SKILL-WAS-EXECUTED").exists());
+        assert!(!fixture.data.join("removals").exists());
+    }
+
+    #[test]
+    fn removal_success_uses_canonical_id_and_skill_name_then_retires_one_receipt() {
+        let fixture = InstallFixture::new();
+        fixture
+            .execute("uncharted", None, &FixtureTransport::archive())
+            .expect("install fixture");
+        let root = fs::canonicalize(&fixture.project).expect("canonical project root");
+        let destination = root.join(".agents/skills/uncharted-ideation");
+        fs::write(root.join("keep.txt"), b"unrelated project data").expect("keep file");
+        let expected = format!(
+            "Removed THRN skill\nResource: uncharted\nSkill name: uncharted-ideation\nAgent: codex\nScope: project\nDestination: {}\nFiles removed: 4\nBytes removed: {}\nOwnership receipt: retired\n",
+            destination.display(),
+            SKILL_MD.len() + GUIDE.len() + SCRIPT.len() + BINARY.len(),
+        );
+
+        let output = execute_remove_with(
+            "uncharted",
+            "codex",
+            Some(&fixture.project),
+            &fixture.current,
+            &fixture.store(),
+            false,
+            &NoRemovalFaults,
+        )
+        .expect("removal completes durably");
+        assert_eq!(output, expected);
+        assert!(!destination.exists());
+        assert!(root.join(".agents/skills").is_dir(), "parents are retained");
+        assert_eq!(
+            fs::read_dir(root.join(".agents/skills")).unwrap().count(),
+            0
+        );
+        assert_eq!(
+            fs::read(root.join("keep.txt")).unwrap(),
+            b"unrelated project data"
+        );
+        assert!(fixture.store().list().expect("receipt retired").is_empty());
+        assert!(!fixture.project.join("SKILL-WAS-EXECUTED").exists());
+        assert!(fixture.data.join("removals").is_dir());
+        assert_eq!(
+            fs::read_dir(fixture.data.join("removals")).unwrap().count(),
+            0
+        );
+    }
+
+    #[test]
+    fn removal_of_one_project_keeps_same_skill_in_another_project() {
+        let fixture = InstallFixture::new();
+        let second = fixture.current.join("second-project");
+        fs::create_dir(&second).expect("second project");
+        fixture
+            .execute("uncharted", None, &FixtureTransport::archive())
+            .expect("install in first project");
+        fixture
+            .execute(
+                "uncharted",
+                Some(Path::new("second-project")),
+                &FixtureTransport::archive(),
+            )
+            .expect("install in second project");
+
+        fixture
+            .store()
+            .remove_by_id(
+                "uncharted",
+                Some(&fixture.project),
+                &fixture.current,
+                &NoRemovalFaults,
+            )
+            .expect("remove selected project only");
+        assert!(
+            !fixture
+                .project
+                .join(".agents/skills/uncharted-ideation")
+                .exists()
+        );
+        assert!(
+            second
+                .join(".agents/skills/uncharted-ideation/SKILL.md")
+                .is_file()
+        );
+        let remaining = fixture
+            .store()
+            .list()
+            .expect("other project receipt remains");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].root_path(), fs::canonicalize(&second).unwrap());
+    }
+
+    #[test]
+    fn modified_missing_extra_and_unmanaged_installations_are_conflicts() {
+        for mutation in [
+            "modified",
+            "missing",
+            "extra",
+            "extra-directory",
+            "unmanaged",
+        ] {
+            let fixture = InstallFixture::new();
+            let destination = fixture.project.join(".agents/skills/uncharted-ideation");
+            if mutation == "unmanaged" {
+                fs::create_dir_all(&destination).expect("manual skill directory");
+                fs::write(destination.join("SKILL.md"), SKILL_MD).expect("manual metadata");
+            } else {
+                fixture
+                    .execute("uncharted", None, &FixtureTransport::archive())
+                    .expect("install fixture");
+                match mutation {
+                    "modified" => {
+                        let mut changed = SCRIPT.to_vec();
+                        changed[0] ^= 1;
+                        fs::write(destination.join("scripts/not-run.sh"), changed)
+                            .expect("same-length mutation");
+                    }
+                    "missing" => fs::remove_file(destination.join("assets/blob.bin"))
+                        .expect("remove expected file"),
+                    "extra" => {
+                        fs::write(destination.join("user.txt"), b"user data").expect("extra file")
+                    }
+                    "extra-directory" => {
+                        fs::create_dir(destination.join("user-dir")).expect("extra directory")
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let before = fs::read_dir(&destination)
+                .expect("destination remains")
+                .count();
+            let result =
+                fixture
+                    .store()
+                    .plan_removal("uncharted", Some(&fixture.project), &fixture.current);
+            assert!(result.is_err(), "mutation={mutation}");
+            assert!(destination.is_dir(), "mutation={mutation}");
+            assert_eq!(
+                fs::read_dir(&destination)
+                    .expect("destination preserved")
+                    .count(),
+                before,
+                "mutation={mutation}"
+            );
+            if mutation != "unmanaged" {
+                assert_eq!(fixture.store().list().expect("receipt preserved").len(), 1);
+            } else {
+                assert!(fixture.store().list().expect("no receipt").is_empty());
+            }
+            assert!(!fixture.project.join("SKILL-WAS-EXECUTED").exists());
+        }
+    }
+
+    #[test]
+    fn missing_corrupt_and_conflicting_receipts_never_authorize_removal() {
+        for scenario in ["missing", "corrupt", "conflicting"] {
+            let fixture = InstallFixture::new();
+            fixture
+                .execute("uncharted", None, &FixtureTransport::archive())
+                .expect("install fixture");
+            let receipt_dir = fixture.data.join("receipts");
+            let receipt_path = fs::read_dir(&receipt_dir)
+                .expect("receipt directory")
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+                .expect("receipt file");
+            match scenario {
+                "missing" => fs::remove_file(&receipt_path).expect("remove receipt fixture"),
+                "corrupt" => fs::write(&receipt_path, b"{broken receipt").expect("corrupt receipt"),
+                "conflicting" => {
+                    let mut json = fs::read_to_string(&receipt_path).expect("receipt JSON");
+                    let modified = json.replace(
+                        "\"catalogResourceId\":\"uncharted\"",
+                        "\"catalogResourceId\":\"creative-lab\"",
+                    );
+                    assert_ne!(modified, json, "fixture resource id field is present");
+                    json = modified;
+                    let root = fs::canonicalize(&fixture.project).expect("canonical project root");
+                    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+                    digest.update(b"THRN-RECEIPT-IDENTITY-V1\0");
+                    for field in [root.to_str().unwrap().as_bytes(), b"codex", b"creative-lab"] {
+                        digest.update(&(field.len() as u64).to_be_bytes());
+                        digest.update(field);
+                    }
+                    let hash = digest.finish();
+                    let mut hex = String::new();
+                    for byte in hash.as_ref() {
+                        use std::fmt::Write as _;
+                        write!(hex, "{byte:02x}").unwrap();
+                    }
+                    fs::write(receipt_dir.join(format!("v1-{hex}.json")), json)
+                        .expect("publish conflicting valid claim");
+                }
+                _ => unreachable!(),
+            }
+            let destination = fixture.project.join(".agents/skills/uncharted-ideation");
+            let result = fixture.store().remove_by_id(
+                "uncharted",
+                Some(&fixture.project),
+                &fixture.current,
+                &NoRemovalFaults,
+            );
+            assert!(result.is_err(), "scenario={scenario}");
+            assert!(
+                destination.join("SKILL.md").is_file(),
+                "scenario={scenario}"
+            );
+            assert_eq!(
+                fs::read(destination.join("assets/blob.bin")).unwrap(),
+                BINARY,
+                "scenario={scenario}"
+            );
+            assert!(!fixture.project.join("SKILL-WAS-EXECUTED").exists());
+        }
+    }
+
+    #[test]
+    fn conflicting_installation_identity_in_removal_journal_fails_closed() {
+        let fixture = InstallFixture::new();
+        fixture
+            .execute("uncharted", None, &FixtureTransport::archive())
+            .expect("install fixture");
+        let destination = fixture.project.join(".agents/skills/uncharted-ideation");
+        let unrelated = fixture.project.join("unrelated.txt");
+        fs::write(&unrelated, b"preserve user data").expect("unrelated sentinel");
+
+        let result = fixture.store().remove_by_id(
+            "uncharted",
+            Some(&fixture.project),
+            &fixture.current,
+            &FailRemovalBefore(RemovalOperation::RenameToQuarantine),
+        );
+        assert!(
+            result.is_err(),
+            "injected pre-rename failure leaves a journal"
+        );
+        assert!(destination.join("SKILL.md").is_file());
+
+        let journal_directory = fixture.data.join("removals");
+        let mut snapshots = fs::read_dir(&journal_directory)
+            .expect("removal journal directory")
+            .map(|entry| entry.expect("journal entry").path())
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .collect::<Vec<_>>();
+        snapshots.sort();
+        let latest = snapshots.last().expect("published removal snapshot");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(latest).expect("journal snapshot"))
+                .expect("valid journal JSON");
+        let object = record["destinationIdentity"]["object"]
+            .as_u64()
+            .expect("destination object identity");
+        record["destinationIdentity"]["object"] = serde_json::json!(object.wrapping_add(1));
+        fs::write(
+            latest,
+            serde_json::to_vec(&record).expect("serialize conflicting journal"),
+        )
+        .expect("write conflicting evidence fixture");
+
+        let recovery = fixture
+            .store()
+            .recover_with_faults(&NoJournalFaults, &NoReceiptFaults);
+        assert!(
+            recovery.is_err(),
+            "mismatched identity evidence fails closed"
+        );
+        assert!(destination.join("SKILL.md").is_file());
+        assert_eq!(
+            fs::read(&unrelated).expect("user data preserved"),
+            b"preserve user data"
+        );
+        let receipt_entries = fs::read_dir(fixture.data.join("receipts"))
+            .expect("receipt store remains")
+            .map(|entry| entry.expect("receipt entry").path())
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .count();
+        assert_eq!(receipt_entries, 1, "ownership receipt is preserved");
+        assert!(
+            journal_directory.is_dir(),
+            "conflicting journal is preserved"
+        );
+    }
+
+    #[test]
+    fn removal_failures_at_each_journal_and_filesystem_boundary_recover_safely() {
+        let operations = [
+            RemovalOperation::CreateJournalStore,
+            RemovalOperation::CreateJournalTemporary,
+            RemovalOperation::WriteJournal,
+            RemovalOperation::SyncJournalRecord,
+            RemovalOperation::VerifyJournalRecord,
+            RemovalOperation::PublishJournalRecord,
+            RemovalOperation::SyncJournalStore,
+            RemovalOperation::Revalidate,
+            RemovalOperation::RenameToQuarantine,
+            RemovalOperation::RemoveFile,
+            RemovalOperation::RemoveDirectory,
+            RemovalOperation::SyncContentDirectory,
+            RemovalOperation::RetireReceipt,
+            RemovalOperation::SyncReceiptDirectory,
+            RemovalOperation::CleanupJournalRecord,
+        ];
+        for operation in operations {
+            for timing in [FaultTiming::Before, FaultTiming::After] {
+                let fixture = InstallFixture::new();
+                fixture
+                    .execute("uncharted", None, &FixtureTransport::archive())
+                    .expect("install fixture");
+                let sentinel = fixture.project.join("unrelated.txt");
+                fs::write(&sentinel, b"preserve user data").expect("unrelated sentinel");
+                let fault = FailRemovalBoundary {
+                    operation,
+                    timing,
+                    fired: std::sync::atomic::AtomicBool::new(false),
+                };
+                let result = fixture.store().remove_by_id(
+                    "uncharted",
+                    Some(&fixture.project),
+                    &fixture.current,
+                    &fault,
+                );
+                assert!(
+                    result.is_err(),
+                    "injected operation={operation:?}, timing={timing:?} must not report success"
+                );
+                fixture
+                    .store()
+                    .recover_with_faults(&NoJournalFaults, &NoReceiptFaults)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "recovery failed for operation={operation:?}, timing={timing:?}: {error}"
+                        )
+                    });
+                let receipts = fixture
+                    .store()
+                    .list()
+                    .expect("recovery leaves readable store");
+                let destination = fixture.project.join(".agents/skills/uncharted-ideation");
+                if receipts.is_empty() {
+                    assert!(
+                        !destination.exists(),
+                        "operation={operation:?}, timing={timing:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        receipts.len(),
+                        1,
+                        "operation={operation:?}, timing={timing:?}"
+                    );
+                    assert!(
+                        destination.join("SKILL.md").is_file(),
+                        "operation={operation:?}, timing={timing:?}"
+                    );
+                    assert_eq!(
+                        fs::read(destination.join("assets/blob.bin")).unwrap(),
+                        BINARY,
+                        "operation={operation:?}, timing={timing:?}"
+                    );
+                }
+                assert_eq!(fs::read(&sentinel).unwrap(), b"preserve user data");
+                assert!(!fixture.project.join("SKILL-WAS-EXECUTED").exists());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removal_rejects_hardlinked_files_and_symlink_substitution() {
+        use std::os::unix::fs::symlink;
+
+        for replace_with_symlink in [false, true] {
+            let fixture = InstallFixture::new();
+            fixture
+                .execute("uncharted", None, &FixtureTransport::archive())
+                .expect("install fixture");
+            let file = fixture
+                .project
+                .join(".agents/skills/uncharted-ideation/assets/blob.bin");
+            let external = fixture._root.path().join("outside.bin");
+            fs::write(&external, b"outside content").expect("outside sentinel");
+            if replace_with_symlink {
+                fs::remove_file(&file).expect("remove original path");
+                symlink(&external, &file).expect("substitute symlink");
+            } else {
+                fs::remove_file(&external).expect("prepare hardlink destination");
+                fs::hard_link(&file, &external).expect("create external hardlink");
+            }
+            assert!(
+                fixture
+                    .store()
+                    .plan_removal("uncharted", Some(&fixture.project), &fixture.current)
+                    .is_err()
+            );
+            let expected_external = if replace_with_symlink {
+                b"outside content".as_slice()
+            } else {
+                BINARY
+            };
+            assert_eq!(
+                fs::read(&external).expect("external content remains"),
+                expected_external
+            );
+            assert_eq!(fixture.store().list().expect("receipt remains").len(), 1);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn removal_rejects_case_insensitive_destination_collisions() {
+        let fixture = InstallFixture::new();
+        fixture
+            .execute("uncharted", None, &FixtureTransport::archive())
+            .expect("install fixture");
+        let collision = fixture.project.join(".agents/skills/Uncharted-Ideation");
+        fs::create_dir(&collision).expect("case collision");
+        fs::write(collision.join("keep.txt"), b"unrelated").expect("collision sentinel");
+        assert!(
+            fixture
+                .store()
+                .plan_removal("uncharted", Some(&fixture.project), &fixture.current)
+                .is_err()
+        );
+        assert!(collision.join("keep.txt").is_file());
+        assert!(
+            fixture
+                .project
+                .join(".agents/skills/uncharted-ideation/SKILL.md")
+                .is_file()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn removal_rejects_real_windows_destination_junction() {
+        let fixture = InstallFixture::new();
+        fixture
+            .execute("uncharted", None, &FixtureTransport::archive())
+            .expect("install fixture");
+        let destination = fixture.project.join(".agents/skills/uncharted-ideation");
+        let displaced = fixture._root.path().join("displaced-skill");
+        let external = fixture._root.path().join("external-skill");
+        fs::create_dir(&external).expect("external directory");
+        fs::write(external.join("keep.txt"), b"external sentinel").expect("sentinel");
+        fs::rename(&destination, &displaced).expect("displace managed content");
+        create_junction(&destination, &external);
+        assert!(
+            fixture
+                .store()
+                .plan_removal("uncharted", Some(&fixture.project), &fixture.current)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(external.join("keep.txt")).unwrap(),
+            b"external sentinel"
+        );
+        assert!(displaced.join("SKILL.md").is_file());
+        assert!(fixture.store().list().expect("receipt remains").len() == 1);
+    }
+
+    #[test]
+    fn replacement_with_identical_inventory_before_removal_planning_is_rejected() {
+        let fixture = InstallFixture::new();
+        fixture
+            .execute("uncharted", None, &FixtureTransport::archive())
+            .expect("install fixture");
+        let destination = fixture.project.join(".agents/skills/uncharted-ideation");
+        let displaced = fixture._root.path().join("original-installed-skill");
+        fs::rename(&destination, &displaced).expect("preserve original installation");
+        copy_fixture_tree(&displaced, &destination).expect("create byte-identical directory copy");
+        assert_eq!(
+            fs::read(displaced.join("SKILL.md")).unwrap(),
+            fs::read(destination.join("SKILL.md")).unwrap()
+        );
+        assert_ne!(
+            crate::install::destination::DestinationFileSystem::object_identity(
+                &crate::install::destination::RealDestinationFileSystem,
+                &displaced,
+            )
+            .unwrap(),
+            crate::install::destination::DestinationFileSystem::object_identity(
+                &crate::install::destination::RealDestinationFileSystem,
+                &destination,
+            )
+            .unwrap(),
+            "the replacement must have a distinct filesystem identity"
+        );
+
+        let error = fixture
+            .store()
+            .plan_removal("uncharted", Some(&fixture.project), &fixture.current)
+            .expect_err("same files under a new directory identity are not the installation");
+        assert!(
+            error
+                .to_string()
+                .contains("installation-time receipt evidence")
+        );
+        assert!(displaced.join("SKILL.md").is_file());
+        assert!(destination.join("SKILL.md").is_file());
+        assert_eq!(fixture.store().list().expect("receipt remains").len(), 1);
+    }
+
+    #[test]
+    fn substitution_after_removal_planning_is_rejected_before_thrn_mutation() {
+        let fixture = InstallFixture::new();
+        fixture
+            .execute("uncharted", None, &FixtureTransport::archive())
+            .expect("install fixture");
+        let destination = fixture.project.join(".agents/skills/uncharted-ideation");
+        let displaced = fixture._root.path().join("displaced-installed-skill");
+        let substitution = SubstituteAfterRemovalPlanning {
+            destination: destination.clone(),
+            displaced: displaced.clone(),
+            substituted: std::sync::Mutex::new(false),
+        };
+        let error = fixture
+            .store()
+            .remove_by_id(
+                "uncharted",
+                Some(&fixture.project),
+                &fixture.current,
+                &substitution,
+            )
+            .expect_err("identity substitution after planning must fail closed");
+        assert!(error.to_string().contains("removal may be incomplete"));
+        assert!(displaced.join("SKILL.md").is_file());
+        assert!(destination.join("SKILL.md").is_file());
+        assert!(destination.join("scripts/not-run.sh").is_file());
+        assert!(!fixture.project.join("SKILL-WAS-EXECUTED").exists());
+        assert!(fixture.data.join("removals").is_dir());
+    }
+
+    #[test]
+    fn incomplete_file_cleanup_recovers_idempotently_without_false_success() {
+        let fixture = InstallFixture::new();
+        fixture
+            .execute("uncharted", None, &FixtureTransport::archive())
+            .expect("install fixture");
+        let error = fixture
+            .store()
+            .remove_by_id(
+                "uncharted",
+                Some(&fixture.project),
+                &fixture.current,
+                &FailRemovalBefore(RemovalOperation::RemoveFile),
+            )
+            .expect_err("injected cleanup failure cannot report success");
+        assert!(error.to_string().contains("removal may be incomplete"));
+        let skills = fixture.project.join(".agents/skills");
+        let quarantine = fs::read_dir(&skills)
+            .expect("skill parent remains")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".thrn-removal-"))
+            })
+            .expect("verified installation remains quarantined");
+        assert!(quarantine.join("SKILL.md").is_file());
+        assert!(!skills.join("uncharted-ideation").exists());
+        assert!(
+            fixture
+                .store()
+                .list()
+                .unwrap_err()
+                .to_string()
+                .contains("recovery is required")
+        );
+        fixture
+            .store()
+            .recover_with_faults(&NoJournalFaults, &NoReceiptFaults)
+            .expect("recovery resumes exact verified deletion");
+        assert!(fixture.store().list().expect("receipt retired").is_empty());
+        assert!(
+            !fixture
+                .project
+                .join(".agents/skills/uncharted-ideation")
+                .exists()
+        );
+        fixture
+            .store()
+            .recover_with_faults(&NoJournalFaults, &NoReceiptFaults)
+            .expect("second recovery is idempotent");
+    }
+
+    #[test]
+    fn installation_and_removal_cannot_race_under_the_receipt_store_lock() {
+        if std::env::var_os("THRN_M3_PAUSED_REMOVE_DATA").is_some() {
+            let data = PathBuf::from(std::env::var_os("THRN_M3_PAUSED_REMOVE_DATA").unwrap());
+            let project = PathBuf::from(std::env::var_os("THRN_M3_PAUSED_REMOVE_PROJECT").unwrap());
+            let current = PathBuf::from(std::env::var_os("THRN_M3_PAUSED_REMOVE_CURRENT").unwrap());
+            let entered = PathBuf::from(std::env::var_os("THRN_M3_PAUSED_REMOVE_ENTERED").unwrap());
+            let release = PathBuf::from(std::env::var_os("THRN_M3_PAUSED_REMOVE_RELEASE").unwrap());
+            ReceiptStore::new(data.join("receipts"))
+                .remove_by_id(
+                    "uncharted",
+                    Some(&project),
+                    &current,
+                    &PauseBeforeRemovalRename { entered, release },
+                )
+                .expect("removal completes after the parent releases its test gate");
+            return;
+        }
+
+        let fixture = InstallFixture::new();
+        fixture
+            .execute("uncharted", None, &FixtureTransport::archive())
+            .expect("install fixture");
+        let entered = fixture._root.path().join("removal-entered");
+        let release = fixture._root.path().join("removal-release");
+        let test_executable = std::env::current_exe().expect("test executable");
+        let mut removal = Command::new(&test_executable)
+            .arg("--exact")
+            .arg("cli::install_tests::installation_and_removal_cannot_race_under_the_receipt_store_lock")
+            .arg("--nocapture")
+            .env("THRN_M3_PAUSED_REMOVE_DATA", &fixture.data)
+            .env("THRN_M3_PAUSED_REMOVE_PROJECT", &fixture.project)
+            .env("THRN_M3_PAUSED_REMOVE_CURRENT", &fixture.current)
+            .env("THRN_M3_PAUSED_REMOVE_ENTERED", &entered)
+            .env("THRN_M3_PAUSED_REMOVE_RELEASE", &release)
+            .spawn()
+            .expect("launch removal-lock subprocess");
+        let _release_on_drop = ReleaseRemovalOnDrop(release.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !entered.exists()
+            && removal
+                .try_wait()
+                .expect("inspect removal subprocess")
+                .is_none()
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !entered.exists() {
+            release_removal(&release);
+            let _ = wait_for_child(&mut removal, std::time::Duration::from_secs(5));
+            panic!("removal subprocess did not reach the locked rename boundary");
+        }
+
+        let mut installation = match Command::new(&test_executable)
+            .arg("--exact")
+            .arg("cli::install_tests::subprocess_install_is_rejected_while_removal_holds_the_writer_lock")
+            .arg("--nocapture")
+            .env("THRN_M3_INSTALL_LOCK_DATA", &fixture.data)
+            .env("THRN_M3_INSTALL_LOCK_PROJECT", &fixture.project)
+            .env("THRN_M3_INSTALL_LOCK_CURRENT", &fixture.current)
+            .env("THRN_M3_INSTALL_LOCK_STAGING", &fixture.staging)
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                release_removal(&release);
+                let _ = wait_for_child(&mut removal, std::time::Duration::from_secs(10));
+                panic!("could not launch install-lock subprocess: {error}");
+            }
+        };
+        let install_result = wait_for_child(&mut installation, std::time::Duration::from_secs(15));
+        release_removal(&release);
+        let removal_result = wait_for_child(&mut removal, std::time::Duration::from_secs(15));
+
+        assert!(
+            install_result.as_ref().is_ok_and(|status| status.success()),
+            "install subprocess must report the active OS writer lock; result={install_result:?}"
+        );
+        assert!(
+            removal_result.as_ref().is_ok_and(|status| status.success()),
+            "removal subprocess must complete after release; result={removal_result:?}"
+        );
+        assert!(fixture.store().list().expect("receipt retired").is_empty());
+        assert!(
+            !fixture
+                .project
+                .join(".agents/skills/uncharted-ideation")
+                .exists(),
+            "competing install must not recreate content removed by the winner"
+        );
+    }
+
+    #[test]
+    fn subprocess_install_is_rejected_while_removal_holds_the_writer_lock() {
+        let Some(data) = std::env::var_os("THRN_M3_INSTALL_LOCK_DATA") else {
+            return;
+        };
+        let project = PathBuf::from(std::env::var_os("THRN_M3_INSTALL_LOCK_PROJECT").unwrap());
+        let current = PathBuf::from(std::env::var_os("THRN_M3_INSTALL_LOCK_CURRENT").unwrap());
+        let staging = PathBuf::from(std::env::var_os("THRN_M3_INSTALL_LOCK_STAGING").unwrap());
+        let catalog = parse_catalog_json(include_bytes!(
+            "../tests/fixtures/catalog/test-only-valid-v1.json"
+        ))
+        .expect("offline catalog fixture");
+        let factory = TestFactory(staging);
+        let result = execute_install_with(
+            "uncharted",
+            "codex",
+            Some(&project),
+            InstallContext {
+                catalog: &catalog,
+                current_directory: &current,
+                transport: &FixtureTransport::archive(),
+                tempdir_factory: &factory,
+                receipt_store: || Ok(ReceiptStore::new(PathBuf::from(&data).join("receipts"))),
+                complete: InstallationSession::commit_and_record,
+            },
+        );
+        let error = result.expect_err("active removal must exclude installation");
+        assert!(
+            error
+                .to_string()
+                .contains("busy or left by an interrupted write"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn subprocess_crash_after_cleanup_intent_recovers_removed_skill() {
+        if std::env::var_os("THRN_M3_CRASH_DURING_REMOVAL").is_some() {
+            let project = PathBuf::from(std::env::var_os("THRN_M3_PROJECT").expect("project"));
+            let data = PathBuf::from(std::env::var_os("THRN_M3_DATA").expect("data"));
+            let store = ReceiptStore::new(data.join("receipts"));
+            let operation = match std::env::var("THRN_M3_CRASH_OPERATION").as_deref() {
+                Ok("rename") => RemovalOperation::RenameToQuarantine,
+                Ok("file") => RemovalOperation::RemoveFile,
+                Ok("receipt") => RemovalOperation::RetireReceipt,
+                _ => panic!("unknown crash boundary"),
+            };
+            let _ = store.remove_by_id("uncharted", None, &project, &ExitAfterRemoval(operation));
+            panic!("child process should have terminated at the crash boundary");
+        }
+
+        for boundary in ["rename", "file", "receipt"] {
+            let fixture = InstallFixture::new();
+            fixture
+                .execute("uncharted", None, &FixtureTransport::archive())
+                .expect("install fixture");
+            let status = Command::new(std::env::current_exe().expect("test executable"))
+                .arg("--exact")
+                .arg("cli::install_tests::subprocess_crash_after_cleanup_intent_recovers_removed_skill")
+                .arg("--nocapture")
+                .env("THRN_M3_CRASH_DURING_REMOVAL", "1")
+                .env("THRN_M3_CRASH_OPERATION", boundary)
+                .env("THRN_M3_PROJECT", &fixture.project)
+                .env("THRN_M3_DATA", &fixture.data)
+                .status()
+                .expect("launch removal crash simulation");
+            assert_eq!(status.code(), Some(89), "boundary={boundary}");
+            fixture
+                .store()
+                .recover_with_faults(&NoJournalFaults, &NoReceiptFaults)
+                .expect("recover process interruption");
+            assert!(fixture.store().list().expect("receipt retired").is_empty());
+            assert!(
+                !fixture
+                    .project
+                    .join(".agents/skills/uncharted-ideation")
+                    .exists()
+            );
+            fixture
+                .store()
+                .recover_with_faults(&NoJournalFaults, &NoReceiptFaults)
+                .expect("recovery repeats safely");
+        }
     }
 
     #[test]

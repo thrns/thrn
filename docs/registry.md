@@ -196,7 +196,7 @@ only. Receipt storage is under the OS application-data directory returned by
 then its `receipts` child. This is separate from the catalog cache. A missing or empty receipt
 directory prints `No THRN-managed installations are recorded.` and does not inspect Codex, Claude,
 Cursor, Gemini, or any other agent directory. It also does not create the application-data or
-receipt directories. Valid schema-v1 records show the canonical resource ID, actual skill directory
+receipt directories. Valid schema-v1 and schema-v2 records show the canonical resource ID, actual skill directory
 name, agent, scope, project destination, pinned revision, and state that current content integrity
 was not checked. Corrupt, unsupported, duplicated, conflicting, linked, nonregular, or unknown
 receipt storage is an explicit error. Listing never fetches the catalog or opens project paths;

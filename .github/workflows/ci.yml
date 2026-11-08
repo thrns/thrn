@@ -79,6 +79,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Run bounded Windows install/removal writer-lock regression
+        if: runner.os == 'Windows'
+        timeout-minutes: 2
+        shell: bash
+        run: cargo test --locked --bin thrn cli::install_tests::installation_and_removal_cannot_race_under_the_receipt_store_lock -- --exact --nocapture
+
       - name: Run tests
         run: cargo test --locked --all-targets --all-features
 

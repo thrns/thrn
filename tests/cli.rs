@@ -164,6 +164,71 @@ fn receipt_json(project_root: &str, resource_id: &str, skill_name: &str, identit
     .expect("valid receipt JSON")
 }
 
+fn receipt_json_with_install_identity(
+    project_root: &str,
+    resource_id: &str,
+    skill_name: &str,
+    project_identity: (u64, u64),
+    destination_identity: (u64, u64),
+) -> Vec<u8> {
+    let content = b"abc";
+    let file_digest = digest(&SHA256, content);
+    let mut content_context = Context::new(&SHA256);
+    content_context.update(b"THRN-CONTENT-INVENTORY-V2\0");
+    content_context.update(&destination_identity.0.to_be_bytes());
+    content_context.update(&destination_identity.1.to_be_bytes());
+    content_context.update(&0_u64.to_be_bytes());
+    content_context.update(&1_u64.to_be_bytes());
+    content_context.update(b"F");
+    content_context.update(&("SKILL.md".len() as u64).to_be_bytes());
+    content_context.update(b"SKILL.md");
+    content_context.update(&(content.len() as u64).to_be_bytes());
+    content_context.update(file_digest.as_ref());
+    let content_digest = format!("sha256:{}", {
+        let value = content_context.finish();
+        value
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    });
+    let destination = std::path::Path::new(project_root)
+        .join(".agents/skills")
+        .join(skill_name)
+        .to_string_lossy()
+        .into_owned();
+    serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "catalogResourceId": resource_id,
+        "skillName": skill_name,
+        "agent": "codex",
+        "scope": "project",
+        "canonicalProjectRoot": project_root,
+        "projectRootIdentity": { "volume": project_identity.0, "object": project_identity.1 },
+        "destination": destination,
+        "installedDirectoryIdentity": {
+            "volume": destination_identity.0,
+            "object": destination_identity.1
+        },
+        "installedAtUnixSeconds": 1,
+        "sourceOwner": "example-org",
+        "sourceRepository": "catalog-test-fixtures",
+        "sourceCommit": "2f68bee292a8c68346b4294fb31d9563eefe1ade",
+        "sourceDirectory": "skills/uncharted-ideation",
+        "resourceVersion": "1.0.0",
+        "directories": [],
+        "files": [{
+            "path": "SKILL.md",
+            "byteCount": content.len(),
+            "sha256": format!("sha256:{}", sha256_hex(content))
+        }],
+        "fileCount": 1,
+        "byteCount": content.len(),
+        "contentDigest": content_digest
+    }))
+    .expect("valid identity-bound receipt JSON")
+}
+
 fn write_receipt(
     directory: &TestDir,
     project_root: &str,
@@ -178,6 +243,86 @@ fn write_receipt(
         receipt_json(project_root, resource_id, skill_name, identity),
     )
     .expect("receipt should be written");
+}
+
+fn write_receipt_with_install_identity(
+    directory: &TestDir,
+    project_root: &str,
+    resource_id: &str,
+    skill_name: &str,
+    project_identity: (u64, u64),
+    destination_identity: (u64, u64),
+) {
+    let receipts = receipt_directory(directory);
+    fs::create_dir_all(&receipts).expect("receipt storage should be created");
+    fs::write(
+        receipts.join(receipt_filename(project_root, resource_id)),
+        receipt_json_with_install_identity(
+            project_root,
+            resource_id,
+            skill_name,
+            project_identity,
+            destination_identity,
+        ),
+    )
+    .expect("identity-bound receipt should be written");
+}
+
+fn project_filesystem_identity(path: &std::path::Path) -> (u64, u64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(path).expect("project metadata is available");
+        (metadata.dev(), metadata.ino())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+        use windows_sys::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
+        };
+        let mut options = fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        let file = options.open(path).expect("project directory opens safely");
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `file` is a live directory handle and `information` is writable storage for
+        // the documented output structure.
+        let result =
+            unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) };
+        assert_ne!(result, 0, "project directory identity is available");
+        let object =
+            (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+        (u64::from(information.dwVolumeSerialNumber), object)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        (0, 0)
+    }
+}
+
+fn prepare_receipted_removal_fixture(directory: &TestDir, resource_id: &str) -> PathBuf {
+    let root = fs::canonicalize(directory.path()).expect("canonical project path");
+    let destination = root.join(".agents/skills/uncharted-ideation");
+    fs::create_dir_all(&destination).expect("skill destination");
+    fs::write(destination.join("SKILL.md"), b"abc").expect("skill file");
+    let project_identity = project_filesystem_identity(&root);
+    let destination_identity = project_filesystem_identity(&destination);
+    write_receipt_with_install_identity(
+        directory,
+        root.to_str().expect("canonical path is UTF-8"),
+        resource_id,
+        "uncharted-ideation",
+        project_identity,
+        destination_identity,
+    );
+    destination
 }
 
 fn write_cache(directory: &TestDir, catalog: &[u8]) {
@@ -531,6 +676,187 @@ fn installed_listing_fails_on_unrecognized_receipt_content_without_changing_it()
     assert_eq!(
         fs::read(file).expect("unrecognized content remains"),
         b"not an M2 receipt"
+    );
+}
+
+#[test]
+fn remove_dry_run_is_offline_read_only_and_prints_the_full_verified_plan() {
+    let directory = TestDir::new();
+    let destination = prepare_receipted_removal_fixture(&directory, "creative-lab");
+    let root = fs::canonicalize(directory.path()).expect("canonical project root");
+    let receipt_path = receipt_directory(&directory).join(receipt_filename(
+        root.to_str().expect("canonical path is UTF-8"),
+        "creative-lab",
+    ));
+    let receipt_before = fs::read(&receipt_path).expect("receipt before dry run");
+
+    let output = command_in(
+        &directory,
+        &[
+            "skills",
+            "remove",
+            "creative-lab",
+            "--agent",
+            "codex",
+            "--dry-run",
+        ],
+    )
+    .output()
+    .expect("CLI starts");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "removal dry-run stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Verified THRN skill removal plan"));
+    assert!(stdout.contains("Resource: creative-lab"));
+    assert!(stdout.contains("Skill name: uncharted-ideation"));
+    assert!(stdout.contains(&format!("Destination: {}", destination.display())));
+    assert!(stdout.contains("- SKILL.md (3)"));
+    assert!(stdout.contains("Files to remove: 1\nBytes to remove: 3"));
+    assert!(stdout.contains("Verification: complete receipt and current content match"));
+    assert!(output.stderr.is_empty());
+    assert_eq!(fs::read(destination.join("SKILL.md")).unwrap(), b"abc");
+    assert_eq!(fs::read(&receipt_path).unwrap(), receipt_before);
+    assert!(!data_directory(&directory).join("removals").exists());
+}
+
+#[test]
+fn remove_success_reports_only_after_receipt_retirement_and_installed_listing_is_empty() {
+    let directory = TestDir::new();
+    let destination = prepare_receipted_removal_fixture(&directory, "creative-lab");
+    let expected = format!(
+        "Removed THRN skill\nResource: creative-lab\nSkill name: uncharted-ideation\nAgent: codex\nScope: project\nDestination: {}\nFiles removed: 1\nBytes removed: 3\nOwnership receipt: retired\n",
+        destination.display(),
+    );
+
+    let output = command_in(
+        &directory,
+        &["skills", "remove", "creative-lab", "--agent", "codex"],
+    )
+    .output()
+    .expect("CLI starts");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "removal stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    assert!(output.stderr.is_empty());
+    assert!(!destination.exists());
+    assert!(directory.path().join(".agents/skills").is_dir());
+
+    let listed = command_in(&directory, &["skills", "list", "--installed"])
+        .output()
+        .expect("installed listing starts");
+    assert_eq!(listed.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&listed.stdout)
+            .contains("No THRN-managed installations are recorded.")
+    );
+    assert!(!String::from_utf8_lossy(&listed.stdout).contains("creative-lab"));
+    assert!(listed.stderr.is_empty());
+}
+
+#[test]
+fn remove_refuses_legacy_receipt_without_install_identity_and_preserves_content() {
+    let directory = TestDir::new();
+    let root = fs::canonicalize(directory.path()).expect("canonical project root");
+    let destination = root.join(".agents/skills/uncharted-ideation");
+    fs::create_dir_all(&destination).expect("skill destination");
+    fs::write(destination.join("SKILL.md"), b"abc").expect("skill file");
+    let (volume, object) = project_filesystem_identity(&root);
+    write_receipt(
+        &directory,
+        root.to_str().expect("canonical project root is UTF-8"),
+        "creative-lab",
+        "uncharted-ideation",
+        object,
+    );
+    let receipt_path = receipt_directory(&directory).join(receipt_filename(
+        root.to_str().expect("canonical project root is UTF-8"),
+        "creative-lab",
+    ));
+    let mut legacy: serde_json::Value =
+        serde_json::from_slice(&fs::read(&receipt_path).expect("legacy receipt"))
+            .expect("legacy JSON");
+    legacy["projectRootIdentity"]["volume"] = serde_json::json!(volume);
+    let legacy_bytes = serde_json::to_vec(&legacy).expect("serialize legacy receipt");
+    fs::write(&receipt_path, &legacy_bytes).expect("write valid legacy receipt");
+
+    let output = command_in(
+        &directory,
+        &["skills", "remove", "creative-lab", "--agent", "codex"],
+    )
+    .output()
+    .expect("CLI starts");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no installation-time directory identity"),
+        "legacy removal stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(destination.join("SKILL.md")).unwrap(), b"abc");
+    assert_eq!(fs::read(receipt_path).unwrap(), legacy_bytes);
+}
+
+#[test]
+fn remove_rejects_unmanaged_content_unsupported_agent_and_force_option() {
+    let directory = TestDir::new();
+    let unmanaged = directory.path().join(".agents/skills/uncharted-ideation");
+    fs::create_dir_all(&unmanaged).expect("unmanaged skill directory");
+    fs::write(unmanaged.join("SKILL.md"), b"user content").expect("unmanaged skill file");
+
+    let missing_receipt = command_in(
+        &directory,
+        &["skills", "remove", "creative-lab", "--agent", "codex"],
+    )
+    .output()
+    .expect("CLI starts");
+    assert_eq!(missing_receipt.status.code(), Some(1));
+    assert!(missing_receipt.stdout.is_empty());
+    assert!(!missing_receipt.stderr.is_empty());
+    assert_eq!(
+        fs::read(unmanaged.join("SKILL.md")).unwrap(),
+        b"user content"
+    );
+
+    let unsupported = command_in(
+        &directory,
+        &["skills", "remove", "creative-lab", "--agent", "claude"],
+    )
+    .output()
+    .expect("CLI starts");
+    assert_eq!(unsupported.status.code(), Some(1));
+    assert!(unsupported.stdout.is_empty());
+    assert!(!unsupported.stderr.is_empty());
+
+    let force = command_in(
+        &directory,
+        &[
+            "skills",
+            "remove",
+            "creative-lab",
+            "--agent",
+            "codex",
+            "--force",
+        ],
+    )
+    .output()
+    .expect("CLI starts");
+    assert_eq!(force.status.code(), Some(2));
+    assert!(force.stdout.is_empty());
+    assert!(!force.stderr.is_empty());
+    assert_eq!(
+        fs::read(unmanaged.join("SKILL.md")).unwrap(),
+        b"user content"
     );
 }
 
