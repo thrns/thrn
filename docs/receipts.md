@@ -3,8 +3,11 @@
 M2-05 introduced private schema-v1 receipts for THRN-managed Codex project skills. Project installs
 publish schema-v2 receipts, which add the final destination directory's installation-time
 filesystem identity. Explicit user-scope installs publish schema-v3 receipts, which additionally
-bind the actual user home and scope-root identity. Schema-v1 remains readable for offline listing
-and interrupted-install compatibility, but it cannot authorize removal or update. The store is
+bind the actual user home and scope-root identity. Claude Code project and user installs publish
+schema-v4 receipts with explicit agent, scope, destination layout, canonical root, and root identity.
+Existing Codex project schema-v1/v2 and user schema-v3 receipts keep their JSON shapes, deterministic
+keys, and digest meanings unchanged. Schema-v1 remains readable for offline listing and
+interrupted-install compatibility, but it cannot authorize removal or update. The store is
 separate from catalog cache data and lives under the OS application-data directory's `receipts`
 child.
 `THRN_DATA_DIR` can select an alternate absolute data directory for isolated use and tests. Its
@@ -86,6 +89,29 @@ user receipt, user fields in a project receipt, scope/schema mismatches, and a u
 root or destination does not match the selected home. A project receipt is never reinterpreted as
 user ownership.
 
+## Claude Code schema v4
+
+Schema v4 is reserved for `agent: "claude-code"` in either explicit project or user scope. It adds
+`destinationLayout: "claude-code-default-v1"` and requires exactly one matching root shape:
+`canonicalProjectRoot` with `projectRootIdentity`, or `canonicalScopeRoot` with
+`scopeRootIdentity`. The destination must be exactly `<root>/.claude/skills/<skillName>`. The
+receipt also requires the committed destination's installation-time identity, full GitHub
+provenance, and the same complete sorted inventory of files, directories, byte counts, and
+individual SHA-256 values used by the existing engine. Host-reserved names such as `synced` and
+the `anthropic-skills` namespace are rejected before a Claude receipt can be created or accepted.
+
+Schema-v4 content digests use `THRN-CONTENT-INVENTORY-V4\0`. They bind agent, scope, layout,
+canonical scope-root path and identity, committed destination identity, and the canonical inventory.
+The separate `THRN-RECEIPT-IDENTITY-V4\0` key binds agent, scope, layout, canonical root and root
+identity, then agent and canonical resource ID. Filenames use `v4-<64 lowercase hex>.json`. V4
+install intents use a distinct intent digest inside the install journal; a receipt is published
+only after the no-replace directory commit captures the final destination identity.
+
+Strict validation never treats an old Codex receipt as a Claude claim. Codex retains historical
+schema-v1/v2 project keys and schema-v3 user keys byte-for-byte; Claude v4 has separate keys and
+ownership identity. The same resource and skill name therefore has independent receipts for both
+agents and both scopes.
+
 ## Identity and aggregate digest
 
 The project receipt filename is `v1-<64 lowercase hex>.json`. The filename digest is SHA-256 over
@@ -108,7 +134,9 @@ The aggregate content digest uses SHA-256 over `THRN-CONTENT-INVENTORY-V1\0`, th
 Every entry has a type tag, every path has a length, and every file carries its byte length and
 digest. The encoding does not depend on JSON key order or ambiguous string concatenation. Schema v2
 uses its version-2 domain separator and prefixes this inventory with the recorded destination volume
-and object values. User schema v3 uses the separate v3 domain described above.
+and object values. User schema v3 uses the separate v3 domain described above; Claude schema v4
+binds agent, scope, destination layout, canonical root and root identity, committed destination
+identity, and inventory under its own domain.
 
 ## Storage and publication
 
@@ -160,8 +188,8 @@ compare paths case-insensitively and also compare the stored scope-root identity
 different machine is not supported as proof that the target directory is the same object.
 
 Receipts do not upgrade manually installed or otherwise unreceipted skills into THRN-owned content.
-Corrupt records never authorize removal or update. Only explicit Codex scope selection is supported;
-other agent adapters are future work. `skills remove` does not need the current catalog: it selects
+Corrupt records never authorize removal or update. Only explicit Codex or Claude Code selection is
+supported; other agent adapters are future work. `skills remove` does not need the current catalog: it selects
 one exact canonical resource ID in the selected scope and verifies the recorded root identity,
 installation-time destination identity, exact destination path, every directory and file, and each
 file's byte count and SHA-256 before building a read-only plan. Extra, missing, linked, hard-linked,
@@ -170,30 +198,32 @@ locations such as `$CODEX_HOME/skills`.
 
 ## Compatibility and migration
 
-Existing project schema-v1 and schema-v2 receipt bytes, keys, and destination identities are
+Existing Codex project schema-v1 and schema-v2 receipt bytes, keys, and destination identities are
 preserved. Listing continues to parse schema-v1, while automatic removal and update refuse because
 installation-time directory ownership cannot be established. No receipt is migrated and no
-unreceipted directory is adopted. Project installs continue to write schema v2; only explicitly
-selected user installs write schema v3. User scope does not reinterpret old project receipts or
+unreceipted directory is adopted. Codex project installs continue to write schema v2 and explicit
+Codex user installs write schema v3. Claude Code project and user installs write schema v4. No
+agent's receipt keys overlap another agent's key, and no old project receipt is reinterpreted as
+Claude ownership. User scope does not reinterpret old project receipts or
 legacy Codex directories such as `$CODEX_HOME/skills`.
 
 Project install operation-journal schema v1 remains readable. Its historical receipt intent is
 schema v1; an interrupted installation can still recover under its original journal identity and
 inventory checks. Existing project receipts are never rewritten. New project operations persist
 the identity-bound v2 receipt in the journal before receipt publication and success. User install,
-remove, and update operations use separate strict journal schema versions that carry v3 user receipts
-and bind the selected user root. Recovery retains the original project journal parsing and cannot
-change an operation's scope.
+remove, and update operations use separate strict journal schema versions that carry v3 Codex user
+or v4 Claude receipts and bind the selected agent and scope root. Recovery retains original project
+journal parsing and cannot change an operation's scope.
 
 An interrupted pre-v2 removal journal cannot authorize new destructive recovery because it lacks
 installation-time evidence. Nonterminal legacy removal journals are left intact with content
 preserved and require independent inspection. Terminal journal cleanup remains verifiable without
 deleting project content.
 
-User install, removal, and update journals retain the selected scope root, scope-specific receipt,
-and transaction identities. Project and user operations use the same exclusive writer lock and
-recovery admission. Recovery cannot cross between scopes, and user operations never derive their
-root from the current working directory.
+Project and user operations retain the selected agent, scope root, scope-specific receipt, and
+transaction identities. All four targets use the same exclusive writer lock and recovery admission.
+Recovery refuses to mutate a pending operation for another agent, scope, or root. User operations
+never derive their root from the current working directory.
 
 Removal uses the same exclusive writer lock as installation. It journals intent, moves the verified
 directory to an operation-private sibling quarantine with a no-replace rename, removes only

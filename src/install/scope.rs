@@ -6,10 +6,14 @@ use thiserror::Error;
 
 use crate::os_paths::{OsPathError, OsPaths};
 
-use super::{commit::SecureDir, plan::InstallScope};
+use super::{
+    commit::SecureDir,
+    plan::{InstallAgent, InstallScope},
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResolvedScope {
+    agent: InstallAgent,
     scope: InstallScope,
     root: PathBuf,
 }
@@ -17,7 +21,23 @@ pub(crate) struct ResolvedScope {
 impl ResolvedScope {
     #[cfg(test)]
     pub(crate) fn from_validated(scope: InstallScope, root: PathBuf) -> Self {
-        Self { scope, root }
+        Self {
+            agent: InstallAgent::Codex,
+            scope,
+            root,
+        }
+    }
+
+    pub(crate) fn from_agent_validated(
+        agent: InstallAgent,
+        scope: InstallScope,
+        root: PathBuf,
+    ) -> Self {
+        Self { agent, scope, root }
+    }
+
+    pub(crate) fn agent(&self) -> InstallAgent {
+        self.agent
     }
 
     pub(crate) fn scope(&self) -> InstallScope {
@@ -30,7 +50,7 @@ impl ResolvedScope {
 
     #[cfg(test)]
     pub(crate) fn skills_root(&self) -> PathBuf {
-        self.root.join(".agents").join("skills")
+        self.agent.adapter().skills_root(self.root.clone())
     }
 
     #[cfg(test)]
@@ -58,10 +78,17 @@ impl ScopeResolver {
 
     pub(crate) fn resolve(
         &self,
+        agent: InstallAgent,
         scope: InstallScope,
         project: Option<&Path>,
         current_directory: Option<&Path>,
     ) -> Result<ResolvedScope, ScopeResolutionError> {
+        if !agent.adapter().supports_scope(scope) {
+            return Err(ScopeResolutionError::UnsupportedScope {
+                agent: agent.as_str(),
+                scope: scope.as_str(),
+            });
+        }
         if scope == InstallScope::User && project.is_some() {
             return Err(ScopeResolutionError::ProjectPathWithUserScope);
         }
@@ -71,11 +98,11 @@ impl ScopeResolver {
                     current_directory.ok_or(ScopeResolutionError::InvalidProjectRoot)?;
                 let root = super::removal::resolve_project_root(project, current_directory)
                     .map_err(|_| ScopeResolutionError::InvalidProjectRoot)?;
-                Ok(ResolvedScope { scope, root })
+                Ok(ResolvedScope { agent, scope, root })
             }
             InstallScope::User => {
                 let root = resolve_user_home(self.paths.user_home())?;
-                Ok(ResolvedScope { scope, root })
+                Ok(ResolvedScope { agent, scope, root })
             }
         }
     }
@@ -116,6 +143,13 @@ pub(crate) enum ScopeResolutionError {
     OsPaths(#[from] OsPathError),
     #[error("--project can only be used with --scope project")]
     ProjectPathWithUserScope,
+    #[error("unsupported agent {0:?}")]
+    UnsupportedAgent(String),
+    #[error("agent {agent} does not support {scope} scope")]
+    UnsupportedScope {
+        agent: &'static str,
+        scope: &'static str,
+    },
     #[error("the selected project directory is unavailable or unsafe")]
     InvalidProjectRoot,
     #[error("the operating-system home directory is missing, ambiguous, or unsafe")]
@@ -132,7 +166,7 @@ mod tests {
     use crate::install::windows_test_support::create_junction;
     use crate::os_paths::OsPaths;
 
-    use super::{ScopeResolutionError, ScopeResolver};
+    use super::{InstallAgent, ScopeResolutionError, ScopeResolver};
     use crate::install::plan::InstallScope;
 
     fn resolver(home: PathBuf) -> ScopeResolver {
@@ -146,7 +180,12 @@ mod tests {
         let home = root_path.join("home");
         fs::create_dir(&home).expect("home directory");
         let resolved = resolver(home.clone())
-            .resolve(InstallScope::User, None, Some(root.path()))
+            .resolve(
+                InstallAgent::Codex,
+                InstallScope::User,
+                None,
+                Some(root.path()),
+            )
             .expect("user scope resolves");
         assert_eq!(resolved.scope(), InstallScope::User);
         assert_eq!(resolved.root(), home);
@@ -159,11 +198,17 @@ mod tests {
         let root_path = root.path().canonicalize().expect("canonical temp root");
         let missing = root_path.join("missing");
         assert!(matches!(
-            resolver(missing).resolve(InstallScope::User, None, Some(&root_path)),
+            resolver(missing).resolve(
+                InstallAgent::Codex,
+                InstallScope::User,
+                None,
+                Some(&root_path)
+            ),
             Err(ScopeResolutionError::UnsafeHomeDirectory)
         ));
         assert!(matches!(
             resolver(PathBuf::from("relative-home")).resolve(
+                InstallAgent::Codex,
                 InstallScope::User,
                 None,
                 Some(&root_path)
@@ -179,7 +224,12 @@ mod tests {
         #[cfg(windows)]
         create_junction(&link_home, &real_home);
         assert!(matches!(
-            resolver(link_home).resolve(InstallScope::User, None, Some(&root_path)),
+            resolver(link_home).resolve(
+                InstallAgent::Codex,
+                InstallScope::User,
+                None,
+                Some(&root_path)
+            ),
             Err(ScopeResolutionError::UnsafeHomeDirectory)
         ));
     }
@@ -193,7 +243,12 @@ mod tests {
         let project = root_path.join("project");
         fs::create_dir(&project).expect("project directory");
         assert!(matches!(
-            resolver(home).resolve(InstallScope::User, Some(&project), Some(&project)),
+            resolver(home).resolve(
+                InstallAgent::Codex,
+                InstallScope::User,
+                Some(&project),
+                Some(&project)
+            ),
             Err(ScopeResolutionError::ProjectPathWithUserScope)
         ));
     }

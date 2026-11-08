@@ -1,28 +1,29 @@
 # Installation, update, and removal recovery
 
-M2-06 introduced the recovery protocol for Codex project installation. M3-04 extends the same
-receipt store, OS-backed writer lock, staging, no-replace commitment, removal quarantine, update
-backup, and recovery paths to explicitly selected Codex user scope. `thrn skills install` enters it
-through `InstallationSession::commit_and_record`; recovery itself has no network dependency and
-tests use isolated application-data, project, and home directories.
+M2-06 introduced the recovery protocol for Codex project installation. M3-04 added Codex user scope;
+M3-05 extends the same receipt store, OS-backed writer lock, staging, no-replace commitment, removal
+quarantine, update backup, and recovery paths to Claude Code project and user scope. `thrn skills
+install` enters it through `InstallationSession::commit_and_record`; recovery itself has no network
+dependency and tests use isolated application-data, project, and home directories.
 
 ## Scope-bound recovery
 
 Project operations retain their original journal formats and resolve the selected project root.
-Explicit user operations resolve the validated OS home and require receipt scope, canonical root,
-root filesystem identity, destination, and journal identities to agree. User install, removal, and
-update journals use schema version 2; project journals retain their existing schema version 1. A
-record cannot switch scope during recovery. The selected skill destination is
-`<project>/.agents/skills/<skillName>` or `<home>/.agents/skills/<skillName>`. User operations do
-not use the current working directory or legacy `$CODEX_HOME/skills` as a fallback. Both scopes
-hold the same `.writer.lock` through recovery and transaction completion.
+Explicit user operations resolve the validated OS home and require agent, receipt scope, canonical
+root, root filesystem identity, destination, and journal identities to agree. Codex project journals
+retain schema version 1; Codex user and Claude Code project/user journals use lifecycle-specific
+schema v2 and v3 records. A record cannot switch agent, scope, or root during recovery. Codex uses
+`<project>/.agents/skills/<skillName>` or `<home>/.agents/skills/<skillName>`; Claude Code uses
+`<project>/.claude/skills/<skillName>` or `<home>/.claude/skills/<skillName>`. User operations do
+not use the current working directory as a fallback. Both agents and scopes hold the same
+`.writer.lock` through recovery and transaction completion.
 
 ## Journal storage and schema
 
 Operation records live in the application-data `operations` directory, beside and separate from
 `receipts` and the catalog cache. Each operation is a sequence of immutable JSON snapshots named
-`op-<random-128-bit-id>-<zero-padded-sequence>.json`. Project schema version 1 and user schema
-version 2 reject unknown fields,
+`op-<random-128-bit-id>-<zero-padded-sequence>.json`. Project schema version 1, Codex user schema
+version 2, and Claude Code schema version 3 reject unknown fields,
 unsupported versions, malformed names, missing or duplicate sequence entries, unsafe object types,
 invalid receipt data, and records larger than 10 MiB. The store is bounded to 16,384 entries and
 256 MiB total; inventory paths and record counts are validated against the receipt and archive
@@ -30,11 +31,12 @@ limits. Capacity exhaustion fails closed and can leave an explicitly incomplete 
 recovery or manual inspection.
 
 Every snapshot carries a strict receipt identity and full expected receipt, operation ID and
-sequence, state, destination-local staging name, selected-root `.agents` and `skills` identities, whether
-THRN intended to create those parents, the staging and final directory identities, and the relative
+sequence, state, destination-local staging name, selected-root agent-directory and `skills`
+identities, whether THRN intended to create those parents, the staging and final directory identities, and the relative
 paths and filesystem identities of operation-created files and directories. A new operation begins
 with a scope-specific receipt intent needed for reservation. After the no-replace commit, the journal
-records the committed destination identity and matching project schema-v2 or user schema-v3 receipt
+records the committed destination identity and matching Codex project schema-v2, Codex user
+schema-v3, or Claude Code schema-v4 receipt
 together before it can advance to `DirectoryCommitVerified`. The receipt's identity must equal the
 journal's destination identity. Historical project v1 journal snapshots remain readable; they keep
 their original strict receipt data until recovery can prove an in-progress installation from its
@@ -105,7 +107,7 @@ verification.
   removes the terminal record after validation.
 - `FilesystemCommitInProgress`, final destination absent: only a staging tree whose root, every
   object identity, exact inventory, and complete file hashes match the journal can be removed.
-  Created `.agents` or `skills` parents are removed only if their recorded identities still match
+  Created agent-directory or `skills` parents are removed only if their recorded identities still match
   and they are empty. Before each removal, recovery durably records an object-specific cleanup
   intent, rechecks identity and contents, removes the object, then synchronizes the containing
   directory where supported. A missing object is tolerated only where that exact cleanup intent
@@ -163,14 +165,15 @@ operations fail closed.
 ## Receipt-backed removal state machine
 
 M3-01 adds a separate versioned removal journal in application-data `removals`; project removal
-requires a schema-v2 installation receipt and user removal requires schema v3. Neither weakens the
+requires a Codex schema-v2 or Claude schema-v4 installation receipt for project scope, and user
+removal requires Codex schema v3 or Claude schema v4. Neither weakens the
 install journal. Removal and
 installation hold the same exclusive `.writer.lock` from recovery/admission through transaction
 completion. Install admission rejects any unresolved removal record, and receipt listing remains
 read-only but fails closed while a removal transaction is pending.
 
 The removal journal contains the strict scope-appropriate ownership receipt, receipt-store and receipt-file
-identities, canonical selected root and `.agents/skills` identities, the verified destination identity,
+identities, canonical selected root and selected agent-directory/`skills` identities, the verified destination identity,
 the complete expected object inventory with filesystem identities and file digests, a random sibling
 quarantine name, and a set of durable per-object cleanup intents. The record duplicates the
 receipt's installation-time destination identity and requires both to agree. It also pins the
@@ -205,7 +208,7 @@ Ordering rules:
 
 1. Acquire and validate the existing writer lock; recover install/removal/update operations or reject them.
    Read and validate receipt claims, then build a read-only plan from exact canonical ID, project
-   identity, exact Codex path, directory/file identities, complete inventory, hard-link counts,
+identity, exact agent-specific path, directory/file identities, complete inventory, hard-link counts,
    sizes, and SHA-256 values.
 2. Persist `Prepared` before project mutation. Persist `DestinationRenamePending`, revalidate the
    receipt and full tree, check parent identities and quarantine absence, and revalidate immediately
@@ -249,12 +252,14 @@ recovery may need to preserve and report a conflict.
 ## Receipt-backed update state machine
 
 M3-02 uses a separate strict versioned journal in application-data `updates`. It shares the
-persistent `.writer.lock` with installation and removal. Project updates require schema v2 and user
-updates require schema v3. The record captures the old scope-appropriate
-receipt, its raw-byte SHA-256 and filesystem identity, the complete old and replacement inventories,
-scope-root and Codex parent identities, stage and destination directory identities, receipt transition
-temporary/backup identities, operation-owned names, and per-object cleanup intents. It records the
-new schema-v2 receipt before that receipt can be published. Journal snapshots use exclusive temp
+persistent `.writer.lock` with installation and removal. Codex project updates use journal schema
+v1 and receipt schema v2; Codex user updates use journal schema v2 and receipt schema v3; Claude
+Code project/user updates use journal schema v3 and receipt schema v4. The record captures the old
+scope-appropriate receipt, its raw-byte SHA-256 and filesystem identity, the complete old and
+replacement inventories, scope-root and selected agent parent identities, stage and destination
+directory identities, receipt transition temporary/backup identities, operation-owned names, and
+per-object cleanup intents. It records the new scope-appropriate receipt before it can be published.
+Journal snapshots use exclusive temp
 files, strict read-back validation, and no-replace publication; malformed journals and leftover
 pending journal objects block new lifecycle operations and installed listing.
 
@@ -286,7 +291,7 @@ private sibling stage on the destination filesystem, verifies every expected byt
 records the stage identity/inventory before moving the original. It then performs two separate
 no-replace renames: original to operation-owned backup, then stage to original destination. This is
 not an atomic swap. The replacement's committed directory identity is captured through the secure
-handle and bound into the new project schema-v2 or user schema-v3 receipt.
+handle and bound into the new Codex project schema-v2, Codex user schema-v3, or Claude schema-v4 receipt.
 
 Receipt transition retains the deterministic receipt filename. The exact old receipt remains active
 until the journal has the new receipt contents and temp identity. THRN moves the exact old receipt

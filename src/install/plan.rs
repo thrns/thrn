@@ -17,18 +17,7 @@ use super::{
     inventory::StagedInventory,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InstallAgent {
-    Codex,
-}
-
-impl InstallAgent {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Codex => "codex",
-        }
-    }
-}
+pub use crate::agents::AgentId as InstallAgent;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
 pub enum InstallScope {
@@ -194,6 +183,12 @@ pub enum PlanError {
     ByteTotalOverflow,
     #[error("planned file sizes do not match the validated staged inventory total")]
     InventoryTotalMismatch,
+    #[error("destination snapshot uses a different agent adapter")]
+    AgentMismatch,
+    #[error("selected agent does not support this skill scope")]
+    UnsupportedScope,
+    #[error("skill name is reserved by the selected agent")]
+    ReservedSkillName,
 }
 
 /// Pure builder: it consumes M2-02 validated staged metadata, a read-only staged inventory, and
@@ -203,15 +198,41 @@ pub fn build_install_plan(
     inventory: &StagedInventory,
     destination: DestinationSnapshot,
 ) -> Result<InstallPlan, PlanError> {
-    build_install_plan_for_scope(staged, inventory, destination, InstallScope::Project)
+    build_install_plan_for_agent_scope(
+        staged,
+        inventory,
+        destination,
+        InstallAgent::Codex,
+        InstallScope::Project,
+    )
 }
 
+#[cfg(test)]
 pub(crate) fn build_install_plan_for_scope(
     staged: &StagedSkill,
     inventory: &StagedInventory,
     destination: DestinationSnapshot,
     scope: InstallScope,
 ) -> Result<InstallPlan, PlanError> {
+    build_install_plan_for_agent_scope(staged, inventory, destination, InstallAgent::Codex, scope)
+}
+
+pub(crate) fn build_install_plan_for_agent_scope(
+    staged: &StagedSkill,
+    inventory: &StagedInventory,
+    destination: DestinationSnapshot,
+    agent: InstallAgent,
+    scope: InstallScope,
+) -> Result<InstallPlan, PlanError> {
+    if destination.agent() != agent {
+        return Err(PlanError::AgentMismatch);
+    }
+    if agent
+        .adapter()
+        .rejects_skill_name(staged.skill_name().as_str())
+    {
+        return Err(PlanError::ReservedSkillName);
+    }
     if inventory.catalog_id() != staged.catalog_id()
         || inventory.skill_name() != staged.skill_name()
         || inventory.revision() != staged.revision()
@@ -222,10 +243,10 @@ pub(crate) fn build_install_plan_for_scope(
 
     let project_root = destination.project_root().to_path_buf();
     let intended_destination = destination.destination().to_path_buf();
-    let expected_destination = project_root
-        .join(".agents")
-        .join("skills")
-        .join(staged.skill_name().as_str());
+    let expected_destination = agent
+        .adapter()
+        .destination_path(scope, project_root.clone(), staged.skill_name().as_str())
+        .ok_or(PlanError::UnsupportedScope)?;
     if intended_destination != expected_destination
         || !intended_destination.starts_with(&project_root)
     {
@@ -234,10 +255,10 @@ pub(crate) fn build_install_plan_for_scope(
 
     let mut directory_paths = BTreeSet::new();
     if destination.agents_state() == ComponentState::Missing {
-        directory_paths.insert(project_root.join(".agents"));
+        directory_paths.insert(project_root.join(agent.adapter().skill_directory()));
     }
     if destination.skills_state() == ComponentState::Missing {
-        directory_paths.insert(project_root.join(".agents/skills"));
+        directory_paths.insert(agent.adapter().skills_root(project_root.clone()));
     }
     if destination.skill_state() == ComponentState::Missing {
         directory_paths.insert(intended_destination.clone());
@@ -292,7 +313,7 @@ pub(crate) fn build_install_plan_for_scope(
         source_repository: source.repository().clone(),
         source_commit: staged.revision().clone(),
         source_directory: source.path().clone(),
-        agent: InstallAgent::Codex,
+        agent,
         scope,
         project_root,
         destination: intended_destination,
@@ -307,13 +328,15 @@ pub(crate) fn build_install_plan_for_scope(
 /// Build the replacement copy plan for a receipt-verified managed directory. The caller must
 /// independently prove ownership and revalidate the destination before commitment; this builder
 /// only removes the expected existing-directory conflict at that exact destination.
-pub(crate) fn build_update_install_plan_for_scope(
+pub(crate) fn build_update_install_plan_for_agent_scope(
     staged: &StagedSkill,
     inventory: &StagedInventory,
     destination: DestinationSnapshot,
+    agent: InstallAgent,
     scope: InstallScope,
 ) -> Result<InstallPlan, PlanError> {
-    let mut plan = build_install_plan_for_scope(staged, inventory, destination, scope)?;
+    let mut plan =
+        build_install_plan_for_agent_scope(staged, inventory, destination, agent, scope)?;
     plan.conflicts.retain(|conflict| {
         conflict.path() != plan.destination
             || conflict.kind() != super::destination::ConflictKind::ExistingDirectory

@@ -3,6 +3,7 @@ use std::{io, path::Path};
 use thiserror::Error;
 
 use crate::{
+    agents::AgentId,
     models::catalog::Catalog,
     registry::discovery::{CatalogResolver, ResolutionError},
     sources::{
@@ -13,19 +14,19 @@ use crate::{
 
 use super::{
     commit::InstallationSession,
-    destination::{DestinationConflict, DestinationError, inspect_destination},
+    destination::{DestinationConflict, DestinationError, inspect_destination_for_agent},
     inventory::{InventoryError, inspect_staged_skill},
-    plan::{InstallPlan, PlanError, build_install_plan_for_scope},
+    plan::{InstallAgent, InstallPlan, PlanError, build_install_plan_for_agent_scope},
     scope::ResolvedScope,
 };
 
 #[cfg(test)]
-use super::plan::build_install_plan;
+use super::plan::InstallScope;
 
 #[derive(Debug, Error)]
 pub(crate) enum InstallCommandError {
-    #[error("M2-03 supports only --agent codex")]
-    UnsupportedAgent,
+    #[error("unsupported agent {0:?}")]
+    UnsupportedAgent(String),
     #[error(transparent)]
     Resolution(#[from] ResolutionError),
     #[error(transparent)]
@@ -97,16 +98,24 @@ pub(crate) fn prepare_install_session<T: GithubTransport + ?Sized>(
     transport: &T,
     tempdir_factory: &dyn TempDirFactory,
 ) -> Result<InstallationSession, InstallCommandError> {
-    if agent != "codex" {
-        return Err(InstallCommandError::UnsupportedAgent);
-    }
+    let agent = parse_agent(agent)?;
 
     let resource = CatalogResolver::new(catalog).resolve(identifier)?;
     let staged = fetch_and_stage_skill_with_factory(resource, transport, tempdir_factory)?;
     let inventory = inspect_staged_skill(&staged)?;
-    let destination =
-        inspect_destination(project, current_directory, staged.skill_name().as_str())?;
-    let plan = build_install_plan(&staged, &inventory, destination)?;
+    let destination = inspect_destination_for_agent(
+        agent,
+        project,
+        current_directory,
+        staged.skill_name().as_str(),
+    )?;
+    let plan = build_install_plan_for_agent_scope(
+        &staged,
+        &inventory,
+        destination,
+        agent,
+        InstallScope::Project,
+    )?;
     Ok(InstallationSession::new(staged, inventory, plan))
 }
 
@@ -119,20 +128,38 @@ pub(crate) fn prepare_install_session_in_scope<T: GithubTransport + ?Sized>(
     transport: &T,
     tempdir_factory: &dyn TempDirFactory,
 ) -> Result<InstallationSession, InstallCommandError> {
-    if agent != "codex" {
-        return Err(InstallCommandError::UnsupportedAgent);
+    let agent = parse_agent(agent)?;
+    if agent != scope.agent() {
+        return Err(InstallCommandError::UnsupportedAgent(
+            agent.as_str().to_owned(),
+        ));
     }
 
     let resource = CatalogResolver::new(catalog).resolve(identifier)?;
     let staged = fetch_and_stage_skill_with_factory(resource, transport, tempdir_factory)?;
     let inventory = inspect_staged_skill(&staged)?;
-    let destination = inspect_destination(
+    let destination = inspect_destination_for_agent(
+        agent,
         Some(scope.root()),
         scope.root(),
         staged.skill_name().as_str(),
     )?;
-    let plan = build_install_plan_for_scope(&staged, &inventory, destination, scope.scope())?;
+    let plan = build_install_plan_for_agent_scope(
+        &staged,
+        &inventory,
+        destination,
+        scope.agent(),
+        scope.scope(),
+    )?;
     Ok(InstallationSession::new(staged, inventory, plan))
+}
+
+fn parse_agent(value: &str) -> Result<InstallAgent, InstallCommandError> {
+    match value {
+        "codex" => Ok(AgentId::Codex),
+        "claude-code" => Ok(AgentId::ClaudeCode),
+        _ => Err(InstallCommandError::UnsupportedAgent(value.to_owned())),
+    }
 }
 
 /// Render a complete successful plan into memory before the CLI writes one byte to stdout.
@@ -445,7 +472,7 @@ mod tests {
         ))
         .expect("catalog");
         for (id, agent, expected) in [
-            ("uncharted", "cursor", "only --agent codex"),
+            ("uncharted", "cursor", "unsupported agent"),
             ("bad--id", "codex", "invalid skill identifier"),
         ] {
             let error = prepare_install_plan(

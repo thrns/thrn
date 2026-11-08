@@ -24,6 +24,7 @@ pub(crate) const MAX_JOURNAL_FILES: usize = 16_384;
 pub(crate) const MAX_JOURNAL_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 const PROJECT_JOURNAL_SCHEMA_VERSION: u64 = 1;
 const USER_JOURNAL_SCHEMA_VERSION: u64 = 2;
+const CLAUDE_JOURNAL_SCHEMA_VERSION: u64 = 3;
 const TEMP_NAME_ATTEMPTS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -151,7 +152,9 @@ impl JournalRecord {
     }
 
     pub(crate) fn validate(&self) -> Result<(), JournalError> {
-        let expected_schema = if self.receipt.scope() == "user" {
+        let expected_schema = if self.receipt.agent() == "claude-code" {
+            CLAUDE_JOURNAL_SCHEMA_VERSION
+        } else if self.receipt.scope() == "user" {
             USER_JOURNAL_SCHEMA_VERSION
         } else {
             PROJECT_JOURNAL_SCHEMA_VERSION
@@ -316,7 +319,9 @@ impl JournalStore {
         faults
             .after(JournalOperation::CreateStore)
             .map_err(|error| map_io("create journal storage", error))?;
-        let schema_version = if intent.receipt.scope() == "user" {
+        let schema_version = if intent.receipt.agent() == "claude-code" {
+            CLAUDE_JOURNAL_SCHEMA_VERSION
+        } else if intent.receipt.scope() == "user" {
             USER_JOURNAL_SCHEMA_VERSION
         } else {
             PROJECT_JOURNAL_SCHEMA_VERSION

@@ -1,3 +1,4 @@
+pub mod agents;
 mod cli;
 mod doctor;
 mod error;

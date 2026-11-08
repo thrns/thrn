@@ -1,4 +1,4 @@
-//! Receipt-backed Codex project skill removal.
+//! Receipt-backed, adapter-scoped skill removal.
 //!
 //! Planning verifies the complete live tree without mutation. Execution moves only that verified
 //! tree to an operation-private sibling quarantine, then removes receipt-listed objects one at a
@@ -24,6 +24,7 @@ use super::{
 
 const PROJECT_REMOVAL_JOURNAL_SCHEMA_VERSION: u64 = 1;
 const USER_REMOVAL_JOURNAL_SCHEMA_VERSION: u64 = 2;
+const CLAUDE_REMOVAL_JOURNAL_SCHEMA_VERSION: u64 = 3;
 const MAX_REMOVAL_JOURNAL_BYTES: usize = 10 * 1024 * 1024;
 const MAX_REMOVAL_JOURNAL_FILES: usize = 16_384;
 const MAX_REMOVAL_JOURNAL_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
@@ -150,7 +151,7 @@ impl RemovalPlan {
                 "canonical project path or filesystem identity differs from the receipt".to_owned(),
             ));
         }
-        let agents = open_exact_directory(&project, ".agents")?;
+        let agents = open_exact_directory(&project, receipt.agent_directory())?;
         let skills = open_exact_directory(&agents, "skills")?;
         let destination_name = receipt.skill_name();
         let destination = open_exact_directory(&skills, destination_name)?;
@@ -181,7 +182,7 @@ impl RemovalPlan {
             receipt_file_identity,
             agents_identity: agents
                 .identity()
-                .map_err(removal_io("identify .agents directory"))?,
+                .map_err(removal_io("identify agent directory"))?,
             skills_identity: skills
                 .identity()
                 .map_err(removal_io("identify skills directory"))?,
@@ -312,7 +313,7 @@ pub(super) fn verify_receipt_for_check(receipt: &InstallationReceipt) -> Result<
             "canonical project path or filesystem identity differs from the receipt".to_owned(),
         ));
     }
-    let agents = open_exact_directory(&project, ".agents")?;
+    let agents = open_exact_directory(&project, receipt.agent_directory())?;
     let skills = open_exact_directory(&agents, "skills")?;
     let destination = open_exact_directory(&skills, receipt.skill_name())?;
     let destination_identity = destination
@@ -636,7 +637,7 @@ enum RemovalOperationType {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RemovalRecord {
+pub(super) struct RemovalRecord {
     schema_version: u64,
     operation_type: RemovalOperationType,
     operation_id: String,
@@ -654,8 +655,14 @@ struct RemovalRecord {
 }
 
 impl RemovalRecord {
+    pub(super) fn receipt(&self) -> &InstallationReceipt {
+        &self.receipt
+    }
+
     fn validate(&self) -> Result<(), RemovalJournalError> {
-        let expected_schema = if self.receipt.scope() == "user" {
+        let expected_schema = if self.receipt.agent() == "claude-code" {
+            CLAUDE_REMOVAL_JOURNAL_SCHEMA_VERSION
+        } else if self.receipt.scope() == "user" {
             USER_REMOVAL_JOURNAL_SCHEMA_VERSION
         } else {
             PROJECT_REMOVAL_JOURNAL_SCHEMA_VERSION
@@ -779,7 +786,9 @@ impl RemovalJournalStore {
             random_id().map_err(|error| map_journal_io("name removal operation", error))?;
         let mut objects = plan.objects.clone();
         objects.sort_by(|left, right| left.order_key().cmp(&right.order_key()));
-        let schema_version = if plan.receipt.scope() == "user" {
+        let schema_version = if plan.receipt.agent() == "claude-code" {
+            CLAUDE_REMOVAL_JOURNAL_SCHEMA_VERSION
+        } else if plan.receipt.scope() == "user" {
             USER_REMOVAL_JOURNAL_SCHEMA_VERSION
         } else {
             PROJECT_REMOVAL_JOURNAL_SCHEMA_VERSION
@@ -828,7 +837,7 @@ impl RemovalJournalStore {
         }
     }
 
-    fn read_all(&self) -> Result<Vec<RemovalRecord>, RemovalJournalError> {
+    pub(super) fn read_all(&self) -> Result<Vec<RemovalRecord>, RemovalJournalError> {
         if !self.directory.is_absolute() {
             return Err(RemovalJournalError::UnsafeDirectory);
         }
@@ -1771,7 +1780,9 @@ fn record_plan(record: &RemovalRecord) -> Result<RemovalPlan, RemovalError> {
 fn plan_record(plan: &RemovalPlan) -> RemovalRecord {
     let operation_id = "00000000000000000000000000000000".to_owned();
     RemovalRecord {
-        schema_version: if plan.receipt.scope() == "user" {
+        schema_version: if plan.receipt.agent() == "claude-code" {
+            CLAUDE_REMOVAL_JOURNAL_SCHEMA_VERSION
+        } else if plan.receipt.scope() == "user" {
             USER_REMOVAL_JOURNAL_SCHEMA_VERSION
         } else {
             PROJECT_REMOVAL_JOURNAL_SCHEMA_VERSION
@@ -1810,7 +1821,7 @@ fn open_record_parents(
             "canonical project path or filesystem identity changed".to_owned(),
         ));
     }
-    let agents = open_exact_directory(&project, ".agents")?;
+    let agents = open_exact_directory(&project, record.receipt.agent_directory())?;
     let skills = open_exact_directory(&agents, "skills")?;
     check_parent_identities(record, &project, &agents, &skills)?;
     Ok((project, agents, skills))
@@ -1828,7 +1839,7 @@ fn check_parent_identities(
         != record.receipt.scope_root_identity()
         || agents
             .identity()
-            .map_err(removal_io("identify .agents directory"))?
+            .map_err(removal_io("identify agent directory"))?
             != record.agents_identity.into()
         || skills
             .identity()
@@ -1836,7 +1847,7 @@ fn check_parent_identities(
             != record.skills_identity.into()
     {
         return Err(RemovalError::Conflict(
-            "project or Codex parent directory identity changed".to_owned(),
+            "project or agent parent directory identity changed".to_owned(),
         ));
     }
     Ok(())
@@ -1852,7 +1863,7 @@ fn check_parent_identities_for_skills(
         != record.skills_identity.into()
     {
         return Err(RemovalError::Conflict(
-            "Codex skills directory identity changed".to_owned(),
+            "agent skills directory identity changed".to_owned(),
         ));
     }
     Ok(())
