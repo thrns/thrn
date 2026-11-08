@@ -1,10 +1,11 @@
 # Installation receipts
 
-M2-05 adds a private, local, schema-v1 record for each internal THRN-managed Codex project skill
-commit. The receipt store is separate from catalog cache data and lives under the OS application
-data directory's `receipts` child. `THRN_DATA_DIR` can select an alternate absolute data directory
-for isolated use and tests. Its existing ancestor path is canonicalized without creating missing
-components, while the configured data root itself and the `receipts` child are rejected if linked.
+M2-05 introduced a private, local, schema-v1 record for each THRN-managed Codex project skill
+commit. M2-07 connects real CLI installation to that receipt boundary. The store is separate from
+catalog cache data and lives under the OS application-data directory's `receipts` child.
+`THRN_DATA_DIR` can select an alternate absolute data directory for isolated use and tests. Its
+existing ancestor path is canonicalized without creating missing components, while the configured
+data root itself and the `receipts` child are rejected if linked.
 
 ## Schema v1
 
@@ -107,5 +108,9 @@ compare paths case-insensitively and also compare the stored project identity. R
 different machine is not supported as proof that the target directory is the same object.
 
 Receipts do not upgrade manually installed or otherwise unreceipted skills into THRN-owned content.
-Corrupt records never authorize removal. Public installation remains disabled pending independent
-architectural review of M2-06 recovery and cross-platform tests.
+Corrupt records never authorize removal. The CLI currently supports only Codex project
+installations; it does not provide public remove or update commands. Installed listing is offline
+and read-only, and does not verify current content integrity. A complete installation success
+requires receipt publication and journal cleanup. If either becomes incomplete after directory
+commitment, the command returns nonzero and describes the partial state; recovery preserves content
+whose ownership cannot be proven.

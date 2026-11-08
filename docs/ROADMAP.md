@@ -30,6 +30,7 @@ Source of truth: `THRN_PROJECT_SPEC.md` §§0–14. Implement a real vertical sl
 | M2-04 | M2-03, M2-01 | Internal Codex project adapter with retained staging lifetime, destination revalidation, exclusive copy, SHA-256 verification, and platform no-replace directory commitment; CLI remains dry-run-only |
 | M2-05 | M2-04 | Strict schema-v1 receipts keyed by canonical project/agent/resource identity; bounded SHA-256 inventories, no-follow/no-replace durable publication, validated offline installed listing; CLI installation remains dry-run-only |
 | M2-06 | M2-05 | Recovery/rollback for partial or failed install; inject rename/write failure and verify no successful receipt or clobber; only then consider enabling public installation |
+| M2-07 | M2-06 | Enable `skills install` for explicit Codex project scope by connecting the validated install session to recovery-aware commit-and-record; test offline orchestration, receipt listing, duplicate/unmanaged conflicts, partial failures and recovery; document that remove/update are not yet public |
 
 ## M3 — Lifecycle and agent coverage
 
