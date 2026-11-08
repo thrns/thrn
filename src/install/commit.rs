@@ -2202,6 +2202,16 @@ impl SecureDir {
         })
     }
 
+    fn open_directory_for_rename(&self, name: &std::ffi::OsStr) -> io::Result<Self> {
+        self.ensure_current_path()?;
+        let path = self.path.join(name);
+        let file = open_windows_directory_for_rename(&path)?;
+        Ok(Self {
+            file: std::sync::Arc::new(file),
+            path,
+        })
+    }
+
     pub(super) fn create_directory(&self, name: &str) -> io::Result<()> {
         self.ensure_current_path()?;
         fs::create_dir(self.path.join(name))?;
@@ -2384,7 +2394,7 @@ impl SecureDir {
         new_name: &str,
         expected_identity: FileIdentity,
     ) -> io::Result<()> {
-        let source = self.open_directory(std::ffi::OsStr::new(old_name))?;
+        let source = self.open_directory_for_rename(std::ffi::OsStr::new(old_name))?;
         if source.identity()? != expected_identity {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -2599,6 +2609,19 @@ fn rename_handle_noreplace(source: &fs::File, destination: &Path) -> io::Result<
 
 #[cfg(windows)]
 fn open_windows_directory(path: &Path) -> io::Result<fs::File> {
+    open_windows_directory_with_delete_access(path, false)
+}
+
+#[cfg(windows)]
+fn open_windows_directory_for_rename(path: &Path) -> io::Result<fs::File> {
+    open_windows_directory_with_delete_access(path, true)
+}
+
+#[cfg(windows)]
+fn open_windows_directory_with_delete_access(
+    path: &Path,
+    delete_access: bool,
+) -> io::Result<fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
@@ -2615,7 +2638,7 @@ fn open_windows_directory(path: &Path) -> io::Result<fs::File> {
                 | FILE_ADD_FILE
                 | FILE_ADD_SUBDIRECTORY
                 | FILE_TRAVERSE
-                | DELETE
+                | if delete_access { DELETE } else { 0 }
                 | SYNCHRONIZE,
         )
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
