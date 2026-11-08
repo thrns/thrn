@@ -704,7 +704,12 @@ fn remove_dry_run_is_offline_read_only_and_prints_the_full_verified_plan() {
     .output()
     .expect("CLI starts");
 
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "removal dry-run stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Verified THRN skill removal plan"));
     assert!(stdout.contains("Resource: creative-lab"));
@@ -735,7 +740,12 @@ fn remove_success_reports_only_after_receipt_retirement_and_installed_listing_is
     .output()
     .expect("CLI starts");
 
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "removal stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
     assert!(output.stderr.is_empty());
     assert!(!destination.exists());
@@ -789,7 +799,9 @@ fn remove_refuses_legacy_receipt_without_install_identity_and_preserves_content(
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("no installation-time directory identity")
+        String::from_utf8_lossy(&output.stderr).contains("no installation-time directory identity"),
+        "legacy removal stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(fs::read(destination.join("SKILL.md")).unwrap(), b"abc");
     assert_eq!(fs::read(receipt_path).unwrap(), legacy_bytes);
