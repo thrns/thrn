@@ -19,6 +19,7 @@ use crate::{
 
 pub(crate) const LEGACY_SCHEMA_VERSION: u64 = 1;
 pub(crate) const SCHEMA_VERSION: u64 = 2;
+pub(crate) const USER_SCHEMA_VERSION: u64 = 3;
 pub(crate) const MAX_RECEIPT_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_RECEIPTS: usize = 4_096;
 pub(crate) const MAX_RECEIPT_PATH_BYTES: usize = 32_768;
@@ -33,8 +34,10 @@ pub struct InstallationReceipt {
     skill_name: String,
     agent: String,
     scope: String,
-    canonical_project_root: String,
-    project_root_identity: ReceiptProjectIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    canonical_project_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project_root_identity: Option<ReceiptProjectIdentity>,
     destination: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     installed_directory_identity: Option<ReceiptDirectoryIdentity>,
@@ -49,6 +52,10 @@ pub struct InstallationReceipt {
     file_count: u64,
     byte_count: u64,
     content_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    canonical_scope_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope_root_identity: Option<ReceiptProjectIdentity>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -83,9 +90,9 @@ pub enum ReceiptValidationError {
     InputTooLarge { maximum: usize },
     #[error("receipt metadata is missing, too long, or invalid")]
     InvalidMetadata,
-    #[error("receipt project paths are not canonical absolute paths")]
-    InvalidProjectPath,
-    #[error("receipt destination does not match the Codex project skill path")]
+    #[error("receipt scope paths are not canonical absolute paths")]
+    InvalidScopePath,
+    #[error("receipt destination does not match the Codex scope skill path")]
     DestinationMismatch,
     #[error("receipt file or directory inventory is invalid")]
     InvalidInventory,
@@ -124,17 +131,24 @@ impl InstallationReceipt {
             .collect::<Result<Vec<_>, ReceiptValidationError>>()?;
         files.sort_by(|left, right| left.path.cmp(&right.path));
 
+        let user_scope = plan.scope() == super::plan::InstallScope::User;
         let mut receipt = Self {
-            schema_version: LEGACY_SCHEMA_VERSION,
+            schema_version: if user_scope {
+                USER_SCHEMA_VERSION
+            } else {
+                LEGACY_SCHEMA_VERSION
+            },
             catalog_resource_id: plan.resource_id().as_str().to_owned(),
             skill_name: plan.skill_name().as_str().to_owned(),
             agent: plan.agent().as_str().to_owned(),
             scope: plan.scope().as_str().to_owned(),
-            canonical_project_root: path_to_string(plan.project_root())?,
-            project_root_identity: ReceiptProjectIdentity {
+            canonical_project_root: (!user_scope)
+                .then(|| path_to_string(plan.scope_root()))
+                .transpose()?,
+            project_root_identity: (!user_scope).then_some(ReceiptProjectIdentity {
                 volume: project_identity.volume(),
                 object: project_identity.object(),
-            },
+            }),
             destination: path_to_string(plan.destination())?,
             installed_directory_identity: None,
             installed_at_unix_seconds,
@@ -149,9 +163,21 @@ impl InstallationReceipt {
             byte_count: inventory.total_bytes(),
             files,
             content_digest: String::new(),
+            canonical_scope_root: user_scope
+                .then(|| path_to_string(plan.scope_root()))
+                .transpose()?,
+            scope_root_identity: user_scope.then_some(ReceiptProjectIdentity {
+                volume: project_identity.volume(),
+                object: project_identity.object(),
+            }),
         };
-        receipt.content_digest = receipt.calculated_content_digest()?;
-        receipt.validate()?;
+        if user_scope {
+            receipt.content_digest = receipt.calculated_install_intent_digest()?;
+            receipt.validate_install_intent()?;
+        } else {
+            receipt.content_digest = receipt.calculated_content_digest()?;
+            receipt.validate()?;
+        }
         Ok(receipt)
     }
 
@@ -178,20 +204,60 @@ impl InstallationReceipt {
         Ok(bytes)
     }
 
+    pub(crate) fn to_journal_intent_json(&self) -> Result<Vec<u8>, ReceiptValidationError> {
+        self.validate_install_intent()?;
+        let bytes = serde_json::to_vec(self).map_err(|_| ReceiptValidationError::MalformedJson)?;
+        if bytes.len() > MAX_RECEIPT_BYTES {
+            return Err(ReceiptValidationError::InputTooLarge {
+                maximum: MAX_RECEIPT_BYTES,
+            });
+        }
+        Ok(bytes)
+    }
+
     pub(crate) fn validate(&self) -> Result<(), ReceiptValidationError> {
-        if !matches!(self.schema_version, LEGACY_SCHEMA_VERSION | SCHEMA_VERSION) {
+        self.validate_inner(false)
+    }
+
+    pub(crate) fn validate_install_intent(&self) -> Result<(), ReceiptValidationError> {
+        self.validate_inner(true)
+    }
+
+    fn validate_inner(&self, allow_user_intent: bool) -> Result<(), ReceiptValidationError> {
+        if !matches!(
+            self.schema_version,
+            LEGACY_SCHEMA_VERSION | SCHEMA_VERSION | USER_SCHEMA_VERSION
+        ) {
             return Err(ReceiptValidationError::UnsupportedSchema(
                 self.schema_version,
             ));
         }
-        if (self.schema_version == LEGACY_SCHEMA_VERSION
-            && self.installed_directory_identity.is_some())
+        let project_shape = self.scope == "project"
+            && self.canonical_project_root.is_some()
+            && self.project_root_identity.is_some()
+            && self.canonical_scope_root.is_none()
+            && self.scope_root_identity.is_none()
+            && matches!(self.schema_version, LEGACY_SCHEMA_VERSION | SCHEMA_VERSION);
+        let user_shape = self.scope == "user"
+            && self.canonical_project_root.is_none()
+            && self.project_root_identity.is_none()
+            && self.canonical_scope_root.is_some()
+            && self.scope_root_identity.is_some()
+            && self.schema_version == USER_SCHEMA_VERSION;
+        let user_intent =
+            allow_user_intent && user_shape && self.installed_directory_identity.is_none();
+        if (!project_shape && !user_shape)
+            || (self.schema_version == LEGACY_SCHEMA_VERSION
+                && self.installed_directory_identity.is_some())
             || (self.schema_version == SCHEMA_VERSION
                 && self.installed_directory_identity.is_none())
+            || (self.schema_version == USER_SCHEMA_VERSION
+                && self.installed_directory_identity.is_none()
+                && !user_intent)
         {
             return Err(ReceiptValidationError::InvalidInstalledDirectoryIdentity);
         }
-        if self.agent != "codex" || self.scope != "project" {
+        if self.agent != "codex" {
             return Err(ReceiptValidationError::InvalidMetadata);
         }
         SkillId::from_str(&self.catalog_resource_id)
@@ -209,7 +275,12 @@ impl InstallationReceipt {
         ResourceVersion::from_str(&self.resource_version)
             .map_err(|_| ReceiptValidationError::InvalidMetadata)?;
 
-        if self.canonical_project_root.len() > MAX_RECEIPT_PATH_BYTES
+        let scope_root = self
+            .canonical_project_root
+            .as_deref()
+            .or(self.canonical_scope_root.as_deref())
+            .ok_or(ReceiptValidationError::InvalidScopePath)?;
+        if scope_root.len() > MAX_RECEIPT_PATH_BYTES
             || self.destination.len() > MAX_RECEIPT_PATH_BYTES
             || self.source_owner.len() > MAX_METADATA_BYTES
             || self.source_repository.len() > MAX_METADATA_BYTES
@@ -219,7 +290,7 @@ impl InstallationReceipt {
             return Err(ReceiptValidationError::InvalidMetadata);
         }
 
-        let root = validate_absolute_path(&self.canonical_project_root)?;
+        let root = validate_absolute_path(scope_root)?;
         let destination = validate_absolute_path(&self.destination)?;
         let expected_destination = root
             .join(".agents")
@@ -294,7 +365,12 @@ impl InstallationReceipt {
         if !is_sha256(&self.content_digest) {
             return Err(ReceiptValidationError::ContentDigestMismatch);
         }
-        if self.calculated_content_digest()? != self.content_digest {
+        let calculated = if user_intent {
+            self.calculated_install_intent_digest()?
+        } else {
+            self.calculated_content_digest()?
+        };
+        if calculated != self.content_digest {
             return Err(ReceiptValidationError::ContentDigestMismatch);
         }
         Ok(())
@@ -305,21 +381,35 @@ impl InstallationReceipt {
         let digest = digest
             .strip_prefix("sha256:")
             .ok_or(ReceiptValidationError::IdentityDigest)?;
-        Ok(format!("v1-{digest}.json"))
+        let version = if self.schema_version == USER_SCHEMA_VERSION {
+            "v2"
+        } else {
+            "v1"
+        };
+        Ok(format!("{version}-{digest}.json"))
     }
 
     pub(crate) fn root_path(&self) -> PathBuf {
-        PathBuf::from(&self.canonical_project_root)
+        PathBuf::from(
+            self.canonical_project_root
+                .as_deref()
+                .or(self.canonical_scope_root.as_deref())
+                .unwrap_or_default(),
+        )
     }
 
     pub(crate) fn destination_path(&self) -> PathBuf {
         PathBuf::from(&self.destination)
     }
 
-    pub(crate) fn project_identity(&self) -> FileIdentity {
-        FileIdentity::new(
-            self.project_root_identity.volume,
-            self.project_root_identity.object,
+    pub(crate) fn scope_root_identity(&self) -> FileIdentity {
+        let identity = self
+            .project_root_identity
+            .as_ref()
+            .or(self.scope_root_identity.as_ref());
+        identity.map_or_else(
+            || FileIdentity::new(0, 0),
+            |identity| FileIdentity::new(identity.volume, identity.object),
         )
     }
 
@@ -329,12 +419,18 @@ impl InstallationReceipt {
         mut self,
         identity: FileIdentity,
     ) -> Result<Self, ReceiptValidationError> {
-        if self.schema_version != LEGACY_SCHEMA_VERSION
-            || self.installed_directory_identity.is_some()
-        {
+        let upgrade_project = self.schema_version == LEGACY_SCHEMA_VERSION
+            && self.scope == "project"
+            && self.installed_directory_identity.is_none();
+        let complete_user = self.schema_version == USER_SCHEMA_VERSION
+            && self.scope == "user"
+            && self.installed_directory_identity.is_none();
+        if !upgrade_project && !complete_user {
             return Err(ReceiptValidationError::InvalidInstalledDirectoryIdentity);
         }
-        self.schema_version = SCHEMA_VERSION;
+        if upgrade_project {
+            self.schema_version = SCHEMA_VERSION;
+        }
         self.installed_directory_identity = Some(ReceiptDirectoryIdentity {
             volume: identity.volume(),
             object: identity.object(),
@@ -364,8 +460,17 @@ impl InstallationReceipt {
         self.schema_version == LEGACY_SCHEMA_VERSION
     }
 
+    pub(crate) fn is_user_intent(&self) -> bool {
+        self.schema_version == USER_SCHEMA_VERSION && self.installed_directory_identity.is_none()
+    }
+
+    pub(crate) fn supports_lifecycle(&self) -> bool {
+        self.installed_directory_identity.is_some()
+            && matches!(self.schema_version, SCHEMA_VERSION | USER_SCHEMA_VERSION)
+    }
+
     pub(crate) fn is_identity_upgrade_of(&self, legacy: &Self, identity: FileIdentity) -> bool {
-        legacy.is_legacy()
+        (legacy.is_legacy() || legacy.is_user_intent())
             && legacy
                 .clone()
                 .with_installed_directory_identity(identity)
@@ -430,15 +535,33 @@ impl InstallationReceipt {
 
     pub(crate) fn same_destination(&self, other: &Self) -> bool {
         let same_path = self.destination.to_lowercase() == other.destination.to_lowercase();
-        let same_identity = self.project_root_identity == other.project_root_identity
+        let same_identity = self.scope_root_identity() == other.scope_root_identity()
             && self.skill_name.eq_ignore_ascii_case(&other.skill_name);
         self.agent == other.agent && (same_path || same_identity)
     }
 
     fn identity_digest(&self) -> Result<String, ReceiptValidationError> {
         let mut context = Context::new(&SHA256);
-        context.update(b"THRN-RECEIPT-IDENTITY-V1\0");
-        update_field(&mut context, self.canonical_project_root.as_bytes())?;
+        if self.schema_version == USER_SCHEMA_VERSION {
+            context.update(b"THRN-RECEIPT-IDENTITY-V2\0");
+            update_field(&mut context, self.scope.as_bytes())?;
+            update_field(
+                &mut context,
+                self.canonical_scope_root
+                    .as_deref()
+                    .ok_or(ReceiptValidationError::IdentityDigest)?
+                    .as_bytes(),
+            )?;
+        } else {
+            context.update(b"THRN-RECEIPT-IDENTITY-V1\0");
+            update_field(
+                &mut context,
+                self.canonical_project_root
+                    .as_deref()
+                    .ok_or(ReceiptValidationError::IdentityDigest)?
+                    .as_bytes(),
+            )?;
+        }
         update_field(&mut context, self.agent.as_bytes())?;
         update_field(&mut context, self.catalog_resource_id.as_bytes())?;
         Ok(hex_digest(context.finish().as_ref()))
@@ -448,13 +571,34 @@ impl InstallationReceipt {
         let mut context = Context::new(&SHA256);
         if self.schema_version == LEGACY_SCHEMA_VERSION {
             context.update(b"THRN-CONTENT-INVENTORY-V1\0");
-        } else {
+        } else if self.schema_version == SCHEMA_VERSION {
             context.update(b"THRN-CONTENT-INVENTORY-V2\0");
             let identity = self
                 .installed_directory_identity
                 .ok_or(ReceiptValidationError::InvalidInstalledDirectoryIdentity)?;
             context.update(&identity.volume.to_be_bytes());
             context.update(&identity.object.to_be_bytes());
+        } else {
+            context.update(b"THRN-CONTENT-INVENTORY-V3\0");
+            let root = self
+                .scope_root_identity
+                .as_ref()
+                .ok_or(ReceiptValidationError::InvalidScopePath)?;
+            let destination = self
+                .installed_directory_identity
+                .ok_or(ReceiptValidationError::InvalidInstalledDirectoryIdentity)?;
+            update_field(
+                &mut context,
+                self.canonical_scope_root
+                    .as_deref()
+                    .ok_or(ReceiptValidationError::InvalidScopePath)?
+                    .as_bytes(),
+            )?;
+            update_field(&mut context, self.scope.as_bytes())?;
+            context.update(&root.volume.to_be_bytes());
+            context.update(&root.object.to_be_bytes());
+            context.update(&destination.volume.to_be_bytes());
+            context.update(&destination.object.to_be_bytes());
         }
         context.update(&(self.directories.len() as u64).to_be_bytes());
         for directory in &self.directories {
@@ -471,6 +615,49 @@ impl InstallationReceipt {
             context.update(&digest);
         }
         Ok(hex_digest(context.finish().as_ref()))
+    }
+
+    fn calculated_install_intent_digest(&self) -> Result<String, ReceiptValidationError> {
+        if self.schema_version != USER_SCHEMA_VERSION || self.installed_directory_identity.is_some()
+        {
+            return self.calculated_content_digest();
+        }
+        let mut context = Context::new(&SHA256);
+        context.update(b"THRN-CONTENT-INSTALL-INTENT-V3\0");
+        let root = self
+            .scope_root_identity
+            .as_ref()
+            .ok_or(ReceiptValidationError::InvalidScopePath)?;
+        update_field(
+            &mut context,
+            self.canonical_scope_root
+                .as_deref()
+                .ok_or(ReceiptValidationError::InvalidScopePath)?
+                .as_bytes(),
+        )?;
+        update_field(&mut context, self.scope.as_bytes())?;
+        context.update(&root.volume.to_be_bytes());
+        context.update(&root.object.to_be_bytes());
+        self.update_inventory_digest(&mut context)?;
+        Ok(hex_digest(context.finish().as_ref()))
+    }
+
+    fn update_inventory_digest(&self, context: &mut Context) -> Result<(), ReceiptValidationError> {
+        context.update(&(self.directories.len() as u64).to_be_bytes());
+        for directory in &self.directories {
+            context.update(b"D");
+            update_field(context, directory.as_bytes())?;
+        }
+        context.update(&(self.files.len() as u64).to_be_bytes());
+        for file in &self.files {
+            context.update(b"F");
+            update_field(context, file.path.as_bytes())?;
+            context.update(&file.byte_count.to_be_bytes());
+            let digest =
+                decode_sha256(&file.sha256).ok_or(ReceiptValidationError::InvalidInventory)?;
+            context.update(&digest);
+        }
+        Ok(())
     }
 }
 
@@ -492,7 +679,7 @@ fn path_to_string(path: &Path) -> Result<String, ReceiptValidationError> {
     path.to_str()
         .map(str::to_owned)
         .filter(|value| !value.is_empty() && value.len() <= MAX_RECEIPT_PATH_BYTES)
-        .ok_or(ReceiptValidationError::InvalidProjectPath)
+        .ok_or(ReceiptValidationError::InvalidScopePath)
 }
 
 fn validate_absolute_path(value: &str) -> Result<PathBuf, ReceiptValidationError> {
@@ -500,11 +687,11 @@ fn validate_absolute_path(value: &str) -> Result<PathBuf, ReceiptValidationError
         || value.len() > MAX_RECEIPT_PATH_BYTES
         || value.chars().any(char::is_control)
     {
-        return Err(ReceiptValidationError::InvalidProjectPath);
+        return Err(ReceiptValidationError::InvalidScopePath);
     }
     let path = PathBuf::from(value);
     if !path.is_absolute() || path.to_str() != Some(value) {
-        return Err(ReceiptValidationError::InvalidProjectPath);
+        return Err(ReceiptValidationError::InvalidScopePath);
     }
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -513,12 +700,12 @@ fn validate_absolute_path(value: &str) -> Result<PathBuf, ReceiptValidationError
                 normalized.push(component.as_os_str());
             }
             Component::CurDir | Component::ParentDir => {
-                return Err(ReceiptValidationError::InvalidProjectPath);
+                return Err(ReceiptValidationError::InvalidScopePath);
             }
         }
     }
     if normalized.to_str() != Some(value) {
-        return Err(ReceiptValidationError::InvalidProjectPath);
+        return Err(ReceiptValidationError::InvalidScopePath);
     }
     Ok(path)
 }
@@ -622,7 +809,7 @@ mod tests {
         install::{
             destination::{FileIdentity, inspect_destination},
             inventory::inspect_staged_skill,
-            plan::build_install_plan,
+            plan::{InstallScope, build_install_plan, build_install_plan_for_scope},
         },
         registry::catalog::parse_catalog_json,
         sources::{
@@ -631,7 +818,7 @@ mod tests {
         },
     };
 
-    use super::{InstallationReceipt, ReceiptValidationError};
+    use super::{InstallationReceipt, ReceiptValidationError, USER_SCHEMA_VERSION};
 
     struct FakeTransport(Vec<u8>);
     impl GithubTransport for FakeTransport {
@@ -711,6 +898,27 @@ mod tests {
             .expect("receipt")
     }
 
+    fn user_receipt_fixture() -> InstallationReceipt {
+        let parent = tempdir().expect("parent");
+        let root = parent.path().canonicalize().expect("canonical parent");
+        let home = root.join("home");
+        fs::create_dir(&home).expect("home");
+        let staged = staged_skill(&root);
+        let inventory = inspect_staged_skill(&staged).expect("inventory");
+        let destination =
+            inspect_destination(Some(&home), &home, staged.skill_name().as_str()).expect("target");
+        let plan =
+            build_install_plan_for_scope(&staged, &inventory, destination, InstallScope::User)
+                .expect("user plan");
+        InstallationReceipt::from_committed_plan(
+            &plan,
+            &inventory,
+            FileIdentity::new(7, 9),
+            1_800_000_000,
+        )
+        .expect("user receipt intent")
+    }
+
     #[test]
     fn legacy_schema_v1_round_trips_and_keeps_catalog_id_distinct_from_skill_name() {
         let receipt = receipt_fixture();
@@ -740,6 +948,11 @@ mod tests {
         let parsed = InstallationReceipt::from_json(&receipt.to_json().expect("serialize v2"))
             .expect("parse v2");
         assert_eq!(parsed, receipt);
+        let project_json: serde_json::Value =
+            serde_json::from_slice(&receipt.to_json().expect("project receipt JSON"))
+                .expect("JSON value");
+        assert!(project_json.get("canonicalScopeRoot").is_none());
+        assert!(project_json.get("scopeRootIdentity").is_none());
 
         let mut changed_identity =
             serde_json::from_slice::<serde_json::Value>(&receipt.to_json().expect("serialize v2"))
@@ -750,6 +963,55 @@ mod tests {
                 &serde_json::to_vec(&changed_identity).expect("serialize changed identity")
             ),
             Err(ReceiptValidationError::ContentDigestMismatch)
+        ));
+    }
+
+    #[test]
+    fn schema_v3_user_receipts_bind_scope_root_and_keep_project_keys_separate() {
+        let user_intent = user_receipt_fixture();
+        assert_eq!(user_intent.schema_version(), USER_SCHEMA_VERSION);
+        assert_eq!(user_intent.scope(), "user");
+        assert!(user_intent.is_user_intent());
+        assert!(user_intent.validate_install_intent().is_ok());
+        assert!(user_intent.validate().is_err());
+        let intent_bytes = user_intent
+            .to_journal_intent_json()
+            .expect("user intent is journal-serializable");
+        assert!(InstallationReceipt::from_json(&intent_bytes).is_err());
+
+        let completed = user_intent
+            .clone()
+            .with_installed_directory_identity(FileIdentity::new(10, 11))
+            .expect("capture committed destination identity");
+        assert_eq!(completed.schema_version(), USER_SCHEMA_VERSION);
+        assert!(completed.supports_lifecycle());
+        assert!(
+            completed
+                .receipt_filename()
+                .expect("user key")
+                .starts_with("v2-")
+        );
+        assert!(InstallationReceipt::from_json(&completed.to_json().expect("user JSON")).is_ok());
+
+        let project = receipt_fixture()
+            .with_installed_directory_identity(FileIdentity::new(10, 11))
+            .expect("project receipt");
+        assert!(
+            project
+                .receipt_filename()
+                .expect("project key")
+                .starts_with("v1-")
+        );
+        assert_ne!(
+            completed.receipt_filename().expect("user key"),
+            project.receipt_filename().expect("project key")
+        );
+
+        let mut project_as_user = project;
+        project_as_user.scope = "user".to_owned();
+        assert!(matches!(
+            project_as_user.validate(),
+            Err(ReceiptValidationError::InvalidInstalledDirectoryIdentity)
         ));
     }
 
@@ -818,13 +1080,23 @@ mod tests {
             another_resource.receipt_filename().expect("different key")
         );
         let mut another_project = first.clone();
-        let root = PathBuf::from(&first.canonical_project_root).join("other-project");
-        another_project.canonical_project_root = root.to_string_lossy().into_owned();
+        let root = PathBuf::from(
+            first
+                .canonical_project_root
+                .as_deref()
+                .expect("project root"),
+        )
+        .join("other-project");
+        another_project.canonical_project_root = Some(root.to_string_lossy().into_owned());
         another_project.destination = root
             .join(".agents/skills/uncharted-ideation")
             .to_string_lossy()
             .into_owned();
-        another_project.project_root_identity.object += 1;
+        another_project
+            .project_root_identity
+            .as_mut()
+            .expect("project identity")
+            .object += 1;
         assert_ne!(
             first.receipt_filename().expect("first key"),
             another_project
@@ -864,10 +1136,10 @@ mod tests {
         let receipt = receipt_fixture();
         let mut value: serde_json::Value =
             serde_json::from_slice(&receipt.to_json().expect("json")).expect("value");
-        value["schemaVersion"] = serde_json::json!(3);
+        value["schemaVersion"] = serde_json::json!(4);
         assert!(matches!(
             InstallationReceipt::from_json(&serde_json::to_vec(&value).expect("json")),
-            Err(ReceiptValidationError::UnsupportedSchema(3))
+            Err(ReceiptValidationError::UnsupportedSchema(4))
         ));
         assert!(matches!(
             InstallationReceipt::from_json(b"{\"schemaVersion\":1"),
@@ -912,27 +1184,36 @@ mod tests {
         wrong_scope.scope = "user".to_owned();
         assert!(matches!(
             wrong_scope.validate(),
-            Err(ReceiptValidationError::InvalidMetadata)
+            Err(ReceiptValidationError::InvalidInstalledDirectoryIdentity)
         ));
         let mut wrong_destination = receipt.clone();
-        wrong_destination.destination = PathBuf::from(&receipt.canonical_project_root)
-            .join("another-project/.agents/skills/uncharted-ideation")
-            .to_string_lossy()
-            .into_owned();
+        wrong_destination.destination = PathBuf::from(
+            receipt
+                .canonical_project_root
+                .as_deref()
+                .expect("project root"),
+        )
+        .join("another-project/.agents/skills/uncharted-ideation")
+        .to_string_lossy()
+        .into_owned();
         assert!(matches!(
             wrong_destination.validate(),
             Err(ReceiptValidationError::DestinationMismatch)
         ));
 
-        let noncanonical = format!("{}/./nested", receipt.canonical_project_root);
+        let root = receipt
+            .canonical_project_root
+            .as_deref()
+            .expect("project root");
+        let noncanonical = format!("{root}/./nested");
         assert!(matches!(
             super::validate_absolute_path(&noncanonical),
-            Err(ReceiptValidationError::InvalidProjectPath)
+            Err(ReceiptValidationError::InvalidScopePath)
         ));
-        let control_path = format!("{}\nforged", receipt.canonical_project_root);
+        let control_path = format!("{root}\nforged");
         assert!(matches!(
             super::validate_absolute_path(&control_path),
-            Err(ReceiptValidationError::InvalidProjectPath)
+            Err(ReceiptValidationError::InvalidScopePath)
         ));
     }
 

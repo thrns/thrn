@@ -30,15 +30,17 @@ impl InstallAgent {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
 pub enum InstallScope {
     Project,
+    User,
 }
 
 impl InstallScope {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Project => "project",
+            Self::User => "user",
         }
     }
 }
@@ -151,6 +153,10 @@ impl InstallPlan {
         &self.project_root
     }
 
+    pub(crate) fn scope_root(&self) -> &Path {
+        &self.project_root
+    }
+
     pub fn destination(&self) -> &Path {
         &self.destination
     }
@@ -196,6 +202,15 @@ pub fn build_install_plan(
     staged: &StagedSkill,
     inventory: &StagedInventory,
     destination: DestinationSnapshot,
+) -> Result<InstallPlan, PlanError> {
+    build_install_plan_for_scope(staged, inventory, destination, InstallScope::Project)
+}
+
+pub(crate) fn build_install_plan_for_scope(
+    staged: &StagedSkill,
+    inventory: &StagedInventory,
+    destination: DestinationSnapshot,
+    scope: InstallScope,
 ) -> Result<InstallPlan, PlanError> {
     if inventory.catalog_id() != staged.catalog_id()
         || inventory.skill_name() != staged.skill_name()
@@ -278,7 +293,7 @@ pub fn build_install_plan(
         source_commit: staged.revision().clone(),
         source_directory: source.path().clone(),
         agent: InstallAgent::Codex,
-        scope: InstallScope::Project,
+        scope,
         project_root,
         destination: intended_destination,
         directories,
@@ -292,12 +307,13 @@ pub fn build_install_plan(
 /// Build the replacement copy plan for a receipt-verified managed directory. The caller must
 /// independently prove ownership and revalidate the destination before commitment; this builder
 /// only removes the expected existing-directory conflict at that exact destination.
-pub(crate) fn build_update_install_plan(
+pub(crate) fn build_update_install_plan_for_scope(
     staged: &StagedSkill,
     inventory: &StagedInventory,
     destination: DestinationSnapshot,
+    scope: InstallScope,
 ) -> Result<InstallPlan, PlanError> {
-    let mut plan = build_install_plan(staged, inventory, destination)?;
+    let mut plan = build_install_plan_for_scope(staged, inventory, destination, scope)?;
     plan.conflicts.retain(|conflict| {
         conflict.path() != plan.destination
             || conflict.kind() != super::destination::ConflictKind::ExistingDirectory

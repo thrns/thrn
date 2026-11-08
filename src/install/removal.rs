@@ -22,7 +22,8 @@ use super::{
     receipt::{InstallationReceipt, MAX_RECEIPT_BYTES, ReceiptFile},
 };
 
-const REMOVAL_JOURNAL_SCHEMA_VERSION: u64 = 1;
+const PROJECT_REMOVAL_JOURNAL_SCHEMA_VERSION: u64 = 1;
+const USER_REMOVAL_JOURNAL_SCHEMA_VERSION: u64 = 2;
 const MAX_REMOVAL_JOURNAL_BYTES: usize = 10 * 1024 * 1024;
 const MAX_REMOVAL_JOURNAL_FILES: usize = 16_384;
 const MAX_REMOVAL_JOURNAL_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
@@ -143,7 +144,7 @@ impl RemovalPlan {
         if project
             .identity()
             .map_err(removal_io("identify project root"))?
-            != receipt.project_identity()
+            != receipt.scope_root_identity()
         {
             return Err(RemovalError::Conflict(
                 "canonical project path or filesystem identity differs from the receipt".to_owned(),
@@ -156,12 +157,15 @@ impl RemovalPlan {
         let destination_identity = destination
             .identity()
             .map_err(removal_io("identify installed skill directory"))?;
-        let Some(installed_identity) = receipt.installed_directory_identity() else {
+        if !receipt.supports_lifecycle() {
             return Err(RemovalError::Conflict(
                 "legacy schema-v1 receipt has no installation-time directory identity; automatic removal is refused"
                     .to_owned(),
             ));
-        };
+        }
+        let installed_identity = receipt
+            .installed_directory_identity()
+            .ok_or_else(|| RemovalError::Conflict("installation identity is missing".to_owned()))?;
         if destination_identity != installed_identity {
             return Err(RemovalError::Conflict(
                 "installed directory identity differs from the installation-time receipt evidence"
@@ -253,8 +257,6 @@ pub(crate) enum RemovalError {
         operation_id: String,
         detail: String,
     },
-    #[error("current directory could not be read ({0})")]
-    CurrentDirectory(io::ErrorKind),
 }
 
 fn open_exact_directory(
@@ -304,7 +306,7 @@ pub(super) fn verify_receipt_for_check(receipt: &InstallationReceipt) -> Result<
     if project
         .identity()
         .map_err(removal_io("identify project root"))?
-        != receipt.project_identity()
+        != receipt.scope_root_identity()
     {
         return Err(RemovalError::Conflict(
             "canonical project path or filesystem identity differs from the receipt".to_owned(),
@@ -653,7 +655,12 @@ struct RemovalRecord {
 
 impl RemovalRecord {
     fn validate(&self) -> Result<(), RemovalJournalError> {
-        if self.schema_version != REMOVAL_JOURNAL_SCHEMA_VERSION {
+        let expected_schema = if self.receipt.scope() == "user" {
+            USER_REMOVAL_JOURNAL_SCHEMA_VERSION
+        } else {
+            PROJECT_REMOVAL_JOURNAL_SCHEMA_VERSION
+        };
+        if self.schema_version != expected_schema {
             return Err(RemovalJournalError::UnsupportedSchema(self.schema_version));
         }
         if self.operation_type != RemovalOperationType::Removal
@@ -772,8 +779,13 @@ impl RemovalJournalStore {
             random_id().map_err(|error| map_journal_io("name removal operation", error))?;
         let mut objects = plan.objects.clone();
         objects.sort_by(|left, right| left.order_key().cmp(&right.order_key()));
+        let schema_version = if plan.receipt.scope() == "user" {
+            USER_REMOVAL_JOURNAL_SCHEMA_VERSION
+        } else {
+            PROJECT_REMOVAL_JOURNAL_SCHEMA_VERSION
+        };
         let record = RemovalRecord {
-            schema_version: REMOVAL_JOURNAL_SCHEMA_VERSION,
+            schema_version,
             operation_type: RemovalOperationType::Removal,
             operation_id: operation_id.clone(),
             sequence: 0,
@@ -1759,7 +1771,11 @@ fn record_plan(record: &RemovalRecord) -> Result<RemovalPlan, RemovalError> {
 fn plan_record(plan: &RemovalPlan) -> RemovalRecord {
     let operation_id = "00000000000000000000000000000000".to_owned();
     RemovalRecord {
-        schema_version: REMOVAL_JOURNAL_SCHEMA_VERSION,
+        schema_version: if plan.receipt.scope() == "user" {
+            USER_REMOVAL_JOURNAL_SCHEMA_VERSION
+        } else {
+            PROJECT_REMOVAL_JOURNAL_SCHEMA_VERSION
+        },
         operation_type: RemovalOperationType::Removal,
         operation_id: operation_id.clone(),
         sequence: 0,
@@ -1788,7 +1804,7 @@ fn open_record_parents(
     if project
         .identity()
         .map_err(removal_io("identify project root"))?
-        != record.receipt.project_identity()
+        != record.receipt.scope_root_identity()
     {
         return Err(RemovalError::Conflict(
             "canonical project path or filesystem identity changed".to_owned(),
@@ -1809,7 +1825,7 @@ fn check_parent_identities(
     if project
         .identity()
         .map_err(removal_io("identify project root"))?
-        != record.receipt.project_identity()
+        != record.receipt.scope_root_identity()
         || agents
             .identity()
             .map_err(removal_io("identify .agents directory"))?

@@ -17,6 +17,8 @@ pub enum ThrnError {
     #[error(transparent)]
     Update(#[from] crate::install::update::UpdateError),
     #[error(transparent)]
+    ScopeResolution(#[from] crate::install::scope::ScopeResolutionError),
+    #[error(transparent)]
     Resolution(#[from] crate::registry::discovery::ResolutionError),
     #[error("skill validation failed")]
     SkillValidation {

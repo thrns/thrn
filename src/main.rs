@@ -3,6 +3,7 @@ mod doctor;
 mod error;
 pub mod install;
 pub mod models;
+mod os_paths;
 pub mod registry;
 pub mod skills;
 pub mod sources;
