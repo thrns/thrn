@@ -7,18 +7,24 @@ pub(crate) fn create_junction(junction: &Path, target: &Path) {
         "junction path must not already exist: {junction:?}"
     );
 
-    let output = Command::new("cmd.exe")
-        .arg("/D")
-        .arg("/C")
-        .arg("mklink")
-        .arg("/J")
-        .arg(junction)
-        .arg(target)
+    let command = "$ErrorActionPreference = 'Stop'; try { New-Item -ItemType Junction -Path $env:THRN_TEST_JUNCTION_PATH -Target $env:THRN_TEST_JUNCTION_TARGET -ErrorAction Stop | Out-Null; exit 0 } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }";
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            command,
+        ])
+        .env("THRN_TEST_JUNCTION_PATH", junction.as_os_str())
+        .env("THRN_TEST_JUNCTION_TARGET", target.as_os_str())
         .output()
-        .unwrap_or_else(|error| panic!("could not start cmd.exe to create test junction: {error}"));
+        .unwrap_or_else(|error| {
+            panic!("could not start PowerShell to create test junction: {error}")
+        });
     assert!(
         output.status.success(),
-        "Windows junction fixture creation failed (status: {}): stdout={:?}, stderr={:?}",
+        "Windows junction fixture creation failed (status: {:?}): stdout={:?}, stderr={:?}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
