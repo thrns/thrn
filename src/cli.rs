@@ -1827,7 +1827,20 @@ mod install_tests {
             removal_result.as_ref().is_ok_and(|status| status.success()),
             "removal subprocess must complete after release; result={removal_result:?}"
         );
-        assert!(fixture.store().list().expect("receipt retired").is_empty());
+        let listed = fixture.store().list();
+        #[cfg(windows)]
+        if listed.is_err() {
+            let names = fs::read_dir(fixture.data.join("removals"))
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.file_name())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            eprintln!("Windows removal journal objects after subprocess: {names:?}");
+        }
+        assert!(listed.expect("receipt retired").is_empty());
         assert!(
             !fixture
                 .project
