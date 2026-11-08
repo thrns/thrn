@@ -2006,6 +2006,24 @@ impl SecureDir {
         .map_err(rustix_error)
     }
 
+    /// Move a verified directory entry to a sibling without replacing anything at the target.
+    /// The opened source identity is checked against the named entry immediately before rename.
+    pub(super) fn rename_directory_child_noreplace(
+        &self,
+        old_name: &str,
+        new_name: &str,
+        expected_identity: FileIdentity,
+    ) -> io::Result<()> {
+        let source = self.open_directory(std::ffi::OsStr::new(old_name))?;
+        if source.identity()? != expected_identity {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "directory rename source identity changed",
+            ));
+        }
+        self.rename_child_noreplace(old_name, new_name, &source)
+    }
+
     pub(super) fn sync_directory(&self) -> io::Result<()> {
         self.ensure_current_path()?;
         self.file.sync_all()
@@ -2021,6 +2039,27 @@ impl SecureDir {
         self.ensure_current_path()?;
         use rustix::fs::{AtFlags, unlinkat};
         unlinkat(&self.file, name, AtFlags::REMOVEDIR).map_err(rustix_error)
+    }
+
+    pub(super) fn remove_regular_file_if_identity(
+        &self,
+        name: &str,
+        expected_identity: FileIdentity,
+    ) -> io::Result<()> {
+        let file = self.open_regular_file(name)?;
+        if Self::file_identity(&file)? != expected_identity || Self::hard_link_count(&file)? != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "file identity or link count changed before removal",
+            ));
+        }
+        drop(file);
+        self.remove_file(name)
+    }
+
+    pub(super) fn hard_link_count(file: &fs::File) -> io::Result<u64> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(file.metadata()?.nlink())
     }
 
     fn rename_child_noreplace(
@@ -2338,6 +2377,22 @@ impl SecureDir {
         rename_handle_noreplace(source, &self.path.join(new_name))
     }
 
+    pub(super) fn rename_directory_child_noreplace(
+        &self,
+        old_name: &str,
+        new_name: &str,
+        expected_identity: FileIdentity,
+    ) -> io::Result<()> {
+        let source = self.open_directory(std::ffi::OsStr::new(old_name))?;
+        if source.identity()? != expected_identity {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "directory rename source identity changed",
+            ));
+        }
+        self.rename_child_noreplace(old_name, new_name, &source)
+    }
+
     /// Windows does not expose a portable directory-entry fsync through the handle flags used
     /// here. Receipt file bytes are flushed before rename; directory metadata durability depends
     /// on the filesystem and operating system.
@@ -2352,6 +2407,59 @@ impl SecureDir {
     pub(super) fn remove_directory(&self, name: &str) -> io::Result<()> {
         self.ensure_current_path()?;
         fs::remove_dir(self.path.join(name))
+    }
+
+    pub(super) fn remove_regular_file_if_identity(
+        &self,
+        name: &str,
+        expected_identity: FileIdentity,
+    ) -> io::Result<()> {
+        let file = self.open_regular_file_for_rename(name)?;
+        if Self::file_identity(&file)? != expected_identity || Self::hard_link_count(&file)? != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "file identity or link count changed before removal",
+            ));
+        }
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{
+                FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+            },
+        };
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+        // SAFETY: the disposition structure is initialized and the file handle remains live.
+        let result = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle() as HANDLE,
+                FileDispositionInfo,
+                (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+        if result == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub(super) fn hard_link_count(file: &fs::File) -> io::Result<u64> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
+        };
+        let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+        // SAFETY: `information` points to writable storage for the documented output structure.
+        let result = unsafe {
+            GetFileInformationByHandle(file.as_raw_handle() as HANDLE, information.as_mut_ptr())
+        };
+        if result == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the Win32 call succeeded and initialized the structure.
+        Ok(unsafe { information.assume_init() }.nNumberOfLinks as u64)
     }
 
     fn rename_child_noreplace(
@@ -2613,6 +2721,33 @@ impl SecureDir {
         ))
     }
     pub(super) fn remove_directory(&self, _name: &str) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unsupported platform",
+        ))
+    }
+    pub(super) fn rename_directory_child_noreplace(
+        &self,
+        _old_name: &str,
+        _new_name: &str,
+        _expected_identity: FileIdentity,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unsupported platform",
+        ))
+    }
+    pub(super) fn remove_regular_file_if_identity(
+        &self,
+        _name: &str,
+        _expected_identity: FileIdentity,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unsupported platform",
+        ))
+    }
+    pub(super) fn hard_link_count(_file: &fs::File) -> io::Result<u64> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "unsupported platform",

@@ -1,4 +1,4 @@
-# Installation recovery
+# Installation and removal recovery
 
 M2-06 adds the recovery protocol used by Codex project installation. `thrn skills install` enters
 it through `InstallationSession::commit_and_record`; the recovery implementation itself has no
@@ -136,21 +136,106 @@ there is no atomic commit spanning them. The protocol revalidates after restart 
 or conflicting evidence; it does not claim power-loss atomicity. Unsupported required filesystem
 operations fail closed.
 
+## Receipt-backed removal state machine
+
+M3-01 adds a separate versioned removal journal in application-data `removals`; it does not
+change the accepted schema-v1 installation receipt or weaken the install journal. Removal and
+installation hold the same exclusive `.writer.lock` from recovery/admission through transaction
+completion. Install admission rejects any unresolved removal record, and receipt listing remains
+read-only but fails closed while a removal transaction is pending.
+
+The removal journal contains the strict ownership receipt, receipt-store and receipt-file
+identities, canonical project and `.agents/skills` identities, the verified destination identity,
+the complete expected object inventory with filesystem identities and file digests, a random sibling
+quarantine name, and a set of durable per-object cleanup intents. Schema-v1 receipts contain the
+project-root identity and content inventory but not the destination's installation-time inode. The
+removal journal therefore pins the fully verified destination identity at transaction preparation
+and requires that same identity through rename and cleanup; this protects the transaction from
+substitution after planning. Proposed ADR-013 records this evidence boundary for independent review.
+
+Each journal update is an immutable strict JSON snapshot written to an exclusive temporary file,
+flushed, synchronized, parsed back, and published without replacement. The parent journal directory
+is synchronized on Linux/macOS. Bounds are 10 MiB per snapshot, 16,384 entries, and 256 MiB total.
+An interrupted temporary publication is preserved and blocks all admission. Capacity for every
+expected snapshot is checked before the first project mutation.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Prepared: verified receipt and tree; durable journal
+    Prepared --> DestinationRenamePending: durable rename intent
+    DestinationRenamePending --> Quarantined: no-replace rename, parent sync, identity verified
+    DestinationRenamePending --> RolledBack: original identity and full tree intact
+    Quarantined --> QuarantineCleanupInProgress: durable cleanup phase
+    QuarantineCleanupInProgress --> ContentFullyRemoved: every listed object removed with durable evidence
+    ContentFullyRemoved --> ReceiptRetirementPending: durable receipt retirement intent
+    ReceiptRetirementPending --> ReceiptRetired: exact receipt removed and store synchronized
+    ReceiptRetired --> Complete: terminal snapshot and verified absence
+    Complete --> [*]: checked journal cleanup
+    RolledBack --> [*]: checked journal cleanup
+```
+
+Ordering rules:
+
+1. Acquire and validate the existing writer lock; recover install/removal operations or reject them.
+   Read and validate receipt claims, then build a read-only plan from exact canonical ID, project
+   identity, exact Codex path, directory/file identities, complete inventory, hard-link counts,
+   sizes, and SHA-256 values.
+2. Persist `Prepared` before project mutation. Persist `DestinationRenamePending`, revalidate the
+   receipt and full tree, check parent identities and quarantine absence, and revalidate immediately
+   before moving the destination.
+3. Move the exact opened directory with a same-filesystem no-replace rename. Synchronize its parent
+   where supported, verify quarantine identity, confirm the original path is absent, then persist
+   `Quarantined`. Persist `QuarantineCleanupInProgress` before object cleanup.
+4. For each receipt-listed regular file and recorded directory, verify its current identity and
+   exact state. Persist that object's cleanup intent before deleting it. Recheck identity, hash,
+   byte count/link count for files or identity/emptiness for directories, then remove through secure
+   directory handles. Synchronize the containing directory where supported before continuing.
+   Remove the quarantine root only after identity verification and emptiness. Its cleanup intent is
+   persisted before removal as well.
+5. Persist `ContentFullyRemoved` only after the quarantine root is absent and the complete set of
+   object intents proves the cleanup sequence. Persist `ReceiptRetirementPending`, verify the
+   receipt identity and content, remove only that receipt, and synchronize receipt storage where
+   supported. Persist `ReceiptRetired`, verify the destination and receipt remain absent, then
+   persist `Complete`. Remove journal snapshots only after the terminal state is revalidated.
+
+Recovery is idempotent. `Prepared` can be retired as rolled back only when the original tree and
+receipt still fully verify. In `DestinationRenamePending`, an intact original path plus absent
+quarantine can be marked rolled back; an absent original plus quarantine matching the recorded
+destination identity and complete original inventory advances to forward cleanup. Ambiguous path
+states are preserved. Once the quarantine exists, recovery proceeds forward and never claims
+rollback after a cleanup intent. A missing file or directory is accepted only if its matching
+object-specific cleanup intent is present; otherwise recovery reports conflict. Any still-present
+object must match its recorded filesystem identity and, for files, receipt digest and byte count. An
+unexpected entry prevents parent removal. The receipt is preserved until all content-removal
+evidence is complete; if receipt retirement or its sync fails, the journal determines whether
+recovery should verify/retry retirement or preserve uncertainty.
+
+Faults before a mutation leave the matching intent or state for retry. Faults after a filesystem
+mutation return nonzero and state that removal may be incomplete. Process-crash tests terminate a
+child after quarantine rename, file unlink, and receipt unlink, then verify recovery and a second
+idempotent pass. Directory-entry sync is not available through the current Windows secure handle
+layer, so Windows power-loss durability is limited to the best available handle/file flushes. No
+cross-filesystem power-loss atomicity is claimed. Ordinary process termination is recoverable; a
+power loss can still lose directory metadata after the journal records its best-supported state, so
+recovery may need to preserve and report a conflict.
+
 ## Read-only listing and troubleshooting
 
 `skills list --installed` remains offline and read-only. It lists validated receipts only and does
 not invoke recovery, delete journal files, repair receipt storage, or claim ownership of an
 unreceipted directory. It does not validate current project contents. There is no standalone public
-recovery command. A later explicit install attempt runs recovery before it can make a new project
-change; when destination inspection finds an existing skill, the CLI also reconciles pending
-operation records before reporting a managed duplicate or an unreceipted conflict.
+recovery command. A later explicit install or remove attempt runs recovery before it can make a new
+project change; an active removal journal blocks install admission and installed listing. Install
+destination inspection also reconciles pending install records before reporting a managed duplicate
+or an unreceipted conflict.
 
-When recovery reports a conflict, preserve the project tree, receipt store, and `operations`
-directory as found. Record the operation ID and actionable error for the architect or maintainer.
-Do not delete a skill directory, `.writer.lock`, `.pending-*` file, receipt, or journal because its
-name looks temporary or stale. Do not copy an unreceipted directory into the managed list. A retry
-through `thrn skills install` is safe only when recovery can verify and resolve the journal state;
-conflicts require inspection and an explicit recovery decision. An install failure after directory
+When recovery reports a conflict, preserve the project tree, receipt store, `operations`, and
+`removals` directories as found. Record the operation ID and actionable error for the architect or
+maintainer. Do not delete a skill directory, quarantine, `.writer.lock`, `.pending-*` file, receipt,
+or journal because its name looks temporary or stale. Do not copy an unreceipted directory into the
+managed list. A retry through `thrn skills install` or `thrn skills remove` is safe only when
+recovery can verify and resolve the journal state; conflicts require inspection and an explicit
+recovery decision. An install failure after directory
 commitment is partial: installed content may remain while a receipt is pending, or a receipt may
 already be published while final journal cleanup is incomplete. THRN returns nonzero in either
 case and does not print its installation success message.

@@ -108,9 +108,25 @@ compare paths case-insensitively and also compare the stored project identity. R
 different machine is not supported as proof that the target directory is the same object.
 
 Receipts do not upgrade manually installed or otherwise unreceipted skills into THRN-owned content.
-Corrupt records never authorize removal. The CLI currently supports only Codex project
-installations; it does not provide public remove or update commands. Installed listing is offline
-and read-only, and does not verify current content integrity. A complete installation success
-requires receipt publication and journal cleanup. If either becomes incomplete after directory
-commitment, the command returns nonzero and describes the partial state; recovery preserves content
-whose ownership cannot be proven.
+Corrupt records never authorize removal. The CLI supports Codex project install and removal, but no
+update command, user scope, or other agent. `skills remove` does not need the current catalog: it
+selects one exact canonical resource ID from the receipt and verifies the recorded project identity,
+exact destination path, every directory and file, and each file's byte count and SHA-256 before
+building a read-only plan. Extra, missing, linked, hard-linked, modified, or unsupported objects
+block removal. The accepted schema-v1 receipt records project-root filesystem identity and complete
+content inventory, but it does not record the destination directory's installation-time filesystem
+identity. The separate versioned removal journal records the observed destination identity before
+mutation and protects the subsequent quarantine and cleanup; this limitation is documented in
+proposed ADR-013 for independent architectural review.
+
+Removal uses the same exclusive writer lock as installation. It journals intent, moves the verified
+directory to an operation-private sibling quarantine with a no-replace rename, removes only
+receipt-listed verified regular files and empty recorded directories, and retires the ownership
+receipt only after the content-removal evidence is durable to the level supported by the platform.
+An interrupted removal blocks new install admission and installed listing until recovery finishes.
+Read-only `--dry-run` creates no journal and changes neither project nor receipt storage. See the
+[recovery protocol](recovery.md) for the state machine and recovery behavior. Installed listing is
+offline and read-only; it reports receipt ownership and does not verify current content integrity.
+A complete installation success still requires receipt publication and install-journal cleanup. If
+an install becomes incomplete after directory commitment, the command returns nonzero and recovery
+preserves content whose ownership cannot be proven.

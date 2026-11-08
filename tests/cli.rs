@@ -180,6 +180,83 @@ fn write_receipt(
     .expect("receipt should be written");
 }
 
+fn project_filesystem_identity(path: &std::path::Path) -> (u64, u64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(path).expect("project metadata is available");
+        (metadata.dev(), metadata.ino())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+        let mut options = fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        let file = options.open(path).expect("project directory opens safely");
+        let metadata = file.metadata().expect("project metadata is available");
+        (
+            u64::from(metadata.volume_serial_number().expect("volume serial")),
+            metadata.file_index().expect("project file index"),
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        (0, 0)
+    }
+}
+
+fn prepare_receipted_removal_fixture(directory: &TestDir, resource_id: &str) -> PathBuf {
+    let root = fs::canonicalize(directory.path()).expect("canonical project path");
+    let destination = root.join(".agents/skills/uncharted-ideation");
+    fs::create_dir_all(&destination).expect("skill destination");
+    fs::write(destination.join("SKILL.md"), b"abc").expect("skill file");
+    let (volume, object) = project_filesystem_identity(&root);
+    write_receipt(
+        directory,
+        root.to_str().expect("canonical path is UTF-8"),
+        resource_id,
+        "uncharted-ideation",
+        object,
+    );
+    #[cfg(unix)]
+    {
+        let receipt_path = receipt_directory(directory).join(receipt_filename(
+            root.to_str().expect("canonical path is UTF-8"),
+            resource_id,
+        ));
+        let bytes = fs::read(&receipt_path).expect("fixture receipt");
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("valid receipt");
+        value["projectRootIdentity"]["volume"] = serde_json::json!(volume);
+        fs::write(
+            receipt_path,
+            serde_json::to_vec(&value).expect("serialize corrected identity"),
+        )
+        .expect("write project identity");
+    }
+    #[cfg(windows)]
+    {
+        let receipt_path = receipt_directory(directory).join(receipt_filename(
+            root.to_str().expect("canonical path is UTF-8"),
+            resource_id,
+        ));
+        let bytes = fs::read(&receipt_path).expect("fixture receipt");
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("valid receipt");
+        value["projectRootIdentity"]["volume"] = serde_json::json!(volume);
+        fs::write(
+            receipt_path,
+            serde_json::to_vec(&value).expect("serialize corrected identity"),
+        )
+        .expect("write project identity");
+    }
+    destination
+}
+
 fn write_cache(directory: &TestDir, catalog: &[u8]) {
     let refreshed_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -531,6 +608,133 @@ fn installed_listing_fails_on_unrecognized_receipt_content_without_changing_it()
     assert_eq!(
         fs::read(file).expect("unrecognized content remains"),
         b"not an M2 receipt"
+    );
+}
+
+#[test]
+fn remove_dry_run_is_offline_read_only_and_prints_the_full_verified_plan() {
+    let directory = TestDir::new();
+    let destination = prepare_receipted_removal_fixture(&directory, "creative-lab");
+    let root = fs::canonicalize(directory.path()).expect("canonical project root");
+    let receipt_path = receipt_directory(&directory).join(receipt_filename(
+        root.to_str().expect("canonical path is UTF-8"),
+        "creative-lab",
+    ));
+    let receipt_before = fs::read(&receipt_path).expect("receipt before dry run");
+
+    let output = command_in(
+        &directory,
+        &[
+            "skills",
+            "remove",
+            "creative-lab",
+            "--agent",
+            "codex",
+            "--dry-run",
+        ],
+    )
+    .output()
+    .expect("CLI starts");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Verified THRN skill removal plan"));
+    assert!(stdout.contains("Resource: creative-lab"));
+    assert!(stdout.contains("Skill name: uncharted-ideation"));
+    assert!(stdout.contains(&format!("Destination: {}", destination.display())));
+    assert!(stdout.contains("- SKILL.md (3)"));
+    assert!(stdout.contains("Files to remove: 1\nBytes to remove: 3"));
+    assert!(stdout.contains("Verification: complete receipt and current content match"));
+    assert!(output.stderr.is_empty());
+    assert_eq!(fs::read(destination.join("SKILL.md")).unwrap(), b"abc");
+    assert_eq!(fs::read(&receipt_path).unwrap(), receipt_before);
+    assert!(!data_directory(&directory).join("removals").exists());
+}
+
+#[test]
+fn remove_success_reports_only_after_receipt_retirement_and_installed_listing_is_empty() {
+    let directory = TestDir::new();
+    let destination = prepare_receipted_removal_fixture(&directory, "creative-lab");
+    let expected = format!(
+        "Removed THRN skill\nResource: creative-lab\nSkill name: uncharted-ideation\nAgent: codex\nScope: project\nDestination: {}\nFiles removed: 1\nBytes removed: 3\nOwnership receipt: retired\n",
+        destination.display(),
+    );
+
+    let output = command_in(
+        &directory,
+        &["skills", "remove", "creative-lab", "--agent", "codex"],
+    )
+    .output()
+    .expect("CLI starts");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    assert!(output.stderr.is_empty());
+    assert!(!destination.exists());
+    assert!(directory.path().join(".agents/skills").is_dir());
+
+    let listed = command_in(&directory, &["skills", "list", "--installed"])
+        .output()
+        .expect("installed listing starts");
+    assert_eq!(listed.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&listed.stdout)
+            .contains("No THRN-managed installations are recorded.")
+    );
+    assert!(!String::from_utf8_lossy(&listed.stdout).contains("creative-lab"));
+    assert!(listed.stderr.is_empty());
+}
+
+#[test]
+fn remove_rejects_unmanaged_content_unsupported_agent_and_force_option() {
+    let directory = TestDir::new();
+    let unmanaged = directory.path().join(".agents/skills/uncharted-ideation");
+    fs::create_dir_all(&unmanaged).expect("unmanaged skill directory");
+    fs::write(unmanaged.join("SKILL.md"), b"user content").expect("unmanaged skill file");
+
+    let missing_receipt = command_in(
+        &directory,
+        &["skills", "remove", "creative-lab", "--agent", "codex"],
+    )
+    .output()
+    .expect("CLI starts");
+    assert_eq!(missing_receipt.status.code(), Some(1));
+    assert!(missing_receipt.stdout.is_empty());
+    assert!(!missing_receipt.stderr.is_empty());
+    assert_eq!(
+        fs::read(unmanaged.join("SKILL.md")).unwrap(),
+        b"user content"
+    );
+
+    let unsupported = command_in(
+        &directory,
+        &["skills", "remove", "creative-lab", "--agent", "claude"],
+    )
+    .output()
+    .expect("CLI starts");
+    assert_eq!(unsupported.status.code(), Some(1));
+    assert!(unsupported.stdout.is_empty());
+    assert!(!unsupported.stderr.is_empty());
+
+    let force = command_in(
+        &directory,
+        &[
+            "skills",
+            "remove",
+            "creative-lab",
+            "--agent",
+            "codex",
+            "--force",
+        ],
+    )
+    .output()
+    .expect("CLI starts");
+    assert_eq!(force.status.code(), Some(2));
+    assert!(force.stdout.is_empty());
+    assert!(!force.stderr.is_empty());
+    assert_eq!(
+        fs::read(unmanaged.join("SKILL.md")).unwrap(),
+        b"user content"
     );
 }
 

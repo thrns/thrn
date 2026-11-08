@@ -13,6 +13,8 @@ pub enum ThrnError {
     #[error(transparent)]
     InstalledListing(#[from] crate::install::receipt_store::ReceiptStoreError),
     #[error(transparent)]
+    Removal(#[from] crate::install::removal::RemovalError),
+    #[error(transparent)]
     Resolution(#[from] crate::registry::discovery::ResolutionError),
     #[error("skill validation failed")]
     SkillValidation {
