@@ -44,9 +44,9 @@ pub(crate) enum RemovalState {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RemovalIdentity {
-    volume: u64,
-    object: u64,
+pub(crate) struct RemovalIdentity {
+    pub(crate) volume: u64,
+    pub(crate) object: u64,
 }
 
 impl From<FileIdentity> for RemovalIdentity {
@@ -66,7 +66,7 @@ impl From<RemovalIdentity> for FileIdentity {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-enum RemovalObjectKind {
+pub(crate) enum RemovalObjectKind {
     Root,
     Directory,
     File,
@@ -74,16 +74,16 @@ enum RemovalObjectKind {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RemovalObject {
-    path: String,
-    kind: RemovalObjectKind,
-    identity: RemovalIdentity,
-    byte_count: u64,
-    sha256: Option<String>,
+pub(crate) struct RemovalObject {
+    pub(crate) path: String,
+    pub(crate) kind: RemovalObjectKind,
+    pub(crate) identity: RemovalIdentity,
+    pub(crate) byte_count: u64,
+    pub(crate) sha256: Option<String>,
 }
 
 impl RemovalObject {
-    fn key(&self) -> String {
+    pub(crate) fn key(&self) -> String {
         match self.kind {
             RemovalObjectKind::Root => "root".to_owned(),
             RemovalObjectKind::Directory => format!("directory:{}", self.path),
@@ -91,7 +91,7 @@ impl RemovalObject {
         }
     }
 
-    fn order_key(&self) -> (u8, &str) {
+    pub(crate) fn order_key(&self) -> (u8, &str) {
         let kind = match self.kind {
             RemovalObjectKind::Root => 0,
             RemovalObjectKind::Directory => 1,
@@ -198,6 +198,34 @@ impl RemovalPlan {
         self.receipt.byte_count()
     }
 
+    pub(crate) fn receipt_name(&self) -> &str {
+        &self.receipt_name
+    }
+
+    pub(crate) fn receipt_directory_identity(&self) -> FileIdentity {
+        self.receipt_directory_identity
+    }
+
+    pub(crate) fn receipt_file_identity(&self) -> FileIdentity {
+        self.receipt_file_identity
+    }
+
+    pub(crate) fn agents_identity(&self) -> FileIdentity {
+        self.agents_identity
+    }
+
+    pub(crate) fn skills_identity(&self) -> FileIdentity {
+        self.skills_identity
+    }
+
+    pub(crate) fn destination_identity(&self) -> FileIdentity {
+        self.destination_identity
+    }
+
+    pub(crate) fn objects(&self) -> &[RemovalObject] {
+        &self.objects
+    }
+
     pub(crate) fn files(&self) -> &[ReceiptFile] {
         self.receipt.files()
     }
@@ -260,7 +288,7 @@ fn open_exact_directory(
         })
 }
 
-fn verify_inventory(
+pub(super) fn verify_inventory(
     receipt: &InstallationReceipt,
     root: SecureDir,
 ) -> Result<Vec<RemovalObject>, RemovalError> {

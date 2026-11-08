@@ -2,7 +2,7 @@
 
 ## Current exposure
 
-THRN is under development and has no supported package-manager release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, reads validated local catalog data, offers an explicit HTTPS catalog refresh, performs read-only local `SKILL.md` validation, lists validated receipt-backed installations, plans/installs Codex project skills, and removes exactly verified receipt-backed Codex project skills. Default discovery, both `skills list` modes, and `skills remove` never use the network. Explicit refresh contacts one fixed THRN-operated HTTPS endpoint, validates the response, and writes only the catalog cache. Install commands read the local catalog without refreshing it, then fetch the selected skill at its pinned public GitHub commit and validate it privately. Install dry-run prints a plan without changing the project. A real install uses the M2-04/M2-05/M2-06 commit, receipt, and recovery boundary, and prints success only after the full journaled operation completes. Removal validates a receipt and full current tree, then uses M3-01's separate removal journal, same-filesystem quarantine, and per-object cleanup intents. No retrieved or installed content, script, or subprocess is executed. Installed listing reads only THRN's application-data receipt directory: it does not inspect agent skill folders, create receipt storage, fetch the catalog, open receipt-referenced project paths, or mutate recovery state. It labels current content integrity as unchecked. See [the recovery protocol](recovery.md) for transaction and durability limits.
+THRN is under development and has no supported package-manager release. The current binary parses arguments, prints help/version, reports static build metadata through `doctor`, reads validated local catalog data, offers an explicit HTTPS catalog refresh, performs read-only local `SKILL.md` validation, lists validated receipt-backed installations, plans/installs Codex project skills, and updates/removes exactly verified receipt-backed Codex project skills. Default discovery, both `skills list` modes, and `skills remove` never use the network. Explicit refresh contacts one fixed THRN-operated HTTPS endpoint, validates the response, and writes only the catalog cache. Install and update commands read the local catalog without refreshing it, then fetch the selected skill at its pinned public GitHub commit and validate it privately. Install/update dry-runs print plans without changing the project or receipt store. A real install uses the M2-04/M2-05/M2-06 commit, receipt, and recovery boundary. Update uses a distinct M3-02 journal and receipt transition. Both print success only after journal finalization. Removal validates a receipt and full current tree, then uses M3-01's separate removal journal, same-filesystem quarantine, and per-object cleanup intents. No retrieved or installed content, script, or subprocess is executed. Installed listing reads only THRN's application-data receipt directory: it does not inspect agent skill folders, create receipt storage, fetch the catalog, open receipt-referenced project paths, or mutate recovery state. It labels current content integrity as unchecked and fails closed while update/removal recovery is pending. See [the recovery protocol](recovery.md) for transaction and durability limits.
 
 ## Current installation security boundaries
 
@@ -39,6 +39,25 @@ The removal path adds its own checks and has narrower authorization than a catal
 - Do not execute installed skill files, scripts, hooks, or instructions during verification,
   removal, or recovery. Leave project `.agents` and `.agents/skills` parent directories in place.
 
+The update path has its own constraints:
+
+- Require an exact canonical resource ID and schema-v2 receipt, with matching project, agent,
+  scope, source owner/repository/directory, skill name, and installation-time destination identity.
+  Do not refresh the catalog or accept caller-supplied URLs.
+- Verify every current object identity, file length, and SHA-256 against the receipt before fetching
+  a newer source. Reject changed, extra, missing, linked, colliding, replaced, or ambiguous content,
+  schema-v1 receipts, repository transfers, and renamed sources.
+- Stage and verify the pinned replacement on the destination filesystem. Move the verified old tree
+  to an operation-owned sibling backup with no-replace semantics, then commit the new tree with a
+  second no-replace rename. These renames do not form an atomic swap.
+- Preserve the exact old receipt in an operation-specific backup. Record its raw-byte digest and
+  filesystem identity, the new receipt contents, and the publication temp identity in a distinct
+  update journal. Publish through the existing no-replace receipt API; never overwrite a receipt.
+- Hold the shared writer lock through recovery, revalidation, directory commitment, receipt
+  transition, verification, and cleanup. Installed listing holds the same lock and fails closed
+  while update journals remain. Recovery deletes only individually verified backup objects after
+  durable per-object intents; ambiguous or modified objects are preserved.
+
 Schema-v1 receipts record project-root filesystem identity and full content digests, but they do
 not persist the installed directory's filesystem identity at installation time. The removal journal
 captures the verified current destination identity before mutation and protects the rest of the
@@ -46,7 +65,7 @@ transaction from substitutions. Proposed ADR-013 leaves the sufficiency of that 
 for independent architectural review. On Windows, the current secure handle layer cannot portably
 flush directory-entry metadata; a power loss can therefore leave rename/unlink durability uncertain.
 
-M2-03 implements read-only destination checks and an immutable proposal. M2-04 adds the Codex project directory commit; M2-05 adds post-commit ownership receipts and receipt-backed listing; M2-06 adds journaled recovery; M2-07 connects the explicit Codex project install command to `prepare_install_session()` and `commit_and_record()`. M3-01 adds explicit Codex project removal only when a schema-v2 receipt proves the installation-time destination identity and the complete current inventory verifies. It does not resolve catalog aliases, refresh the catalog, remove unreceipted content, or support user scope or other agents. New installs persist the committed destination identity in the install journal and schema-v2 receipt before success. Historical schema-v1 receipts remain listable but cannot authorize automatic removal. Removal uses a separate versioned journal, keeps the receipt until cleanup evidence is complete, and reports incomplete transactions without a success block. The implementation is pending independent architectural review and is not a claim of a supported package release.
+M2-03 implements read-only destination checks and an immutable proposal. M2-04 adds the Codex project directory commit; M2-05 adds post-commit ownership receipts and receipt-backed listing; M2-06 adds journaled recovery; M2-07 connects the explicit Codex project install command to `prepare_install_session()` and `commit_and_record()`. M3-01 adds explicit Codex project removal only when a schema-v2 receipt proves the installation-time destination identity and the complete current inventory verifies. M3-02 adds update only when the same ownership proof and complete current inventory verify against an exact canonical catalog ID and unchanged GitHub source identity. These commands do not resolve aliases, refresh the catalog, modify unreceipted content, or support user scope or other agents. New installs persist the committed destination identity in the install journal and schema-v2 receipt before success. Historical schema-v1 receipts remain listable but cannot authorize automatic removal or update. Removal and update use separate versioned journals and report incomplete transactions without a success block. Lifecycle implementation is pending independent architectural review and is not a claim of a supported package release.
 
 ## Milestone status
 
@@ -290,6 +309,10 @@ Remaining requirements:
   proposal. Historical schema-v1 receipts do not retain installation-time destination identity and
   are list-only. New schema-v2 installs bind that identity into the receipt; Windows
   directory-entry durability remains limited.
-- **Remaining M3:** user scope, other agents, update/check commands, JSON and noninteractive behavior.
+- **M3-02:** safe update implementation is pending independent architectural review; ADR-014 is a
+  proposal. It uses a separate update journal, operation-owned old-directory and old-receipt
+  backups, a no-replace receipt transition, and verified forward recovery. It preserves schema-v2
+  destination identity and fails closed on schema-v1, modified, or ambiguous content.
+- **Remaining M3:** user scope, other agents, check command, JSON and noninteractive behavior.
 
 Security-sensitive parsing and writes require negative tests with hostile fixtures, isolated temporary directories, and deterministic network mocks. See the [roadmap](ROADMAP.md) and [repository security policy](../SECURITY.md) for project status.

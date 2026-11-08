@@ -28,6 +28,10 @@ use super::{
         NoRemovalFaults, RemovalError, RemovalFaultInjector, RemovalJournalStore, RemovalPlan,
         RemovalSummary,
     },
+    update::{
+        NoUpdateFaults, UpdateError, UpdateFaultInjector, UpdateJournalStore, UpdatePlan,
+        UpdateSummary,
+    },
 };
 
 const IO_CHUNK_BYTES: usize = 8 * 1024;
@@ -69,9 +73,9 @@ impl ReceiptStore {
             self.ensure_no_pending_removals()?;
             return Ok(Vec::new());
         };
-        let allow_idle_lock = check_idle_writer_lock(&directory)?;
+        let _read_reservation = WriterLock::try_acquire_existing(directory.clone())?;
         self.ensure_no_pending_removals()?;
-        let receipts = read_receipts(&directory, allow_idle_lock)?;
+        let receipts = read_receipts(&directory, true)?;
         validate_unique_destinations(&receipts)?;
         let mut receipts = receipts
             .into_iter()
@@ -107,6 +111,45 @@ impl ReceiptStore {
         build_removal_plan(&directory, &receipts, resource_id, &project_root)
     }
 
+    /// Build a read-only update proof using the same schema-v2 ownership and complete-tree
+    /// verification used by removal. The caller supplies an exact canonical catalog ID.
+    pub(crate) fn plan_update_target(
+        &self,
+        resource_id: &str,
+        project: Option<&std::path::Path>,
+        current_directory: &std::path::Path,
+    ) -> Result<RemovalPlan, RemovalError> {
+        let project_root = super::removal::resolve_project_root(project, current_directory)?;
+        let directory = self
+            .open_existing_directory()
+            .map_err(|error| RemovalError::Store(error.to_string()))?
+            .ok_or(RemovalError::MissingReceipt)?;
+        check_idle_writer_lock(&directory)
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+        self.ensure_no_pending_operations()
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+        let receipts = read_receipts(&directory, true)
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+        build_removal_plan(&directory, &receipts, resource_id, &project_root)
+    }
+
+    pub(crate) fn update_receipt_digest(
+        &self,
+        plan: &RemovalPlan,
+    ) -> Result<String, ReceiptStoreError> {
+        let directory = self
+            .open_existing_directory()?
+            .ok_or(ReceiptStoreError::UnsafeDirectory)?;
+        if directory
+            .identity()
+            .map_err(|error| map_io("identify receipt storage", error))?
+            != plan.receipt_directory_identity()
+        {
+            return Err(ReceiptStoreError::UnsafeDirectory);
+        }
+        receipt_file_sha256(&directory, plan.receipt_name())
+    }
+
     /// Recover an interrupted removal and then remove one exact receipt-backed installation.
     pub(crate) fn remove_by_id(
         &self,
@@ -139,6 +182,28 @@ impl ReceiptStore {
         let removal_store = self
             .removal_journal_store()
             .map_err(|error| RemovalError::Store(error.to_string()))?;
+        let update_store = self
+            .update_journal_store()
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+        let removal_count = removal_store
+            .pending_count()
+            .map_err(|error| RemovalError::Journal(error.to_string()))?;
+        let update_count = update_store
+            .pending_count()
+            .map_err(|error| RemovalError::Journal(error.to_string()))?;
+        if removal_count != 0 && update_count != 0 {
+            return Err(RemovalError::Store(
+                "conflicting removal and update journals require manual recovery".to_owned(),
+            ));
+        }
+        super::update::recover_all(
+            &update_store,
+            &directory,
+            &lock,
+            &NoReceiptFaults,
+            &NoUpdateFaults,
+        )
+        .map_err(RemovalError::Journal)?;
         super::removal::recover_all(&removal_store, &directory, &lock, faults)?;
         lock.validate()
             .map_err(|error| RemovalError::Store(error.to_string()))?;
@@ -189,9 +254,15 @@ impl ReceiptStore {
             .map_err(|error| ReceiptStoreError::Journal {
                 detail: error.to_string(),
             })?;
-        if !journal_records.is_empty() || removal_count != 0 {
+        let update_count = self
+            .update_journal_store()?
+            .pending_count()
+            .map_err(|error| ReceiptStoreError::Journal {
+                detail: error.to_string(),
+            })?;
+        if !journal_records.is_empty() || removal_count != 0 || update_count != 0 {
             return Err(ReceiptStoreError::RecoveryRequired {
-                operation_count: journal_records.len() + removal_count,
+                operation_count: journal_records.len() + removal_count + update_count,
             });
         }
         let existing = read_receipts(&reservation.directory, true);
@@ -226,6 +297,83 @@ impl ReceiptStore {
         Ok(RemovalJournalStore::new(data_directory.join("removals")))
     }
 
+    pub(crate) fn update_journal_store(&self) -> Result<UpdateJournalStore, ReceiptStoreError> {
+        let data_directory = self
+            .directory
+            .parent()
+            .ok_or(ReceiptStoreError::UnsafeDirectory)?;
+        Ok(UpdateJournalStore::new(data_directory.join("updates")))
+    }
+
+    /// Recover any prior lifecycle operation, then replace one still-matching immutable update
+    /// plan while holding the shared writer lock through receipt and journal finalization.
+    pub(crate) fn update(
+        &self,
+        plan: &UpdatePlan,
+        faults: &dyn UpdateFaultInjector,
+    ) -> Result<UpdateSummary, UpdateError> {
+        let directory = self
+            .open_existing_directory()
+            .map_err(|error| UpdateError::Store(error.to_string()))?
+            .ok_or(UpdateError::MissingReceipt)?;
+        let mut lock = WriterLock::acquire(directory.clone(), &NoReceiptFaults)
+            .map_err(|error| UpdateError::RecoveryRequired(error.to_string()))?;
+        lock.validate()
+            .map_err(|error| UpdateError::RecoveryRequired(error.to_string()))?;
+        let result = (|| {
+            let install_store = self
+                .journal_store()
+                .map_err(|error| UpdateError::Store(error.to_string()))?;
+            let install_records = install_store
+                .read_all()
+                .map_err(|error| UpdateError::RecoveryRequired(error.to_string()))?;
+            for record in install_records {
+                lock.validate()
+                    .map_err(|error| UpdateError::RecoveryRequired(error.to_string()))?;
+                recover_operation(
+                    &install_store,
+                    &record,
+                    &directory,
+                    &NoRecoveryInstallFaults,
+                    &super::journal::NoJournalFaults,
+                    &NoReceiptFaults,
+                )
+                .map_err(|error| UpdateError::RecoveryRequired(error.to_string()))?;
+            }
+            let removal_store = self
+                .removal_journal_store()
+                .map_err(|error| UpdateError::Store(error.to_string()))?;
+            super::removal::recover_all(&removal_store, &directory, &lock, &NoRemovalFaults)
+                .map_err(|error| UpdateError::RecoveryRequired(error.to_string()))?;
+            let update_store = self
+                .update_journal_store()
+                .map_err(|error| UpdateError::Store(error.to_string()))?;
+            super::update::recover_all(&update_store, &directory, &lock, &NoReceiptFaults, faults)
+                .map_err(UpdateError::RecoveryRequired)?;
+            lock.validate()
+                .map_err(|error| UpdateError::RecoveryRequired(error.to_string()))?;
+            super::update::execute_locked(
+                plan,
+                &directory,
+                &lock,
+                &update_store,
+                &NoReceiptFaults,
+                faults,
+            )
+        })();
+        match result {
+            Ok(summary) => {
+                lock.release()
+                    .map_err(|error| UpdateError::Store(error.to_string()))?;
+                Ok(summary)
+            }
+            Err(error) => {
+                let _ = lock.release();
+                Err(error)
+            }
+        }
+    }
+
     fn ensure_no_pending_operations(&self) -> Result<(), ReceiptStoreError> {
         let install_count = self
             .journal_store()?
@@ -240,7 +388,13 @@ impl ReceiptStore {
             .map_err(|error| ReceiptStoreError::Journal {
                 detail: error.to_string(),
             })?;
-        let operation_count = install_count + removal_count;
+        let update_count = self
+            .update_journal_store()?
+            .pending_count()
+            .map_err(|error| ReceiptStoreError::Journal {
+                detail: error.to_string(),
+            })?;
+        let operation_count = install_count + removal_count + update_count;
         if operation_count != 0 {
             return Err(ReceiptStoreError::RecoveryRequired { operation_count });
         }
@@ -254,9 +408,15 @@ impl ReceiptStore {
             .map_err(|error| ReceiptStoreError::Journal {
                 detail: error.to_string(),
             })?;
-        if removal_count != 0 {
+        let update_count = self
+            .update_journal_store()?
+            .pending_count()
+            .map_err(|error| ReceiptStoreError::Journal {
+                detail: error.to_string(),
+            })?;
+        if removal_count != 0 || update_count != 0 {
             return Err(ReceiptStoreError::RecoveryRequired {
-                operation_count: removal_count,
+                operation_count: removal_count + update_count,
             });
         }
         Ok(())
@@ -289,6 +449,19 @@ impl ReceiptStore {
         let journal_store = self.journal_store().map_err(RecoveryError::Store)?;
         let result = (|| {
             let records = journal_store.read_all().map_err(RecoveryError::Journal)?;
+            let removal_store = self.removal_journal_store().map_err(RecoveryError::Store)?;
+            let update_store = self.update_journal_store().map_err(RecoveryError::Store)?;
+            let removal_count = removal_store
+                .pending_count()
+                .map_err(|error| RecoveryError::Removal(error.to_string()))?;
+            let update_count = update_store
+                .pending_count()
+                .map_err(|error| RecoveryError::Update(error.to_string()))?;
+            if (!records.is_empty() && (removal_count != 0 || update_count != 0))
+                || (removal_count != 0 && update_count != 0)
+            {
+                return Err(RecoveryError::LifecycleConflict);
+            }
             let mut outcomes = Vec::new();
             for record in records {
                 lock.validate().map_err(RecoveryError::Store)?;
@@ -301,9 +474,16 @@ impl ReceiptStore {
                     receipt_faults,
                 )?);
             }
-            let removal_store = self.removal_journal_store().map_err(RecoveryError::Store)?;
             super::removal::recover_all(&removal_store, &directory, &lock, &NoRemovalFaults)
                 .map_err(|error| RecoveryError::Removal(error.to_string()))?;
+            super::update::recover_all(
+                &update_store,
+                &directory,
+                &lock,
+                receipt_faults,
+                &NoUpdateFaults,
+            )
+            .map_err(RecoveryError::Update)?;
             Ok(outcomes)
         })();
         match result {
@@ -557,10 +737,6 @@ impl ReceiptReservation {
             .receipt
             .to_json()
             .map_err(|source| validation_error("committed receipt", source))?;
-        let final_name = self
-            .receipt
-            .receipt_filename()
-            .map_err(|source| validation_error("committed receipt", source))?;
         let (temporary_name, mut temporary_file) = self.create_temporary_receipt(faults)?;
         let temporary_identity = SecureDir::file_identity(&temporary_file)
             .map_err(|error| map_io("identify temporary receipt", error))?;
@@ -604,41 +780,17 @@ impl ReceiptReservation {
             return Err(ReceiptStoreError::TemporaryReceiptMismatch);
         }
 
-        faults
-            .before(ReceiptOperation::PublishNoReplace)
-            .map_err(|error| map_io("publish receipt without replacement", error))?;
-        self.lock.validate()?;
-        self.directory
-            .rename_file_child_noreplace(&temporary_name, &final_name, &temporary_file)
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::AlreadyExists {
-                    ReceiptStoreError::DuplicateIdentity
-                } else {
-                    map_io("publish receipt without replacement", error)
-                }
-            })?;
+        publish_receipt_no_replace(
+            &self.directory,
+            &self.lock,
+            &self.receipt,
+            &current,
+            &temporary_name,
+            temporary_identity,
+            &mut temporary_file,
+            faults,
+        )?;
         temporary_guard.active = false;
-        faults
-            .after(ReceiptOperation::PublishNoReplace)
-            .map_err(|error| map_io("publish receipt without replacement", error))?;
-        faults
-            .before(ReceiptOperation::SyncReceiptDirectory)
-            .map_err(|error| ReceiptStoreError::Durability {
-                kind: error.kind(),
-                os_error: error.raw_os_error(),
-            })?;
-        self.directory
-            .sync_directory()
-            .map_err(|error| ReceiptStoreError::Durability {
-                kind: error.kind(),
-                os_error: error.raw_os_error(),
-            })?;
-        faults
-            .after(ReceiptOperation::SyncReceiptDirectory)
-            .map_err(|error| ReceiptStoreError::Durability {
-                kind: error.kind(),
-                os_error: error.raw_os_error(),
-            })?;
         Ok(self.receipt.clone())
     }
 
@@ -675,6 +827,140 @@ impl Drop for ReceiptReservation {
     fn drop(&mut self) {
         // WriterLock releases its OS lock when this reservation is dropped.
     }
+}
+
+/// The shared receipt publication boundary for installs and updates. It validates the exact
+/// prepared bytes and uses the existing no-replace rename primitive; callers cannot overwrite a
+/// deterministic receipt filename.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn publish_receipt_no_replace(
+    directory: &SecureDir,
+    lock: &WriterLock,
+    receipt: &InstallationReceipt,
+    existing_claims: &[(String, InstallationReceipt)],
+    temporary_name: &str,
+    temporary_identity: FileIdentity,
+    temporary_file: &mut fs::File,
+    faults: &dyn ReceiptFaultInjector,
+) -> Result<FileIdentity, ReceiptStoreError> {
+    lock.validate()?;
+    validate_new_claim(receipt, existing_claims)?;
+    if SecureDir::file_identity(temporary_file)
+        .map_err(|error| map_io("identify temporary receipt", error))?
+        != temporary_identity
+        || SecureDir::hard_link_count(temporary_file)
+            .map_err(|error| map_io("inspect temporary receipt links", error))?
+            != 1
+        || read_receipt_file(directory, temporary_name)? != *receipt
+    {
+        return Err(ReceiptStoreError::TemporaryReceiptMismatch);
+    }
+    let final_name = receipt
+        .receipt_filename()
+        .map_err(|source| validation_error("committed receipt", source))?;
+    faults
+        .before(ReceiptOperation::PublishNoReplace)
+        .map_err(|error| map_io("publish receipt without replacement", error))?;
+    lock.validate()?;
+    directory
+        .rename_file_child_noreplace(temporary_name, &final_name, temporary_file)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                ReceiptStoreError::DuplicateIdentity
+            } else {
+                map_io("publish receipt without replacement", error)
+            }
+        })?;
+    faults
+        .after(ReceiptOperation::PublishNoReplace)
+        .map_err(|error| map_io("publish receipt without replacement", error))?;
+    faults
+        .before(ReceiptOperation::SyncReceiptDirectory)
+        .map_err(|error| ReceiptStoreError::Durability {
+            kind: error.kind(),
+            os_error: error.raw_os_error(),
+        })?;
+    directory
+        .sync_directory()
+        .map_err(|error| ReceiptStoreError::Durability {
+            kind: error.kind(),
+            os_error: error.raw_os_error(),
+        })?;
+    faults
+        .after(ReceiptOperation::SyncReceiptDirectory)
+        .map_err(|error| ReceiptStoreError::Durability {
+            kind: error.kind(),
+            os_error: error.raw_os_error(),
+        })?;
+    let published = directory
+        .open_regular_file(&final_name)
+        .map_err(|error| map_io("verify published receipt", error))?;
+    let identity = SecureDir::file_identity(&published)
+        .map_err(|error| map_io("identify published receipt", error))?;
+    if identity != temporary_identity || read_receipt_file(directory, &final_name)? != *receipt {
+        return Err(ReceiptStoreError::TemporaryReceiptMismatch);
+    }
+    Ok(identity)
+}
+
+/// Write and verify a transition receipt temporary without publishing it. The returned name and
+/// identity must be persisted in the update journal before the old receipt is moved.
+pub(super) fn prepare_transition_receipt_temp(
+    directory: &SecureDir,
+    operation_id: &str,
+    receipt: &InstallationReceipt,
+    faults: &dyn ReceiptFaultInjector,
+) -> Result<(String, FileIdentity), ReceiptStoreError> {
+    let bytes = receipt
+        .to_json()
+        .map_err(|source| validation_error("replacement receipt", source))?;
+    let name = format!(".pending-update-{operation_id}");
+    faults
+        .before(ReceiptOperation::CreateTemporaryReceipt)
+        .map_err(|error| map_io("create update receipt temporary", error))?;
+    let mut file = directory
+        .create_regular_file(&name)
+        .map_err(|error| map_io("create update receipt temporary", error))?;
+    let identity = SecureDir::file_identity(&file)
+        .map_err(|error| map_io("identify update receipt temporary", error))?;
+    file.write_all(&bytes)
+        .map_err(|error| map_io("write update receipt temporary", error))?;
+    file.flush()
+        .map_err(|error| map_io("flush update receipt temporary", error))?;
+    faults
+        .before(ReceiptOperation::SyncTemporaryReceipt)
+        .map_err(|error| map_io("synchronize update receipt temporary", error))?;
+    file.sync_all()
+        .map_err(|error| map_io("synchronize update receipt temporary", error))?;
+    faults
+        .after(ReceiptOperation::SyncTemporaryReceipt)
+        .map_err(|error| map_io("synchronize update receipt temporary", error))?;
+    if read_receipt_file(directory, &name)? != *receipt
+        || SecureDir::file_identity(&file)
+            .map_err(|error| map_io("verify update receipt temporary", error))?
+            != identity
+    {
+        return Err(ReceiptStoreError::TemporaryReceiptMismatch);
+    }
+    faults
+        .before(ReceiptOperation::SyncReceiptDirectory)
+        .map_err(|error| ReceiptStoreError::Durability {
+            kind: error.kind(),
+            os_error: error.raw_os_error(),
+        })?;
+    directory
+        .sync_directory()
+        .map_err(|error| ReceiptStoreError::Durability {
+            kind: error.kind(),
+            os_error: error.raw_os_error(),
+        })?;
+    faults
+        .after(ReceiptOperation::SyncReceiptDirectory)
+        .map_err(|error| ReceiptStoreError::Durability {
+            kind: error.kind(),
+            os_error: error.raw_os_error(),
+        })?;
+    Ok((name, identity))
 }
 
 pub(super) struct WriterLock {
@@ -722,6 +1008,54 @@ impl WriterLock {
         };
         lock.validate()?;
         Ok(lock)
+    }
+
+    fn try_acquire_existing(directory: SecureDir) -> Result<Option<Self>, ReceiptStoreError> {
+        let entries = directory
+            .entries()
+            .map_err(|error| map_io("inspect receipt-store lock", error))?;
+        let Some((_, kind)) = entries
+            .iter()
+            .find(|(name, _)| name.to_str() == Some(WRITER_LOCK_NAME))
+        else {
+            return Ok(None);
+        };
+        if *kind != NodeKind::RegularFile {
+            return Err(ReceiptStoreError::UnsafeObject {
+                name: WRITER_LOCK_NAME.to_owned(),
+            });
+        }
+        let file = directory
+            .open_lock_file(WRITER_LOCK_NAME)
+            .map_err(|error| map_io("open receipt-store read reservation", error))?;
+        if file
+            .metadata()
+            .map_err(|error| map_io("inspect receipt-store read reservation", error))?
+            .len()
+            != 0
+        {
+            return Err(ReceiptStoreError::UnsafeObject {
+                name: WRITER_LOCK_NAME.to_owned(),
+            });
+        }
+        match file.try_lock() {
+            Ok(()) => {
+                let identity = SecureDir::file_identity(&file)
+                    .map_err(|error| map_io("identify receipt-store read reservation", error))?;
+                let lock = Self {
+                    directory,
+                    file,
+                    identity,
+                    released: false,
+                };
+                lock.validate()?;
+                Ok(Some(lock))
+            }
+            Err(std::fs::TryLockError::WouldBlock) => Err(ReceiptStoreError::BusyOrInterrupted),
+            Err(std::fs::TryLockError::Error(error)) => {
+                Err(map_io("reserve receipt-store listing", error))
+            }
+        }
     }
 
     pub(super) fn validate(&self) -> Result<(), ReceiptStoreError> {
@@ -2431,6 +2765,12 @@ pub(crate) enum RecoveryError {
     Journal(#[source] JournalError),
     #[error("removal recovery is incomplete or conflicted: {0}")]
     Removal(String),
+    #[error("update recovery is incomplete or conflicted: {0}")]
+    Update(String),
+    #[error(
+        "installation, removal, and update journals conflict; preserve them for manual recovery"
+    )]
+    LifecycleConflict,
     #[error(
         "operation {operation_id} conflicts with current filesystem or receipt state: {detail}; preserve the content and inspect it manually"
     )]
@@ -2451,6 +2791,15 @@ fn read_receipts_with_pending(
     directory: &SecureDir,
     allow_writer_lock: bool,
     allow_pending: bool,
+) -> Result<Vec<(String, InstallationReceipt)>, ReceiptStoreError> {
+    read_receipts_excluding(directory, allow_writer_lock, allow_pending, &[])
+}
+
+fn read_receipts_excluding(
+    directory: &SecureDir,
+    allow_writer_lock: bool,
+    allow_pending: bool,
+    excluded_artifacts: &[&str],
 ) -> Result<Vec<(String, InstallationReceipt)>, ReceiptStoreError> {
     let mut entries = directory
         .entries()
@@ -2489,6 +2838,12 @@ fn read_receipts_with_pending(
         if name == WRITER_LOCK_NAME {
             return Err(ReceiptStoreError::BusyOrInterrupted);
         }
+        if excluded_artifacts.contains(&name.as_str()) {
+            if kind != NodeKind::RegularFile {
+                return Err(ReceiptStoreError::UnsafeObject { name });
+            }
+            continue;
+        }
         if name.starts_with(".pending-") {
             if allow_pending {
                 continue;
@@ -2517,6 +2872,90 @@ fn read_receipts_with_pending(
     }
     validate_unique_destinations(&receipts)?;
     Ok(receipts)
+}
+
+pub(super) fn read_update_receipt_claims(
+    directory: &SecureDir,
+    excluded_artifacts: &[&str],
+) -> Result<Vec<(String, InstallationReceipt)>, ReceiptStoreError> {
+    read_receipts_excluding(directory, true, false, excluded_artifacts)
+}
+
+pub(super) fn read_named_receipt(
+    directory: &SecureDir,
+    name: &str,
+) -> Result<InstallationReceipt, ReceiptStoreError> {
+    read_receipt_file(directory, name)
+}
+
+pub(super) fn receipt_file_identity(
+    directory: &SecureDir,
+    name: &str,
+) -> Result<FileIdentity, ReceiptStoreError> {
+    let file = directory
+        .open_regular_file(name)
+        .map_err(|error| map_io("open ownership receipt", error))?;
+    if SecureDir::hard_link_count(&file)
+        .map_err(|error| map_io("inspect ownership receipt links", error))?
+        != 1
+    {
+        return Err(ReceiptStoreError::UnsafeObject {
+            name: name.to_owned(),
+        });
+    }
+    SecureDir::file_identity(&file).map_err(|error| map_io("identify ownership receipt", error))
+}
+
+pub(super) fn receipt_file_sha256(
+    directory: &SecureDir,
+    name: &str,
+) -> Result<String, ReceiptStoreError> {
+    let mut file = directory
+        .open_regular_file(name)
+        .map_err(|error| map_io("open ownership receipt for digest", error))?;
+    let before = SecureDir::file_identity(&file)
+        .map_err(|error| map_io("identify ownership receipt for digest", error))?;
+    if SecureDir::hard_link_count(&file)
+        .map_err(|error| map_io("inspect ownership receipt links", error))?
+        != 1
+    {
+        return Err(ReceiptStoreError::UnsafeObject {
+            name: name.to_owned(),
+        });
+    }
+    let length = file
+        .metadata()
+        .map_err(|error| map_io("inspect ownership receipt for digest", error))?
+        .len();
+    if length > MAX_RECEIPT_BYTES as u64 {
+        return Err(validation_error(
+            name,
+            ReceiptValidationError::InputTooLarge {
+                maximum: MAX_RECEIPT_BYTES,
+            },
+        ));
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    Read::by_ref(&mut file)
+        .take(MAX_RECEIPT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| map_io("read ownership receipt for digest", error))?;
+    if bytes.len() as u64 != length
+        || SecureDir::file_identity(&file)
+            .map_err(|error| map_io("reidentify ownership receipt for digest", error))?
+            != before
+    {
+        return Err(ReceiptStoreError::UnsafeObject {
+            name: name.to_owned(),
+        });
+    }
+    let digest = ring::digest::digest(&SHA256, &bytes);
+    let mut value = String::from("sha256:");
+    for byte in digest.as_ref() {
+        use std::fmt::Write as _;
+        let _ = write!(value, "{byte:02x}");
+    }
+    Ok(value)
 }
 
 /// An unlocked persistent lock file is a stale reservation: OS locks, rather than age or PID,

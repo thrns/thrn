@@ -1,6 +1,6 @@
 # CLI contract
 
-This page describes the executable that exists today. The CLI supports offline catalog discovery and installed-resource listing, explicit catalog refresh, local skill validation, `doctor`, Codex project installation planning and installation, and receipt-backed Codex project removal. Update, user scope, other agents, configuration, completions, JSON output, and noninteractive options are not implemented.
+This page describes the executable that exists today. The CLI supports offline catalog discovery and installed-resource listing, explicit catalog refresh, local skill validation, `doctor`, Codex project installation planning and installation, and receipt-backed Codex project update and removal. User scope, other agents, configuration, completions, JSON output, and noninteractive options are not implemented.
 
 ## Available commands
 
@@ -24,13 +24,57 @@ This page describes the executable that exists today. The CLI supports offline c
 | `thrn skills remove <canonical-id> --agent codex --project <path>` | Remove one fully verified receipt-backed skill from the selected existing project. |
 | `thrn skills remove <canonical-id> --agent codex --dry-run` | Print the exact verified destination, receipt-listed files, counts, and bytes without changing the project or receipt store. |
 | `thrn skills remove <canonical-id> --agent codex --project <path> --dry-run` | Print a read-only removal plan for the selected project. |
+| `thrn skills update <canonical-id> --agent codex --dry-run` | Verify the current receipt and complete tree, fetch the local catalog's exact pinned replacement if needed, and print the file-level comparison without project or receipt-store writes. |
+| `thrn skills update <canonical-id> --agent codex` | Replace the exactly verified project installation with the newer full commit pinned by the validated local catalog, using a versioned update journal and receipt transition. |
+| `thrn skills update <canonical-id> --agent codex --project <path>` | Update the selected existing project instead of the current directory. |
 
 The root parser requires a subcommand. Clap also supplies its normal short-help and short-version aliases.
 
 ## Output and exit status
 
-Successful help, version, doctor, list, search, info, validation, conflict-free dry-run, and completed installation output goes to stdout and exits `0`. Empty catalog and empty managed-installation states are successful. Catalog list, search, and info identify their selected catalog source (`local cache` or `bundled metadata`) and freshness. Installed listing reads validated receipts only and explicitly says current content integrity was not checked. Clap usage errors go to stderr and exit `2`. Invalid or unknown IDs, unsupported agents, network or source validation errors, unsafe or conflicting destinations, existing unmanaged skills, duplicate managed installs, active writer locks, recovery-required state, receipt or journal corruption, and output failures go to stderr and exit `1`. Failures after directory commitment identify the incomplete state and never print the full success message. Receipt publication followed by journal-cleanup failure is also an error even though the receipt may be visible. Recovery conflicts instruct the user to preserve the files and inspect the recorded operation; do not blindly delete receipts, journals, locks, or installed directories.
+Successful help, version, doctor, list, search, info, validation, conflict-free dry-run, completed installation/update/removal, and already-up-to-date results go to stdout and exit `0`. Empty catalog and empty managed-installation states are successful. Catalog list, search, and info identify their selected catalog source (`local cache` or `bundled metadata`) and freshness. Installed listing reads validated receipts only and explicitly says current content integrity was not checked. Clap usage errors go to stderr and exit `2`. Invalid or unknown IDs, unsupported agents, network or source validation errors, unsafe or conflicting destinations, existing unmanaged skills, duplicate managed installs, active writer locks, recovery-required state, receipt or journal corruption, and output failures go to stderr and exit `1`. Failures after directory commitment identify the incomplete state and never print the full success message. Receipt publication followed by journal-cleanup failure is also an error even though the receipt may be visible. Recovery conflicts instruct the user to preserve the files and inspect the recorded operation; do not blindly delete receipts, journals, locks, or installed directories.
 Successful removal follows the same stdout/exit-0 rule as installation. For removal, only an exact canonical resource ID recorded in a valid schema-v2 receipt with installation-time destination identity is accepted; aliases and skill directory names are not resolved. Historical schema-v1 receipts remain listable, but removal refuses them because they do not prove the directory's original identity. The receipt must identify `agent: codex`, `scope: project`, and the selected canonical project root. THRN verifies the exact `<project>/.agents/skills/<skillName>` path, transaction identities, all receipt-listed files and directories, each file's byte count and SHA-256, and the absence of additional or linked objects. The catalog is not loaded, refreshed, or contacted. A missing, corrupt, or conflicting receipt; unmanaged directory; modified, missing, or extra content; identity change; lock contention; or unresolved transaction exits nonzero and preserves uncertain state. Once mutation begins, errors state that removal may be incomplete and never print the success block.
+
+### Receipt-backed updates
+
+```sh
+thrn skills update uncharted --agent codex --dry-run
+thrn skills update uncharted --agent codex
+thrn skills update uncharted --agent codex --project ./my-project
+```
+
+Update accepts only an exact canonical resource ID and explicit Codex project scope. It reads the
+validated local catalog without refreshing it. Before fetching a replacement, THRN requires a
+schema-v2 ownership receipt whose project, agent, scope, resource, GitHub owner/repository, source
+directory, skill name, and installation-time destination identity still match. It verifies every
+current file and directory, including filesystem object identity, byte count, SHA-256, link/type
+restrictions, and absence of extra objects. Schema-v1 receipts, changed repository transfers,
+renamed skills, changed source directories, same-length edits, replacement directories, or any
+ambiguous object are conflicts. A matching catalog pin reports `Already up to date` without a fetch,
+project mutation, or receipt rewrite.
+
+For a newer pin, THRN fetches only that exact full GitHub commit and uses the existing archive and
+staged skill validation. Dry-run lists each added, removed, changed, and unchanged file, old/new
+revisions, destination, replacement file count and bytes, and verified ownership. The exact pinned
+source can be downloaded for this comparison; dry-run does not alter project or receipt storage.
+
+Execution holds the shared OS-backed writer lock, resolves prior lifecycle journals, revalidates the
+plan, and stages the complete replacement beside the destination. A separate versioned update
+journal records both inventories and directory identities. The old installation is moved with a
+no-replace rename into a named backup; the replacement is then committed to the original name with
+a second no-replace rename. These two operations are not an atomic swap. For the deterministic
+receipt identity, THRN retains the exact old receipt in a journal-owned backup, publishes the new
+receipt through the existing no-replace API, verifies the new tree and receipt, then cleans the old
+backup with durable per-object deletion intents. Installed listing fails closed while an update
+journal exists. Recovery follows a verified forward path once an update starts; it never adopts a
+directory just because hashes match. If a conflict prevents recovery, the old/new directory, receipt
+backup, and journal remain for manual inspection. See the [update state machine](recovery.md#receipt-backed-update-state-machine).
+
+On success, stdout includes the resource ID, skill name, destination, previous/new pinned revisions,
+updated file count and bytes, and confirmation that the new ownership receipt was recorded. An
+interrupted/partially committed update exits nonzero and does not print this success block. The
+current Windows secure handle layer cannot flush directory-entry metadata, and no cross-filesystem
+power-loss atomicity is claimed.
 
 ### Installation planning and installation
 

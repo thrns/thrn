@@ -132,8 +132,8 @@ compare paths case-insensitively and also compare the stored project identity. R
 different machine is not supported as proof that the target directory is the same object.
 
 Receipts do not upgrade manually installed or otherwise unreceipted skills into THRN-owned content.
-Corrupt records never authorize removal. The CLI supports Codex project install and removal, but no
-update command, user scope, or other agent. `skills remove` does not need the current catalog: it
+Corrupt records never authorize removal or update. The CLI supports Codex project install, update,
+and removal, but no user scope or other agent. `skills remove` does not need the current catalog: it
 selects one exact canonical resource ID from the receipt and verifies the recorded project identity,
 installation-time destination identity, exact destination path, every directory and file, and each
 file's byte count and SHA-256 before building a read-only plan. Extra, missing, linked, hard-linked,
@@ -142,7 +142,7 @@ replaced, modified, or unsupported objects block removal.
 ## Compatibility and migration
 
 Existing schema-v1 receipt bytes are preserved. Listing continues to parse them, while automatic
-removal refuses because installation-time directory ownership cannot be established. No migration
+removal and update refuse because installation-time directory ownership cannot be established. No migration
 or adoption shortcut is performed. New installs write schema v2.
 
 Install operation-journal schema v1 remains readable. Its historical receipt intent is schema v1;
@@ -168,3 +168,30 @@ offline and read-only; it reports receipt ownership and does not verify current 
 A complete installation success still requires receipt publication and install-journal cleanup. If
 an install becomes incomplete after directory commitment, the command returns nonzero and recovery
 preserves content whose ownership cannot be proven.
+
+## Receipt-backed update transition
+
+An update retains the same deterministic receipt filename because the canonical project, agent, and
+resource identity do not change. The immutable update plan records the active filename, the old
+receipt file's filesystem identity and raw SHA-256, and the required transition mode: back up the old
+claim, then publish the new claim with the existing no-replace receipt API. The versioned update
+journal stores the full old receipt, its raw-byte digest, the new schema-v2 receipt contents, the
+receipt temp/backup names and identities, and the committed replacement directory identity.
+
+Before renaming the old receipt, the active receipt must still match its exact old file identity,
+validated receipt fields, and raw-byte digest. The old receipt is renamed without replacement into
+an operation-specific regular file in the same receipt directory and synchronized. The new receipt
+is prepared in a private exclusive temporary file, captured in the journal, and published through
+`publish_receipt_no_replace`; the publication code itself still validates other active claims and
+refuses an occupied deterministic filename. While the old record is backed up and the new record is
+not yet durably verified, the operation journal remains pending and installed listing fails closed.
+Recovery accepts only the exact old active receipt plus no backup, the exact old backup plus no
+active receipt, or the exact new active receipt plus the exact old backup, as permitted by the
+journaled state. Two independently valid active records cannot claim one destination.
+
+The old receipt backup is retained until the replacement tree and new receipt both verify and the
+old skill backup cleanup reaches its terminal state. Its deletion has a durable cleanup intent and
+is allowed only after the recorded file identity and old receipt content verify. The new receipt is
+never published by unchecked overwrite, and a matching set of hashes alone never authorizes adopting
+a directory. A failed or interrupted transition exits nonzero; success is reported only after the
+new receipt verifies and transaction finalization completes. See the [update state machine](recovery.md#receipt-backed-update-state-machine).

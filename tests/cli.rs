@@ -958,6 +958,56 @@ fn install_help_distinguishes_planning_from_installation() {
 }
 
 #[test]
+fn update_help_exposes_only_explicit_codex_project_options() {
+    let output = run_cli(&["skills", "update", "--help"]);
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--agent <AGENT>"));
+    assert!(stdout.contains("--project <PATH>"));
+    assert!(stdout.contains("--dry-run"));
+    assert!(stdout.contains("exactly verified"));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn update_cli_reports_usage_and_runtime_failures_on_stderr_without_partial_stdout() {
+    let missing_agent = run_cli(&["skills", "update", "uncharted"]);
+    assert_eq!(missing_agent.status.code(), Some(2));
+    assert!(missing_agent.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&missing_agent.stderr).contains("--agent <AGENT>"));
+
+    let directory = TestDir::new();
+    let unsupported = command_in(
+        &directory,
+        &["skills", "update", "uncharted", "--agent", "cursor"],
+    )
+    .output()
+    .expect("CLI process starts");
+    assert_eq!(unsupported.status.code(), Some(1));
+    assert!(unsupported.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&unsupported.stderr).contains("only explicit --agent codex"));
+    assert!(!directory.root().join("thrn-data").exists());
+
+    let missing_receipt = command_in(
+        &directory,
+        &[
+            "skills",
+            "update",
+            "frontend-design",
+            "--agent",
+            "codex",
+            "--dry-run",
+        ],
+    )
+    .output()
+    .expect("CLI process starts");
+    assert_eq!(missing_receipt.status.code(), Some(1));
+    assert!(missing_receipt.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&missing_receipt.stderr).contains("ownership receipt"));
+    assert!(!directory.path().join(".agents").exists());
+}
+
+#[test]
 fn install_does_not_accept_overwrite_or_other_unlisted_options() {
     let directory = TestDir::new();
     let output = command_in(

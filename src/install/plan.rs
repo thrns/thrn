@@ -289,6 +289,22 @@ pub fn build_install_plan(
     })
 }
 
+/// Build the replacement copy plan for a receipt-verified managed directory. The caller must
+/// independently prove ownership and revalidate the destination before commitment; this builder
+/// only removes the expected existing-directory conflict at that exact destination.
+pub(crate) fn build_update_install_plan(
+    staged: &StagedSkill,
+    inventory: &StagedInventory,
+    destination: DestinationSnapshot,
+) -> Result<InstallPlan, PlanError> {
+    let mut plan = build_install_plan(staged, inventory, destination)?;
+    plan.conflicts.retain(|conflict| {
+        conflict.path() != plan.destination
+            || conflict.kind() != super::destination::ConflictKind::ExistingDirectory
+    });
+    Ok(plan)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
