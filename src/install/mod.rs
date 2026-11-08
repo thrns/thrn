@@ -7,6 +7,7 @@ pub mod plan;
 pub(crate) mod receipt;
 pub mod receipt_store;
 pub(crate) mod removal;
+pub mod update;
 
 #[cfg(all(test, windows))]
 pub(crate) mod windows_test_support;

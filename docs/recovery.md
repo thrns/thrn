@@ -1,4 +1,4 @@
-# Installation and removal recovery
+# Installation, update, and removal recovery
 
 M2-06 adds the recovery protocol used by Codex project installation. `thrn skills install` enters
 it through `InstallationSession::commit_and_record`; the recovery implementation itself has no
@@ -187,7 +187,7 @@ stateDiagram-v2
 
 Ordering rules:
 
-1. Acquire and validate the existing writer lock; recover install/removal operations or reject them.
+1. Acquire and validate the existing writer lock; recover install/removal/update operations or reject them.
    Read and validate receipt claims, then build a read-only plan from exact canonical ID, project
    identity, exact Codex path, directory/file identities, complete inventory, hard-link counts,
    sizes, and SHA-256 values.
@@ -230,21 +230,102 @@ cross-filesystem power-loss atomicity is claimed. Ordinary process termination i
 power loss can still lose directory metadata after the journal records its best-supported state, so
 recovery may need to preserve and report a conflict.
 
+## Receipt-backed update state machine
+
+M3-02 uses a separate strict versioned journal in application-data `updates`. It shares the
+persistent `.writer.lock` with installation and removal. The record captures the old schema-v2
+receipt, its raw-byte SHA-256 and filesystem identity, the complete old and replacement inventories,
+project and Codex parent identities, stage and destination directory identities, receipt transition
+temporary/backup identities, operation-owned names, and per-object cleanup intents. It records the
+new schema-v2 receipt before that receipt can be published. Journal snapshots use exclusive temp
+files, strict read-back validation, and no-replace publication; malformed journals and leftover
+pending journal objects block new lifecycle operations and installed listing.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Prepared: old receipt/tree verified; durable intent
+    Prepared --> ReplacementStaged: complete replacement copied, rehashed, identity recorded
+    Prepared --> RolledBack: recovery proves no stage or backup exists; old installation/receipt intact
+    ReplacementStaged --> BackupRenamePending: durable rename intent
+    BackupRenamePending --> OldBackedUp: old tree moved with no-replace rename and verified
+    OldBackedUp --> NewCommitPending: durable replacement-commit intent
+    NewCommitPending --> NewCommitted: replacement moved with no-replace rename; identity recorded
+    NewCommitted --> ReceiptTransitionPending: exact new receipt temp and identity journaled
+    ReceiptTransitionPending --> OldReceiptBackedUp: exact old receipt moved to operation backup
+    ReceiptTransitionPending --> NewReceiptPublished: publication verified after recovery
+    OldReceiptBackedUp --> NewReceiptPublished: new receipt published with no-replace API
+    NewReceiptPublished --> OldBackupCleanupInProgress: both new tree and active receipt verify
+    OldBackupCleanupInProgress --> OldBackupRemoved: all old objects removed with durable intents
+    OldBackupRemoved --> ReceiptBackupCleanupPending: old receipt backup cleanup authorized
+    ReceiptBackupCleanupPending --> Complete: old receipt backup removed; new receipt/tree verified
+    Complete --> [*]: verified terminal journal cleanup
+    RolledBack --> [*]: verified terminal journal cleanup
+```
+
+The update plan and first durable journal are prepared only after the exact canonical resource,
+matching schema-v2 installation, complete installed tree, and pinned replacement source validate.
+`Already up to date` returns before fetching or writing. For a newer source, THRN copies into a
+private sibling stage on the destination filesystem, verifies every expected byte and SHA-256, and
+records the stage identity/inventory before moving the original. It then performs two separate
+no-replace renames: original to operation-owned backup, then stage to original destination. This is
+not an atomic swap. The replacement's committed directory identity is captured through the secure
+handle and bound into the new schema-v2 receipt.
+
+Receipt transition retains the deterministic receipt filename. The exact old receipt remains active
+until the journal has the new receipt contents and temp identity. THRN moves the exact old receipt
+file into an operation-specific backup with no-replace semantics and synchronizes the receipt
+directory where supported. The existing no-replace receipt publication helper validates all other
+active claims and refuses an occupied name. Installed listing holds the existing lock while reading
+and fails closed if any install, removal, or update operation is pending, so it cannot report
+success during this transition. Recovery accepts only the states and object identities recorded by
+the journal; matching hashes do not establish ownership of a new destination.
+
+Recovery runs under the writer lock and is idempotent. It revalidates the active old receipt and
+whole old tree before the backup rename, then verifies complete old/new trees and parent identities
+at every later state. Before replacement staging has been durably recorded, an unexpected partial
+stage is preserved and reported for inspection; the original remains under its receipt-backed
+destination. Once backup/replacement work has a durable identity, recovery follows the strict
+forward sequence. After any old-backup cleanup intent, it continues forward only when every
+remaining object still matches its recorded identity and digest. An absent object counts as an
+earlier cleanup only with its matching durable intent. Altered, extra, linked, missing-without-intent,
+or ambiguous objects stop recovery and remain for inspection. No arbitrary backup directory is
+recursively deleted.
+
+After the replacement receipt and tree verify, recovery removes the old skill backup one file and
+directory at a time. Each deletion is preceded by a durable object-specific intent and followed by
+parent synchronization where supported. The old receipt backup has its own durable cleanup intent
+and is removed only after the new active receipt and destination are verified. Terminal cleanup
+checks the replacement receipt/tree and absence of stage and backups before reporting success. Any
+failure returns nonzero; update success output is emitted only after recovery/transaction
+finalization completes.
+
+If a receipt temp is created but its filesystem identity has not yet reached a durable journal
+snapshot, its ownership cannot be proven: the old receipt and new tree remain represented by the
+update record, while the temp is preserved and recovery reports a conflict for manual inspection.
+If publication occurred before the next state snapshot, recovery recognizes the new receipt only
+when its identity and contents match the recorded temp and the exact old receipt backup remains.
+This is deliberately fail-closed. Cross-filesystem project/receipt atomicity is not claimed. The
+stage and both skill directories are siblings and therefore use same-filesystem rename; receipt
+storage may reside on another filesystem with a separately journaled transition. On Linux and
+macOS, files and containing directories are synchronized where supported. The Windows secure
+directory-handle layer cannot flush directory-entry metadata, matching existing install/removal
+power-loss limitations.
+
 ## Read-only listing and troubleshooting
 
 `skills list --installed` remains offline and read-only. It lists validated receipts only and does
 not invoke recovery, delete journal files, repair receipt storage, or claim ownership of an
 unreceipted directory. It does not validate current project contents. There is no standalone public
-recovery command. A later explicit install or remove attempt runs recovery before it can make a new
-project change; an active removal journal blocks install admission and installed listing. Install
+recovery command. A later explicit install, update, or remove attempt runs recovery before it can
+make a new project change; an active lifecycle journal blocks admission and installed listing. Install
 destination inspection also reconciles pending install records before reporting a managed duplicate
 or an unreceipted conflict.
 
-When recovery reports a conflict, preserve the project tree, receipt store, `operations`, and
-`removals` directories as found. Record the operation ID and actionable error for the architect or
+When recovery reports a conflict, preserve the project tree, receipt store, `operations`, `removals`,
+and `updates` directories as found. Record the operation ID and actionable error for the architect or
 maintainer. Do not delete a skill directory, quarantine, `.writer.lock`, `.pending-*` file, receipt,
 or journal because its name looks temporary or stale. Do not copy an unreceipted directory into the
-managed list. A retry through `thrn skills install` or `thrn skills remove` is safe only when
+managed list. A retry through `thrn skills install`, `thrn skills update`, or `thrn skills remove` is safe only when
 recovery can verify and resolve the journal state; conflicts require inspection and an explicit
 recovery decision. An install failure after directory
 commitment is partial: installed content may remain while a receipt is pending, or a receipt may

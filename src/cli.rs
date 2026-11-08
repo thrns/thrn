@@ -18,6 +18,10 @@ use crate::{
         receipt::InstallationReceipt,
         receipt_store::{NoReceiptFaults, ReceiptStore, ReceiptStoreError},
         removal::{NoRemovalFaults, RemovalError, RemovalPlan, RemovalSummary},
+        update::{
+            NoUpdateFaults, UpdateError, UpdateFaultInjector, UpdatePreparation, UpdateSummary,
+            format_dry_run as format_update_dry_run, prepare_update,
+        },
     },
     registry::{
         catalog_service::{CatalogSelection, CatalogService, Freshness},
@@ -95,6 +99,20 @@ enum SkillsCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Update one exactly verified THRN-managed Codex project skill to the local catalog pin.
+    Update {
+        /// Exact canonical resource ID recorded in a THRN ownership receipt.
+        id: String,
+        /// Select the only currently supported agent (codex).
+        #[arg(long, required = true, value_name = "AGENT")]
+        agent: String,
+        /// Select an existing project directory (defaults to the current directory).
+        #[arg(long, value_name = "PATH")]
+        project: Option<std::path::PathBuf>,
+        /// Print a file-level replacement plan without changing the project or receipt store.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -120,6 +138,12 @@ pub fn run() -> Result<()> {
                 project,
                 dry_run,
             } => remove_skill(&id, &agent, project.as_deref(), dry_run),
+            SkillsCommand::Update {
+                id,
+                agent,
+                project,
+                dry_run,
+            } => update_skill(&id, &agent, project.as_deref(), dry_run),
         },
     }
 }
@@ -144,6 +168,95 @@ fn remove_skill(
         &NoRemovalFaults,
     )?;
     write_stdout(&output)
+}
+
+fn update_skill(
+    identifier: &str,
+    agent: &str,
+    project: Option<&Path>,
+    dry_run: bool,
+) -> Result<()> {
+    if agent != "codex" {
+        return Err(UpdateError::UnsupportedAgent.into());
+    }
+    let current_directory =
+        std::env::current_dir().map_err(|error| UpdateError::CurrentDirectory(error.kind()))?;
+    let selection = CatalogService::for_system().discover()?;
+    let store = ReceiptStore::for_system()?;
+    let transport = crate::sources::github::UreqGithubTransport::new();
+    let output = execute_update_with(
+        &selection.catalog,
+        identifier,
+        agent,
+        project,
+        &current_directory,
+        &store,
+        &transport,
+        &crate::sources::staging::SystemTempDirFactory,
+        dry_run,
+        &NoUpdateFaults,
+    )?;
+    report_cache_warning(selection.cache_warning.as_deref())?;
+    write_stdout(&output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_update_with<T: crate::sources::github::GithubTransport + ?Sized>(
+    catalog: &crate::models::catalog::Catalog,
+    identifier: &str,
+    agent: &str,
+    project: Option<&Path>,
+    current_directory: &Path,
+    store: &ReceiptStore,
+    transport: &T,
+    tempdir_factory: &dyn crate::sources::staging::TempDirFactory,
+    dry_run: bool,
+    faults: &dyn UpdateFaultInjector,
+) -> std::result::Result<String, UpdateError> {
+    match prepare_update(
+        catalog,
+        identifier,
+        agent,
+        project,
+        current_directory,
+        store,
+        transport,
+        tempdir_factory,
+    )? {
+        UpdatePreparation::AlreadyUpToDate(receipt) => {
+            Ok(format_update_already_up_to_date(&receipt))
+        }
+        UpdatePreparation::Ready(plan) if dry_run => Ok(format_update_dry_run(&plan)),
+        UpdatePreparation::Ready(plan) => {
+            let summary = store.update(&plan, faults)?;
+            Ok(format_update_success(&summary))
+        }
+    }
+}
+
+pub(crate) fn format_update_already_up_to_date(receipt: &InstallationReceipt) -> String {
+    format!(
+        "Already up to date\nResource: {}\nSkill name: {}\nDestination: {}\nPinned revision: {}/{}@{}\nNo project files or ownership receipt were modified.\n",
+        receipt.catalog_resource_id(),
+        receipt.skill_name(),
+        safe_path_display(&receipt.destination_path()),
+        receipt.source_owner(),
+        receipt.source_repository(),
+        receipt.source_commit(),
+    )
+}
+
+pub(crate) fn format_update_success(summary: &UpdateSummary) -> String {
+    format!(
+        "Updated THRN skill\nResource: {}\nSkill name: {}\nAgent: codex\nScope: project\nDestination: {}\nPrevious pinned revision: {}\nNew pinned revision: {}\nFiles updated: {}\nBytes installed: {}\nOwnership receipt: updated and verified\n",
+        summary.resource_id(),
+        summary.skill_name(),
+        safe_path_display(summary.destination()),
+        summary.previous_revision(),
+        summary.new_revision(),
+        summary.file_count(),
+        summary.byte_count(),
+    )
 }
 
 fn execute_remove_with(

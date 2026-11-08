@@ -345,6 +345,16 @@ impl InstallationReceipt {
         Ok(self)
     }
 
+    #[cfg(test)]
+    pub(crate) fn into_legacy_for_test(mut self) -> Self {
+        self.schema_version = LEGACY_SCHEMA_VERSION;
+        self.installed_directory_identity = None;
+        self.content_digest = self
+            .calculated_content_digest()
+            .expect("legacy fixture digest");
+        self
+    }
+
     pub(crate) fn installed_directory_identity(&self) -> Option<FileIdentity> {
         self.installed_directory_identity
             .map(|identity| FileIdentity::new(identity.volume, identity.object))
@@ -384,6 +394,14 @@ impl InstallationReceipt {
 
     pub(crate) fn source_repository(&self) -> &str {
         &self.source_repository
+    }
+
+    pub(crate) fn source_directory(&self) -> &str {
+        &self.source_directory
+    }
+
+    pub(crate) fn schema_version(&self) -> u64 {
+        self.schema_version
     }
 
     pub(crate) fn source_commit(&self) -> &str {
