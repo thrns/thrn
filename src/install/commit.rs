@@ -2628,19 +2628,17 @@ fn open_windows_directory_with_delete_access(
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
         FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, SYNCHRONIZE,
     };
+    let mut access =
+        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY;
+    if delete_access {
+        access |= DELETE;
+    }
+    access |= FILE_TRAVERSE | SYNCHRONIZE;
     let mut options = fs::OpenOptions::new();
     options
         .read(true)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .access_mode(
-            FILE_LIST_DIRECTORY
-                | FILE_READ_ATTRIBUTES
-                | FILE_ADD_FILE
-                | FILE_ADD_SUBDIRECTORY
-                | FILE_TRAVERSE
-                | if delete_access { DELETE } else { 0 }
-                | SYNCHRONIZE,
-        )
+        .access_mode(access)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
     let file = options.open(path)?;
     let metadata = file.metadata()?;
