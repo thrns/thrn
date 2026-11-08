@@ -189,20 +189,28 @@ fn project_filesystem_identity(path: &std::path::Path) -> (u64, u64) {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+        use windows_sys::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
         };
         let mut options = fs::OpenOptions::new();
         options
             .read(true)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
         let file = options.open(path).expect("project directory opens safely");
-        let metadata = file.metadata().expect("project metadata is available");
-        (
-            u64::from(metadata.volume_serial_number().expect("volume serial")),
-            metadata.file_index().expect("project file index"),
-        )
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `file` is a live directory handle and `information` is writable storage for
+        // the documented output structure.
+        let result =
+            unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) };
+        assert_ne!(result, 0, "project directory identity is available");
+        let object =
+            (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+        (u64::from(information.dwVolumeSerialNumber), object)
     }
     #[cfg(not(any(unix, windows)))]
     {

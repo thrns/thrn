@@ -2428,7 +2428,7 @@ impl SecureDir {
                 FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
             },
         };
-        let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
         // SAFETY: the disposition structure is initialized and the file handle remains live.
         let result = unsafe {
             SetFileInformationByHandle(
