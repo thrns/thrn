@@ -15,12 +15,17 @@ invalid receipt data, and records larger than 10 MiB. The store is bounded to 16
 limits. Capacity exhaustion fails closed and can leave an explicitly incomplete operation for
 recovery or manual inspection.
 
-Every snapshot carries the strict schema-v1 receipt identity and full expected receipt, operation
-ID and sequence, state, destination-local staging name, project `.agents` and `skills` identities,
-whether THRN intended to create those parents, the staging and final directory identities, and the
-relative paths and filesystem identities of operation-created files and directories. The receipt
-supplies the expected path inventory, file sizes, and SHA-256 hashes. A file record also marks
-whether the complete staged file was verified before commit. Journal contents and receipts are
+Every snapshot carries a strict receipt identity and full expected receipt, operation ID and
+sequence, state, destination-local staging name, project `.agents` and `skills` identities, whether
+THRN intended to create those parents, the staging and final directory identities, and the relative
+paths and filesystem identities of operation-created files and directories. A new operation begins
+with the schema-v1 receipt intent needed for reservation. After the no-replace commit, the journal
+records the committed destination identity and matching schema-v2 receipt together before it can
+advance to `DirectoryCommitVerified`. A v2 receipt's identity must equal the journal's destination
+identity. Historical v1 journal snapshots remain readable; they keep their original strict receipt
+data until recovery can prove an in-progress installation from its recorded staging identity. The
+receipt supplies the expected path inventory, file sizes, and SHA-256 hashes. A file record also
+marks whether the complete staged file was verified before commit. Journal contents and receipts are
 both untrusted and neither is sufficient evidence by itself.
 
 Each snapshot is written to an exclusive unpredictable temporary file, flushed, synchronized,
@@ -58,7 +63,9 @@ parents or staging content. Directory and file identities are journaled as each 
 object is created. Copied files are synchronized and hashed before being marked verified. The final
 directory is committed with Linux `renameat2(RENAME_NOREPLACE)`, macOS `renameatx_np(RENAME_EXCL)`,
 or Windows `FileRenameInfoEx` with replacement disabled; unsupported primitives fail closed. Its
-parent directory is synchronized where supported before the journal records `DirectoryCommitVerified`.
+parent directory is synchronized where supported. THRN then captures the committed directory
+identity through the secure handle layer and durably records it with the upgraded v2 receipt before
+the journal records `DirectoryCommitVerified`.
 
 `ReceiptPublicationPending` is durable before receipt-temp creation. The receipt is exclusively
 created, fully written, synchronized, read back and validated, then published without replacement;
@@ -89,7 +96,9 @@ verification.
   directory where supported. A missing object is tolerated only where that exact cleanup intent
   is present, so a later recovery can distinguish its own prior removal from unexpected loss.
 - `FilesystemCommitInProgress`, final destination present: recovery finalizes only if its identity
-  is the recorded staging identity and its exact inventory and all receipt hashes verify.
+  is the recorded staging identity and its exact inventory and all receipt hashes verify. An
+  interrupted legacy operation can bind v2 evidence only after this identity comparison; an
+  already-published v1 receipt is never rewritten.
 - `DirectoryCommitVerified` or `ReceiptPublicationPending`: recovery verifies destination and
   project identities and all hashes, synchronizes the parent where supported, then publishes the
   exact receipt or recognizes an already-published identical receipt. A conflicting receipt is
@@ -138,20 +147,22 @@ operations fail closed.
 
 ## Receipt-backed removal state machine
 
-M3-01 adds a separate versioned removal journal in application-data `removals`; it does not
-change the accepted schema-v1 installation receipt or weaken the install journal. Removal and
+M3-01 adds a separate versioned removal journal in application-data `removals`; new removal
+operations require the schema-v2 installation receipt and do not weaken the install journal. Removal and
 installation hold the same exclusive `.writer.lock` from recovery/admission through transaction
 completion. Install admission rejects any unresolved removal record, and receipt listing remains
 read-only but fails closed while a removal transaction is pending.
 
-The removal journal contains the strict ownership receipt, receipt-store and receipt-file
+The removal journal contains the strict v2 ownership receipt, receipt-store and receipt-file
 identities, canonical project and `.agents/skills` identities, the verified destination identity,
 the complete expected object inventory with filesystem identities and file digests, a random sibling
-quarantine name, and a set of durable per-object cleanup intents. Schema-v1 receipts contain the
-project-root identity and content inventory but not the destination's installation-time inode. The
-removal journal therefore pins the fully verified destination identity at transaction preparation
-and requires that same identity through rename and cleanup; this protects the transaction from
-substitution after planning. Proposed ADR-013 records this evidence boundary for independent review.
+quarantine name, and a set of durable per-object cleanup intents. The record duplicates the
+receipt's installation-time destination identity and requires both to agree. It also pins the
+destination and per-object identities observed during planning and requires them through rename and
+cleanup. Legacy v1 receipts remain listable but cannot start removal. A nonterminal pre-v2 removal
+journal lacks installation-time evidence, so automatic recovery preserves it and its remaining
+content rather than authorizing further deletion. Proposed ADR-013 records this compatibility
+boundary for independent re-review.
 
 Each journal update is an immutable strict JSON snapshot written to an exclusive temporary file,
 flushed, synchronized, parsed back, and published without replacement. The parent journal directory

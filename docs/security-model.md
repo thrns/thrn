@@ -46,7 +46,7 @@ transaction from substitutions. Proposed ADR-013 leaves the sufficiency of that 
 for independent architectural review. On Windows, the current secure handle layer cannot portably
 flush directory-entry metadata; a power loss can therefore leave rename/unlink durability uncertain.
 
-M2-03 implements read-only destination checks and an immutable proposal. M2-04 adds the Codex project directory commit; M2-05 adds post-commit ownership receipts and receipt-backed listing; M2-06 adds journaled recovery; M2-07 connects the explicit Codex project install command to `prepare_install_session()` and `commit_and_record()`. M3-01 adds explicit Codex project removal only when the exact canonical-ID receipt and the complete current destination inventory verify. It does not resolve catalog aliases, refresh the catalog, remove unreceipted content, or support user scope or other agents. Removal uses a separate schema-versioned journal rather than changing the accepted schema-v1 receipt, keeps the receipt until cleanup evidence is complete, and reports incomplete transactions without a success block. The implementation is pending independent architectural review and is not a claim of a supported package release.
+M2-03 implements read-only destination checks and an immutable proposal. M2-04 adds the Codex project directory commit; M2-05 adds post-commit ownership receipts and receipt-backed listing; M2-06 adds journaled recovery; M2-07 connects the explicit Codex project install command to `prepare_install_session()` and `commit_and_record()`. M3-01 adds explicit Codex project removal only when a schema-v2 receipt proves the installation-time destination identity and the complete current inventory verifies. It does not resolve catalog aliases, refresh the catalog, remove unreceipted content, or support user scope or other agents. New installs persist the committed destination identity in the install journal and schema-v2 receipt before success. Historical schema-v1 receipts remain listable but cannot authorize automatic removal. Removal uses a separate versioned journal, keeps the receipt until cleanup evidence is complete, and reports incomplete transactions without a success block. The implementation is pending independent architectural review and is not a claim of a supported package release.
 
 ## Milestone status
 
@@ -175,7 +175,7 @@ Current implementation boundaries through M2-07:
   or commits do not replace the last valid cache. Offline discovery uses cache or bundled metadata
   and never silently refreshes stale content.
 - **Listing boundary:** M1-05's catalog list reuses the validated local catalog selection and exact
-  resolver. M2-05's installed list parses strict schema-v1 receipts from the OS application-data
+  resolver. M2-05's installed list parses strict schema-v1 and schema-v2 receipts from the OS application-data
   `receipts` directory. It treats missing or empty storage as no recorded installations and rejects
   corrupt, unsupported, duplicated, conflicting, linked, nonregular, or unknown content. Listing
   creates no directories, writes no files, opens no referenced project paths, and reports current
@@ -287,7 +287,8 @@ M2-02 network boundary.
 Remaining requirements:
 
 - **M3-01:** safe removal implementation is pending independent architectural review; ADR-013 is a
-  proposal. Receipt-v1 does not retain installation-time destination identity, and Windows
+  proposal. Historical schema-v1 receipts do not retain installation-time destination identity and
+  are list-only. New schema-v2 installs bind that identity into the receipt; Windows
   directory-entry durability remains limited.
 - **Remaining M3:** user scope, other agents, update/check commands, JSON and noninteractive behavior.
 

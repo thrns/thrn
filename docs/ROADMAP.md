@@ -36,7 +36,7 @@ Source of truth: `THRN_PROJECT_SPEC.md` §§0–14. Implement a real vertical sl
 
 | Task | Depends on | Deliverable and independently testable acceptance |
 |---|---|---|
-| M3-01 | M2-06 | `skills remove`: explicit Codex project scope; exact canonical ID, schema-v1 receipt and complete current inventory verification; quarantined no-replace removal with a separate versioned journal, per-object cleanup intents, receipt retirement after content removal; deterministic fault and subprocess-crash recovery tests |
+| M3-01 | M2-06 | `skills remove`: explicit Codex project scope; exact canonical ID, schema-v2 installation-time destination identity and complete current inventory verification; schema-v1 receipts remain listable but cannot authorize removal; quarantined no-replace removal with a separate versioned journal, per-object cleanup intents, receipt retirement after content removal; deterministic fault and subprocess-crash recovery tests |
 | M3-02 | M3-01 | `skills update`: new immutable commit, owner/modified-content guard, stage/backup/recovery tests, no partial-success claims |
 | M3-03 | M3-02 | `skills check`: read-only update discovery, offline behavior and exit semantics tested |
 | M3-04 | M2-06 | User/global scope and OS config/data/cache paths; temp-home isolation; no global writes without selection |

@@ -17,7 +17,8 @@ use crate::{
     sources::archive::{ArchiveLimits, ValidatedArchivePath},
 };
 
-pub(crate) const SCHEMA_VERSION: u64 = 1;
+pub(crate) const LEGACY_SCHEMA_VERSION: u64 = 1;
+pub(crate) const SCHEMA_VERSION: u64 = 2;
 pub(crate) const MAX_RECEIPT_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_RECEIPTS: usize = 4_096;
 pub(crate) const MAX_RECEIPT_PATH_BYTES: usize = 32_768;
@@ -35,6 +36,8 @@ pub struct InstallationReceipt {
     canonical_project_root: String,
     project_root_identity: ReceiptProjectIdentity,
     destination: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    installed_directory_identity: Option<ReceiptDirectoryIdentity>,
     installed_at_unix_seconds: u64,
     source_owner: String,
     source_repository: String,
@@ -51,6 +54,13 @@ pub struct InstallationReceipt {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReceiptProjectIdentity {
+    volume: u64,
+    object: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReceiptDirectoryIdentity {
     volume: u64,
     object: u64,
 }
@@ -81,6 +91,8 @@ pub enum ReceiptValidationError {
     InvalidInventory,
     #[error("receipt content digest does not match its canonical inventory")]
     ContentDigestMismatch,
+    #[error("receipt's installation-time directory identity is missing or inconsistent")]
+    InvalidInstalledDirectoryIdentity,
     #[error("receipt identity digest could not be computed")]
     IdentityDigest,
 }
@@ -113,7 +125,7 @@ impl InstallationReceipt {
         files.sort_by(|left, right| left.path.cmp(&right.path));
 
         let mut receipt = Self {
-            schema_version: SCHEMA_VERSION,
+            schema_version: LEGACY_SCHEMA_VERSION,
             catalog_resource_id: plan.resource_id().as_str().to_owned(),
             skill_name: plan.skill_name().as_str().to_owned(),
             agent: plan.agent().as_str().to_owned(),
@@ -124,6 +136,7 @@ impl InstallationReceipt {
                 object: project_identity.object(),
             },
             destination: path_to_string(plan.destination())?,
+            installed_directory_identity: None,
             installed_at_unix_seconds,
             source_owner: plan.source_owner().as_str().to_owned(),
             source_repository: plan.source_repository().as_str().to_owned(),
@@ -166,10 +179,17 @@ impl InstallationReceipt {
     }
 
     pub(crate) fn validate(&self) -> Result<(), ReceiptValidationError> {
-        if self.schema_version != SCHEMA_VERSION {
+        if !matches!(self.schema_version, LEGACY_SCHEMA_VERSION | SCHEMA_VERSION) {
             return Err(ReceiptValidationError::UnsupportedSchema(
                 self.schema_version,
             ));
+        }
+        if (self.schema_version == LEGACY_SCHEMA_VERSION
+            && self.installed_directory_identity.is_some())
+            || (self.schema_version == SCHEMA_VERSION
+                && self.installed_directory_identity.is_none())
+        {
+            return Err(ReceiptValidationError::InvalidInstalledDirectoryIdentity);
         }
         if self.agent != "codex" || self.scope != "project" {
             return Err(ReceiptValidationError::InvalidMetadata);
@@ -303,6 +323,45 @@ impl InstallationReceipt {
         )
     }
 
+    /// Upgrade an install intent with the identity captured from the committed destination
+    /// handle. Legacy receipts are never upgraded by observing a directory during removal.
+    pub(crate) fn with_installed_directory_identity(
+        mut self,
+        identity: FileIdentity,
+    ) -> Result<Self, ReceiptValidationError> {
+        if self.schema_version != LEGACY_SCHEMA_VERSION
+            || self.installed_directory_identity.is_some()
+        {
+            return Err(ReceiptValidationError::InvalidInstalledDirectoryIdentity);
+        }
+        self.schema_version = SCHEMA_VERSION;
+        self.installed_directory_identity = Some(ReceiptDirectoryIdentity {
+            volume: identity.volume(),
+            object: identity.object(),
+        });
+        self.content_digest = String::new();
+        self.content_digest = self.calculated_content_digest()?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub(crate) fn installed_directory_identity(&self) -> Option<FileIdentity> {
+        self.installed_directory_identity
+            .map(|identity| FileIdentity::new(identity.volume, identity.object))
+    }
+
+    pub(crate) fn is_legacy(&self) -> bool {
+        self.schema_version == LEGACY_SCHEMA_VERSION
+    }
+
+    pub(crate) fn is_identity_upgrade_of(&self, legacy: &Self, identity: FileIdentity) -> bool {
+        legacy.is_legacy()
+            && legacy
+                .clone()
+                .with_installed_directory_identity(identity)
+                .is_ok_and(|upgraded| upgraded == *self)
+    }
+
     pub(crate) fn catalog_resource_id(&self) -> &str {
         &self.catalog_resource_id
     }
@@ -369,7 +428,16 @@ impl InstallationReceipt {
 
     fn calculated_content_digest(&self) -> Result<String, ReceiptValidationError> {
         let mut context = Context::new(&SHA256);
-        context.update(b"THRN-CONTENT-INVENTORY-V1\0");
+        if self.schema_version == LEGACY_SCHEMA_VERSION {
+            context.update(b"THRN-CONTENT-INVENTORY-V1\0");
+        } else {
+            context.update(b"THRN-CONTENT-INVENTORY-V2\0");
+            let identity = self
+                .installed_directory_identity
+                .ok_or(ReceiptValidationError::InvalidInstalledDirectoryIdentity)?;
+            context.update(&identity.volume.to_be_bytes());
+            context.update(&identity.object.to_be_bytes());
+        }
         context.update(&(self.directories.len() as u64).to_be_bytes());
         for directory in &self.directories {
             context.update(b"D");
@@ -626,8 +694,10 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_round_trips_and_keeps_catalog_id_distinct_from_skill_name() {
+    fn legacy_schema_v1_round_trips_and_keeps_catalog_id_distinct_from_skill_name() {
         let receipt = receipt_fixture();
+        assert!(receipt.is_legacy());
+        assert_eq!(receipt.installed_directory_identity(), None);
         let bytes = receipt.to_json().expect("serialization");
         let parsed = InstallationReceipt::from_json(&bytes).expect("parse");
         assert_eq!(parsed, receipt);
@@ -636,6 +706,82 @@ mod tests {
         assert_eq!(parsed.agent(), "codex");
         assert_eq!(parsed.scope(), "project");
         assert_eq!(parsed.installed_at_unix_seconds(), 1_800_000_000);
+    }
+
+    #[test]
+    fn schema_v2_binds_installation_time_directory_identity_into_the_digest() {
+        let legacy = receipt_fixture();
+        let identity = FileIdentity::new(77, 991);
+        let receipt = legacy
+            .clone()
+            .with_installed_directory_identity(identity)
+            .expect("upgrade install intent after destination commit");
+        assert!(!receipt.is_legacy());
+        assert_eq!(receipt.installed_directory_identity(), Some(identity));
+        assert_ne!(legacy.content_digest, receipt.content_digest);
+        let parsed = InstallationReceipt::from_json(&receipt.to_json().expect("serialize v2"))
+            .expect("parse v2");
+        assert_eq!(parsed, receipt);
+
+        let mut changed_identity =
+            serde_json::from_slice::<serde_json::Value>(&receipt.to_json().expect("serialize v2"))
+                .expect("JSON value");
+        changed_identity["installedDirectoryIdentity"]["object"] = serde_json::json!(992);
+        assert!(matches!(
+            InstallationReceipt::from_json(
+                &serde_json::to_vec(&changed_identity).expect("serialize changed identity")
+            ),
+            Err(ReceiptValidationError::ContentDigestMismatch)
+        ));
+    }
+
+    #[test]
+    fn schema_versions_reject_missing_or_conflicting_installation_identity() {
+        let legacy = receipt_fixture();
+        let mut missing_v2_identity: serde_json::Value =
+            serde_json::from_slice(&legacy.to_json().expect("serialize legacy"))
+                .expect("legacy JSON");
+        missing_v2_identity["schemaVersion"] = serde_json::json!(2);
+        assert!(matches!(
+            InstallationReceipt::from_json(
+                &serde_json::to_vec(&missing_v2_identity).expect("serialize missing identity")
+            ),
+            Err(ReceiptValidationError::InvalidInstalledDirectoryIdentity)
+        ));
+
+        let identity = FileIdentity::new(7, 10);
+        let current = legacy
+            .clone()
+            .with_installed_directory_identity(identity)
+            .expect("v2 receipt");
+        let mut identity_on_v1: serde_json::Value =
+            serde_json::from_slice(&legacy.to_json().expect("serialize legacy"))
+                .expect("legacy JSON");
+        identity_on_v1["installedDirectoryIdentity"] = serde_json::json!({
+            "volume": identity.volume(),
+            "object": identity.object()
+        });
+        assert!(matches!(
+            InstallationReceipt::from_json(
+                &serde_json::to_vec(&identity_on_v1).expect("serialize conflicting schema")
+            ),
+            Err(ReceiptValidationError::InvalidInstalledDirectoryIdentity)
+        ));
+
+        let bytes = current.to_json().expect("serialize v2");
+        let mut missing_field: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("current JSON");
+        missing_field
+            .as_object_mut()
+            .expect("receipt JSON object")
+            .remove("installedDirectoryIdentity");
+        missing_field["contentDigest"] = serde_json::json!(current.content_digest);
+        assert!(matches!(
+            InstallationReceipt::from_json(
+                &serde_json::to_vec(&missing_field).expect("serialize missing v2 field")
+            ),
+            Err(ReceiptValidationError::InvalidInstalledDirectoryIdentity)
+        ));
     }
 
     #[test]
@@ -700,10 +846,10 @@ mod tests {
         let receipt = receipt_fixture();
         let mut value: serde_json::Value =
             serde_json::from_slice(&receipt.to_json().expect("json")).expect("value");
-        value["schemaVersion"] = serde_json::json!(2);
+        value["schemaVersion"] = serde_json::json!(3);
         assert!(matches!(
             InstallationReceipt::from_json(&serde_json::to_vec(&value).expect("json")),
-            Err(ReceiptValidationError::UnsupportedSchema(2))
+            Err(ReceiptValidationError::UnsupportedSchema(3))
         ));
         assert!(matches!(
             InstallationReceipt::from_json(b"{\"schemaVersion\":1"),

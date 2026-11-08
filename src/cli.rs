@@ -579,7 +579,7 @@ mod install_tests {
         fs,
         io::{self, Cursor, Write},
         path::{Path, PathBuf},
-        process::Command,
+        process::{Child, Command, ExitStatus},
         sync::{
             Arc, Barrier,
             atomic::{AtomicUsize, Ordering},
@@ -874,15 +874,57 @@ mod install_tests {
         }
     }
 
-    struct PauseBeforeRemovalRename(Arc<Barrier>);
+    struct PauseBeforeRemovalRename {
+        entered: PathBuf,
+        release: PathBuf,
+    }
 
     impl RemovalFaultInjector for PauseBeforeRemovalRename {
         fn before(&self, operation: RemovalOperation) -> io::Result<()> {
             if operation == RemovalOperation::RenameToQuarantine {
-                self.0.wait();
-                self.0.wait();
+                fs::write(&self.entered, b"entered rename boundary")?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                while !self.release.exists() {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "timed out waiting for the removal test release signal",
+                        ));
+                    }
+                    thread::sleep(std::time::Duration::from_millis(10));
+                }
             }
             Ok(())
+        }
+    }
+
+    fn wait_for_child(child: &mut Child, timeout: std::time::Duration) -> io::Result<ExitStatus> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill()?;
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for a concurrency-test subprocess",
+                ));
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn release_removal(path: &Path) {
+        let _ = fs::write(path, b"release removal test subprocess");
+    }
+
+    struct ReleaseRemovalOnDrop(PathBuf);
+
+    impl Drop for ReleaseRemovalOnDrop {
+        fn drop(&mut self) {
+            release_removal(&self.0);
         }
     }
 
@@ -1333,6 +1375,73 @@ mod install_tests {
     }
 
     #[test]
+    fn conflicting_installation_identity_in_removal_journal_fails_closed() {
+        let fixture = InstallFixture::new();
+        fixture
+            .execute("uncharted", None, &FixtureTransport::archive())
+            .expect("install fixture");
+        let destination = fixture.project.join(".agents/skills/uncharted-ideation");
+        let unrelated = fixture.project.join("unrelated.txt");
+        fs::write(&unrelated, b"preserve user data").expect("unrelated sentinel");
+
+        let result = fixture.store().remove_by_id(
+            "uncharted",
+            Some(&fixture.project),
+            &fixture.current,
+            &FailRemovalBefore(RemovalOperation::RenameToQuarantine),
+        );
+        assert!(
+            result.is_err(),
+            "injected pre-rename failure leaves a journal"
+        );
+        assert!(destination.join("SKILL.md").is_file());
+
+        let journal_directory = fixture.data.join("removals");
+        let mut snapshots = fs::read_dir(&journal_directory)
+            .expect("removal journal directory")
+            .map(|entry| entry.expect("journal entry").path())
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .collect::<Vec<_>>();
+        snapshots.sort();
+        let latest = snapshots.last().expect("published removal snapshot");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(latest).expect("journal snapshot"))
+                .expect("valid journal JSON");
+        let object = record["destinationIdentity"]["object"]
+            .as_u64()
+            .expect("destination object identity");
+        record["destinationIdentity"]["object"] = serde_json::json!(object.wrapping_add(1));
+        fs::write(
+            latest,
+            serde_json::to_vec(&record).expect("serialize conflicting journal"),
+        )
+        .expect("write conflicting evidence fixture");
+
+        let recovery = fixture
+            .store()
+            .recover_with_faults(&NoJournalFaults, &NoReceiptFaults);
+        assert!(
+            recovery.is_err(),
+            "mismatched identity evidence fails closed"
+        );
+        assert!(destination.join("SKILL.md").is_file());
+        assert_eq!(
+            fs::read(&unrelated).expect("user data preserved"),
+            b"preserve user data"
+        );
+        let receipt_entries = fs::read_dir(fixture.data.join("receipts"))
+            .expect("receipt store remains")
+            .map(|entry| entry.expect("receipt entry").path())
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .count();
+        assert_eq!(receipt_entries, 1, "ownership receipt is preserved");
+        assert!(
+            journal_directory.is_dir(),
+            "conflicting journal is preserved"
+        );
+    }
+
+    #[test]
     fn removal_failures_at_each_journal_and_filesystem_boundary_recover_safely() {
         let operations = [
             RemovalOperation::CreateJournalStore,
@@ -1509,6 +1618,48 @@ mod install_tests {
     }
 
     #[test]
+    fn replacement_with_identical_inventory_before_removal_planning_is_rejected() {
+        let fixture = InstallFixture::new();
+        fixture
+            .execute("uncharted", None, &FixtureTransport::archive())
+            .expect("install fixture");
+        let destination = fixture.project.join(".agents/skills/uncharted-ideation");
+        let displaced = fixture._root.path().join("original-installed-skill");
+        fs::rename(&destination, &displaced).expect("preserve original installation");
+        copy_fixture_tree(&displaced, &destination).expect("create byte-identical directory copy");
+        assert_eq!(
+            fs::read(displaced.join("SKILL.md")).unwrap(),
+            fs::read(destination.join("SKILL.md")).unwrap()
+        );
+        assert_ne!(
+            crate::install::destination::DestinationFileSystem::object_identity(
+                &crate::install::destination::RealDestinationFileSystem,
+                &displaced,
+            )
+            .unwrap(),
+            crate::install::destination::DestinationFileSystem::object_identity(
+                &crate::install::destination::RealDestinationFileSystem,
+                &destination,
+            )
+            .unwrap(),
+            "the replacement must have a distinct filesystem identity"
+        );
+
+        let error = fixture
+            .store()
+            .plan_removal("uncharted", Some(&fixture.project), &fixture.current)
+            .expect_err("same files under a new directory identity are not the installation");
+        assert!(
+            error
+                .to_string()
+                .contains("installation-time receipt evidence")
+        );
+        assert!(displaced.join("SKILL.md").is_file());
+        assert!(destination.join("SKILL.md").is_file());
+        assert_eq!(fixture.store().list().expect("receipt remains").len(), 1);
+    }
+
+    #[test]
     fn substitution_after_removal_planning_is_rejected_before_thrn_mutation() {
         let fixture = InstallFixture::new();
         fixture
@@ -1594,39 +1745,130 @@ mod install_tests {
 
     #[test]
     fn installation_and_removal_cannot_race_under_the_receipt_store_lock() {
+        if std::env::var_os("THRN_M3_PAUSED_REMOVE_DATA").is_some() {
+            let data = PathBuf::from(std::env::var_os("THRN_M3_PAUSED_REMOVE_DATA").unwrap());
+            let project = PathBuf::from(std::env::var_os("THRN_M3_PAUSED_REMOVE_PROJECT").unwrap());
+            let current = PathBuf::from(std::env::var_os("THRN_M3_PAUSED_REMOVE_CURRENT").unwrap());
+            let entered = PathBuf::from(std::env::var_os("THRN_M3_PAUSED_REMOVE_ENTERED").unwrap());
+            let release = PathBuf::from(std::env::var_os("THRN_M3_PAUSED_REMOVE_RELEASE").unwrap());
+            ReceiptStore::new(data.join("receipts"))
+                .remove_by_id(
+                    "uncharted",
+                    Some(&project),
+                    &current,
+                    &PauseBeforeRemovalRename { entered, release },
+                )
+                .expect("removal completes after the parent releases its test gate");
+            return;
+        }
+
         let fixture = InstallFixture::new();
         fixture
             .execute("uncharted", None, &FixtureTransport::archive())
             .expect("install fixture");
-        let barrier = Arc::new(Barrier::new(2));
-        let worker_barrier = Arc::clone(&barrier);
-        let store = fixture.store();
-        let project = fixture.project.clone();
-        let current = fixture.current.clone();
-        let removal = thread::spawn(move || {
-            store.remove_by_id(
-                "uncharted",
-                Some(&project),
-                &current,
-                &PauseBeforeRemovalRename(worker_barrier),
-            )
-        });
-        barrier.wait();
-        let error = fixture
-            .execute("uncharted", None, &FixtureTransport::archive())
-            .expect_err("install admission must see active removal writer");
+        let entered = fixture._root.path().join("removal-entered");
+        let release = fixture._root.path().join("removal-release");
+        let test_executable = std::env::current_exe().expect("test executable");
+        let mut removal = Command::new(&test_executable)
+            .arg("--exact")
+            .arg("cli::install_tests::installation_and_removal_cannot_race_under_the_receipt_store_lock")
+            .arg("--nocapture")
+            .env("THRN_M3_PAUSED_REMOVE_DATA", &fixture.data)
+            .env("THRN_M3_PAUSED_REMOVE_PROJECT", &fixture.project)
+            .env("THRN_M3_PAUSED_REMOVE_CURRENT", &fixture.current)
+            .env("THRN_M3_PAUSED_REMOVE_ENTERED", &entered)
+            .env("THRN_M3_PAUSED_REMOVE_RELEASE", &release)
+            .spawn()
+            .expect("launch removal-lock subprocess");
+        let _release_on_drop = ReleaseRemovalOnDrop(release.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !entered.exists()
+            && removal
+                .try_wait()
+                .expect("inspect removal subprocess")
+                .is_none()
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !entered.exists() {
+            release_removal(&release);
+            let _ = wait_for_child(&mut removal, std::time::Duration::from_secs(5));
+            panic!("removal subprocess did not reach the locked rename boundary");
+        }
+
+        let mut installation = match Command::new(&test_executable)
+            .arg("--exact")
+            .arg("cli::install_tests::subprocess_install_is_rejected_while_removal_holds_the_writer_lock")
+            .arg("--nocapture")
+            .env("THRN_M3_INSTALL_LOCK_DATA", &fixture.data)
+            .env("THRN_M3_INSTALL_LOCK_PROJECT", &fixture.project)
+            .env("THRN_M3_INSTALL_LOCK_CURRENT", &fixture.current)
+            .env("THRN_M3_INSTALL_LOCK_STAGING", &fixture.staging)
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                release_removal(&release);
+                let _ = wait_for_child(&mut removal, std::time::Duration::from_secs(10));
+                panic!("could not launch install-lock subprocess: {error}");
+            }
+        };
+        let install_result = wait_for_child(&mut installation, std::time::Duration::from_secs(15));
+        release_removal(&release);
+        let removal_result = wait_for_child(&mut removal, std::time::Duration::from_secs(15));
+
+        assert!(
+            install_result.as_ref().is_ok_and(|status| status.success()),
+            "install subprocess must report the active OS writer lock; result={install_result:?}"
+        );
+        assert!(
+            removal_result.as_ref().is_ok_and(|status| status.success()),
+            "removal subprocess must complete after release; result={removal_result:?}"
+        );
+        assert!(fixture.store().list().expect("receipt retired").is_empty());
+        assert!(
+            !fixture
+                .project
+                .join(".agents/skills/uncharted-ideation")
+                .exists(),
+            "competing install must not recreate content removed by the winner"
+        );
+    }
+
+    #[test]
+    fn subprocess_install_is_rejected_while_removal_holds_the_writer_lock() {
+        let Some(data) = std::env::var_os("THRN_M3_INSTALL_LOCK_DATA") else {
+            return;
+        };
+        let project = PathBuf::from(std::env::var_os("THRN_M3_INSTALL_LOCK_PROJECT").unwrap());
+        let current = PathBuf::from(std::env::var_os("THRN_M3_INSTALL_LOCK_CURRENT").unwrap());
+        let staging = PathBuf::from(std::env::var_os("THRN_M3_INSTALL_LOCK_STAGING").unwrap());
+        let catalog = parse_catalog_json(include_bytes!(
+            "../tests/fixtures/catalog/test-only-valid-v1.json"
+        ))
+        .expect("offline catalog fixture");
+        let factory = TestFactory(staging);
+        let result = execute_install_with(
+            "uncharted",
+            "codex",
+            Some(&project),
+            InstallContext {
+                catalog: &catalog,
+                current_directory: &current,
+                transport: &FixtureTransport::archive(),
+                tempdir_factory: &factory,
+                receipt_store: || Ok(ReceiptStore::new(PathBuf::from(&data).join("receipts"))),
+                complete: InstallationSession::commit_and_record,
+            },
+        );
+        let error = result.expect_err("active removal must exclude installation");
         assert!(
             error
                 .to_string()
                 .contains("busy or left by an interrupted write"),
             "{error}"
         );
-        barrier.wait();
-        removal
-            .join()
-            .expect("removal worker exits")
-            .expect("removal completes after lock release");
-        assert!(fixture.store().list().expect("receipt retired").is_empty());
     }
 
     #[test]

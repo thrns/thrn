@@ -164,6 +164,71 @@ fn receipt_json(project_root: &str, resource_id: &str, skill_name: &str, identit
     .expect("valid receipt JSON")
 }
 
+fn receipt_json_with_install_identity(
+    project_root: &str,
+    resource_id: &str,
+    skill_name: &str,
+    project_identity: (u64, u64),
+    destination_identity: (u64, u64),
+) -> Vec<u8> {
+    let content = b"abc";
+    let file_digest = digest(&SHA256, content);
+    let mut content_context = Context::new(&SHA256);
+    content_context.update(b"THRN-CONTENT-INVENTORY-V2\0");
+    content_context.update(&destination_identity.0.to_be_bytes());
+    content_context.update(&destination_identity.1.to_be_bytes());
+    content_context.update(&0_u64.to_be_bytes());
+    content_context.update(&1_u64.to_be_bytes());
+    content_context.update(b"F");
+    content_context.update(&("SKILL.md".len() as u64).to_be_bytes());
+    content_context.update(b"SKILL.md");
+    content_context.update(&(content.len() as u64).to_be_bytes());
+    content_context.update(file_digest.as_ref());
+    let content_digest = format!("sha256:{}", {
+        let value = content_context.finish();
+        value
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    });
+    let destination = std::path::Path::new(project_root)
+        .join(".agents/skills")
+        .join(skill_name)
+        .to_string_lossy()
+        .into_owned();
+    serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "catalogResourceId": resource_id,
+        "skillName": skill_name,
+        "agent": "codex",
+        "scope": "project",
+        "canonicalProjectRoot": project_root,
+        "projectRootIdentity": { "volume": project_identity.0, "object": project_identity.1 },
+        "destination": destination,
+        "installedDirectoryIdentity": {
+            "volume": destination_identity.0,
+            "object": destination_identity.1
+        },
+        "installedAtUnixSeconds": 1,
+        "sourceOwner": "example-org",
+        "sourceRepository": "catalog-test-fixtures",
+        "sourceCommit": "2f68bee292a8c68346b4294fb31d9563eefe1ade",
+        "sourceDirectory": "skills/uncharted-ideation",
+        "resourceVersion": "1.0.0",
+        "directories": [],
+        "files": [{
+            "path": "SKILL.md",
+            "byteCount": content.len(),
+            "sha256": format!("sha256:{}", sha256_hex(content))
+        }],
+        "fileCount": 1,
+        "byteCount": content.len(),
+        "contentDigest": content_digest
+    }))
+    .expect("valid identity-bound receipt JSON")
+}
+
 fn write_receipt(
     directory: &TestDir,
     project_root: &str,
@@ -178,6 +243,29 @@ fn write_receipt(
         receipt_json(project_root, resource_id, skill_name, identity),
     )
     .expect("receipt should be written");
+}
+
+fn write_receipt_with_install_identity(
+    directory: &TestDir,
+    project_root: &str,
+    resource_id: &str,
+    skill_name: &str,
+    project_identity: (u64, u64),
+    destination_identity: (u64, u64),
+) {
+    let receipts = receipt_directory(directory);
+    fs::create_dir_all(&receipts).expect("receipt storage should be created");
+    fs::write(
+        receipts.join(receipt_filename(project_root, resource_id)),
+        receipt_json_with_install_identity(
+            project_root,
+            resource_id,
+            skill_name,
+            project_identity,
+            destination_identity,
+        ),
+    )
+    .expect("identity-bound receipt should be written");
 }
 
 fn project_filesystem_identity(path: &std::path::Path) -> (u64, u64) {
@@ -224,44 +312,16 @@ fn prepare_receipted_removal_fixture(directory: &TestDir, resource_id: &str) -> 
     let destination = root.join(".agents/skills/uncharted-ideation");
     fs::create_dir_all(&destination).expect("skill destination");
     fs::write(destination.join("SKILL.md"), b"abc").expect("skill file");
-    let (volume, object) = project_filesystem_identity(&root);
-    write_receipt(
+    let project_identity = project_filesystem_identity(&root);
+    let destination_identity = project_filesystem_identity(&destination);
+    write_receipt_with_install_identity(
         directory,
         root.to_str().expect("canonical path is UTF-8"),
         resource_id,
         "uncharted-ideation",
-        object,
+        project_identity,
+        destination_identity,
     );
-    #[cfg(unix)]
-    {
-        let receipt_path = receipt_directory(directory).join(receipt_filename(
-            root.to_str().expect("canonical path is UTF-8"),
-            resource_id,
-        ));
-        let bytes = fs::read(&receipt_path).expect("fixture receipt");
-        let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("valid receipt");
-        value["projectRootIdentity"]["volume"] = serde_json::json!(volume);
-        fs::write(
-            receipt_path,
-            serde_json::to_vec(&value).expect("serialize corrected identity"),
-        )
-        .expect("write project identity");
-    }
-    #[cfg(windows)]
-    {
-        let receipt_path = receipt_directory(directory).join(receipt_filename(
-            root.to_str().expect("canonical path is UTF-8"),
-            resource_id,
-        ));
-        let bytes = fs::read(&receipt_path).expect("fixture receipt");
-        let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("valid receipt");
-        value["projectRootIdentity"]["volume"] = serde_json::json!(volume);
-        fs::write(
-            receipt_path,
-            serde_json::to_vec(&value).expect("serialize corrected identity"),
-        )
-        .expect("write project identity");
-    }
     destination
 }
 
@@ -691,6 +751,48 @@ fn remove_success_reports_only_after_receipt_retirement_and_installed_listing_is
     );
     assert!(!String::from_utf8_lossy(&listed.stdout).contains("creative-lab"));
     assert!(listed.stderr.is_empty());
+}
+
+#[test]
+fn remove_refuses_legacy_receipt_without_install_identity_and_preserves_content() {
+    let directory = TestDir::new();
+    let root = fs::canonicalize(directory.path()).expect("canonical project root");
+    let destination = root.join(".agents/skills/uncharted-ideation");
+    fs::create_dir_all(&destination).expect("skill destination");
+    fs::write(destination.join("SKILL.md"), b"abc").expect("skill file");
+    let (volume, object) = project_filesystem_identity(&root);
+    write_receipt(
+        &directory,
+        root.to_str().expect("canonical project root is UTF-8"),
+        "creative-lab",
+        "uncharted-ideation",
+        object,
+    );
+    let receipt_path = receipt_directory(&directory).join(receipt_filename(
+        root.to_str().expect("canonical project root is UTF-8"),
+        "creative-lab",
+    ));
+    let mut legacy: serde_json::Value =
+        serde_json::from_slice(&fs::read(&receipt_path).expect("legacy receipt"))
+            .expect("legacy JSON");
+    legacy["projectRootIdentity"]["volume"] = serde_json::json!(volume);
+    let legacy_bytes = serde_json::to_vec(&legacy).expect("serialize legacy receipt");
+    fs::write(&receipt_path, &legacy_bytes).expect("write valid legacy receipt");
+
+    let output = command_in(
+        &directory,
+        &["skills", "remove", "creative-lab", "--agent", "codex"],
+    )
+    .output()
+    .expect("CLI starts");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no installation-time directory identity")
+    );
+    assert_eq!(fs::read(destination.join("SKILL.md")).unwrap(), b"abc");
+    assert_eq!(fs::read(receipt_path).unwrap(), legacy_bytes);
 }
 
 #[test]

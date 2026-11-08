@@ -529,10 +529,20 @@ impl ReceiptReservation {
             committed.project_identity(),
             self.receipt.installed_at_unix_seconds(),
         )
+        .and_then(|receipt| {
+            receipt.with_installed_directory_identity(committed.destination_identity())
+        })
         .map_err(|source| validation_error("committed receipt", source))?;
-        if expected != self.receipt {
+        let reserved_intent = self.receipt.clone();
+        if expected
+            != reserved_intent
+                .clone()
+                .with_installed_directory_identity(committed.destination_identity())
+                .map_err(|source| validation_error("committed receipt", source))?
+        {
             return Err(ReceiptStoreError::CommittedIdentityMismatch);
         }
+        self.receipt = expected.clone();
         match verify_receipt_tree(&self.receipt, Some(committed.destination_identity()))? {
             ReceiptContentState::Verified => {}
             ReceiptContentState::Missing => return Err(ReceiptStoreError::CommittedContentMissing),
@@ -2662,7 +2672,14 @@ fn verify_receipt_tree(
     let Some(root) = open_directory_status(&skills, receipt.skill_name())? else {
         return Ok(ReceiptContentState::Missing);
     };
-    if expected_destination_identity.is_some_and(|identity| root.identity().ok() != Some(identity))
+    let current_destination_identity = root
+        .identity()
+        .map_err(|error| content_error("identify installed directory", error))?;
+    if receipt
+        .installed_directory_identity()
+        .is_some_and(|identity| identity != current_destination_identity)
+        || expected_destination_identity
+            .is_some_and(|identity| current_destination_identity != identity)
     {
         return Ok(ReceiptContentState::Modified);
     }
@@ -3035,7 +3052,7 @@ mod tests {
                 self.resume
                     .lock()
                     .map_err(|_| io::Error::other("writer-lock barrier poisoned"))?
-                    .recv()
+                    .recv_timeout(std::time::Duration::from_secs(15))
                     .map_err(|error| io::Error::other(error.to_string()))?;
             }
             Ok(())
@@ -3066,7 +3083,7 @@ mod tests {
                 self.resume
                     .lock()
                     .map_err(|_| io::Error::other("prepared-journal barrier poisoned"))?
-                    .recv()
+                    .recv_timeout(std::time::Duration::from_secs(15))
                     .map_err(|error| io::Error::other(error.to_string()))?;
             }
             Ok(())
@@ -3392,6 +3409,19 @@ mod tests {
         let receipt = session
             .commit_and_record_at(&store, 1_800_000_000, &NoInstallFaults, &NoReceiptFaults)
             .expect("commit and receipt");
+        assert!(
+            !receipt.is_legacy(),
+            "new installations use receipt schema v2"
+        );
+        assert_eq!(
+            receipt.installed_directory_identity(),
+            Some(
+                super::SecureDir::open_absolute(&receipt.destination_path())
+                    .expect("installed destination handle")
+                    .identity()
+                    .expect("committed destination identity")
+            )
+        );
         assert_eq!(receipt.catalog_resource_id(), "uncharted");
         assert_eq!(receipt.skill_name(), "uncharted-ideation");
         assert_eq!(
@@ -3403,6 +3433,114 @@ mod tests {
             store.verify_current_content(&receipt).expect("verify"),
             ReceiptContentState::Verified
         );
+    }
+
+    #[test]
+    fn identity_recording_failure_keeps_install_unmanaged_until_recovery_proves_it() {
+        let (_parent, project, staging, data) = setup();
+        let store = ReceiptStore::new(data.join("receipts"));
+        let result = session(&project, &staging).commit_and_record_at_with_journal(
+            &store,
+            1,
+            &NoInstallFaults,
+            &NoReceiptFaults,
+            &FailJournalAt(JournalOperation::SetDestinationIdentity),
+        );
+        assert!(matches!(
+            result,
+            Err(
+                crate::install::commit::InstallationCompletionError::JournalAfterDirectoryCommit(_)
+            )
+        ));
+        let destination = project.join(".agents/skills/uncharted-ideation");
+        assert!(destination.join("SKILL.md").is_file());
+        assert!(
+            store
+                .list()
+                .expect("legacy receipt is not published")
+                .is_empty()
+        );
+        let pending = store
+            .journal_store()
+            .expect("journal store")
+            .read_all()
+            .expect("journal");
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].receipt().is_legacy());
+        assert_eq!(pending[0].destination_identity(), None);
+
+        assert_eq!(
+            store
+                .recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults)
+                .expect("recovery captures the committed installation identity"),
+            vec![super::RecoveryOutcome::FinalizedReceipt]
+        );
+        let receipts = store.list().expect("recovered schema-v2 receipt");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            receipts[0].installed_directory_identity(),
+            Some(
+                super::SecureDir::open_absolute(&destination)
+                    .expect("destination handle")
+                    .identity()
+                    .expect("destination identity")
+            )
+        );
+    }
+
+    #[test]
+    fn subprocess_crash_after_identity_recording_recovers_a_v2_receipt() {
+        if std::env::var_os("THRN_M2_OWNERSHIP_CRASH_AFTER_IDENTITY").is_some() {
+            let project =
+                PathBuf::from(std::env::var_os("THRN_M2_OWNERSHIP_PROJECT").expect("project"));
+            let staging =
+                PathBuf::from(std::env::var_os("THRN_M2_OWNERSHIP_STAGING").expect("staging"));
+            let data = PathBuf::from(std::env::var_os("THRN_M2_OWNERSHIP_DATA").expect("data"));
+            let _ = session(&project, &staging).commit_and_record_at_with_journal(
+                &ReceiptStore::new(data.join("receipts")),
+                1,
+                &NoInstallFaults,
+                &NoReceiptFaults,
+                &ExitAfterJournal(JournalOperation::SetDestinationIdentity),
+            );
+            panic!("child should exit immediately after durable identity recording");
+        }
+
+        let (_parent, project, staging, data) = setup();
+        let status = Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("install::receipt_store::tests::subprocess_crash_after_identity_recording_recovers_a_v2_receipt")
+            .arg("--nocapture")
+            .env("THRN_M2_OWNERSHIP_CRASH_AFTER_IDENTITY", "1")
+            .env("THRN_M2_OWNERSHIP_PROJECT", &project)
+            .env("THRN_M2_OWNERSHIP_STAGING", &staging)
+            .env("THRN_M2_OWNERSHIP_DATA", &data)
+            .status()
+            .expect("launch identity-recording crash simulation");
+        assert_eq!(status.code(), Some(88));
+
+        let store = ReceiptStore::new(data.join("receipts"));
+        assert!(store.list().expect("no premature publication").is_empty());
+        let journals = store
+            .journal_store()
+            .expect("journal store")
+            .read_all()
+            .expect("journal");
+        assert_eq!(journals.len(), 1);
+        assert!(!journals[0].receipt().is_legacy());
+        assert_eq!(
+            journals[0].destination_identity(),
+            journals[0].receipt().installed_directory_identity()
+        );
+        assert_eq!(
+            store
+                .recover_with_faults(&NoJournalFaultsForTest, &NoReceiptFaults)
+                .expect("recover interrupted publication"),
+            vec![super::RecoveryOutcome::FinalizedReceipt]
+        );
+        let receipts = store.list().expect("completed receipt");
+        assert_eq!(receipts.len(), 1);
+        assert!(!receipts[0].is_legacy());
     }
 
     #[test]

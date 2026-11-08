@@ -156,6 +156,18 @@ impl RemovalPlan {
         let destination_identity = destination
             .identity()
             .map_err(removal_io("identify installed skill directory"))?;
+        let Some(installed_identity) = receipt.installed_directory_identity() else {
+            return Err(RemovalError::Conflict(
+                "legacy schema-v1 receipt has no installation-time directory identity; automatic removal is refused"
+                    .to_owned(),
+            ));
+        };
+        if destination_identity != installed_identity {
+            return Err(RemovalError::Conflict(
+                "installed directory identity differs from the installation-time receipt evidence"
+                    .to_owned(),
+            ));
+        }
 
         let objects = verify_inventory(&receipt, destination)?;
         Ok(Self {
@@ -589,6 +601,12 @@ impl RemovalRecord {
         self.receipt
             .validate()
             .map_err(|_| RemovalJournalError::InvalidRecord)?;
+        if let Some(receipt_identity) = self.receipt.installed_directory_identity() {
+            let journal_identity: FileIdentity = self.destination_identity.into();
+            if journal_identity != receipt_identity {
+                return Err(RemovalJournalError::InvalidRecord);
+            }
+        }
         if self
             .receipt
             .to_json()
@@ -1517,6 +1535,29 @@ fn recover_one(
     faults: &dyn RemovalFaultInjector,
 ) -> Result<(), RemovalError> {
     let state = journal.record().state;
+    if journal.record().receipt.is_legacy() {
+        let record = journal.record().clone();
+        return match state {
+            RemovalState::Complete => {
+                verify_quarantine_removed(&record, &open_record_parents(&record)?.2)?;
+                verify_receipt_missing(&record, receipt_directory)?;
+                journal_store
+                    .cleanup_completed(journal.operation_id(), faults)
+                    .map_err(|error| RemovalError::Journal(error.to_string()))
+            }
+            RemovalState::RolledBack => {
+                verify_legacy_original_tree(&record)?;
+                verify_receipt_exists(&record, receipt_directory, false)?;
+                journal_store
+                    .cleanup_completed(journal.operation_id(), faults)
+                    .map_err(|error| RemovalError::Journal(error.to_string()))
+            }
+            _ => Err(RemovalError::Conflict(
+                "legacy removal journal has no installation-time directory identity; automatic recovery is refused and its content and journal are preserved"
+                    .to_owned(),
+            )),
+        };
+    }
     if state == RemovalState::Prepared {
         verify_original_tree(journal.record())?;
         verify_receipt_exists(journal.record(), receipt_directory, false)?;
@@ -1807,6 +1848,22 @@ fn verify_original_tree(record: &RemovalRecord) -> Result<(), RemovalError> {
         return Err(RemovalError::Conflict(
             "original destination no longer matches the recorded receipt and filesystem identities"
                 .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_legacy_original_tree(record: &RemovalRecord) -> Result<(), RemovalError> {
+    let (_, _, skills) = open_record_parents(record)?;
+    let destination = open_exact_directory(&skills, record.receipt.skill_name())?;
+    if destination
+        .identity()
+        .map_err(removal_io("identify legacy installed directory"))?
+        != record.destination_identity.into()
+        || verify_inventory(&record.receipt, destination)? != record.objects
+    {
+        return Err(RemovalError::Conflict(
+            "legacy removal rollback does not match its pre-removal journal evidence".to_owned(),
         ));
     }
     Ok(())
