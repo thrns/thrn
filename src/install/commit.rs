@@ -246,6 +246,7 @@ impl CommittedInstallation {
 /// Filesystem boundaries that tests can fail at deterministic operation points.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum InstallOperation {
+    RevalidateDestination,
     CreateParentDirectory,
     CreateTemporaryDirectory,
     CreateDirectory,
@@ -342,6 +343,12 @@ fn commit_session_inner(
     if current_inventory != session.inventory {
         return Err(CommitError::SourceChanged);
     }
+
+    faults
+        .before(InstallOperation::RevalidateDestination)
+        .map_err(|error| {
+            operation_error(InstallOperation::RevalidateDestination, error, true, vec![])
+        })?;
 
     let snapshot = session.plan.destination_snapshot();
     let current = inspect_destination(
@@ -2815,6 +2822,33 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    struct SubstituteJunctionBeforeRevalidation {
+        junction: PathBuf,
+        displaced: PathBuf,
+        target: PathBuf,
+        called: Mutex<bool>,
+    }
+
+    #[cfg(windows)]
+    impl InstallFaultInjector for SubstituteJunctionBeforeRevalidation {
+        fn before(&self, operation: InstallOperation) -> io::Result<()> {
+            if operation != InstallOperation::RevalidateDestination {
+                return Ok(());
+            }
+            let mut called = self
+                .called
+                .lock()
+                .map_err(|_| io::Error::other("junction substitution test seam was poisoned"))?;
+            if !*called {
+                fs::rename(&self.junction, &self.displaced)?;
+                crate::install::windows_test_support::create_junction(&self.junction, &self.target);
+                *called = true;
+            }
+            Ok(())
+        }
+    }
+
     fn project_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let parent = tempdir().expect("temporary parent");
         let project = parent.path().join("project");
@@ -3060,6 +3094,54 @@ mod tests {
             b"outside selected destination"
         );
         assert!(!external.join("skills").exists());
+        assert_no_receipts(&project);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reparse_substitution_after_planning_is_rejected_by_m204_revalidation() {
+        let (_parent, project, stage_parent) = project_fixture();
+        let skills = project.join(".agents/skills");
+        fs::create_dir_all(&skills).expect("real planned skills directory");
+        let session = make_session(&project, &stage_parent);
+
+        let external = project.with_extension("external");
+        fs::create_dir(&external).expect("external target");
+        fs::write(external.join("keep.txt"), b"outside selected destination")
+            .expect("external sentinel");
+        let displaced = project.join(".agents/skills-before-junction");
+        let substitution = SubstituteJunctionBeforeRevalidation {
+            junction: skills.clone(),
+            displaced,
+            target: external.clone(),
+            called: Mutex::new(false),
+        };
+
+        let error = commit_session(&session, &substitution)
+            .expect_err("revalidation must reject the substituted junction");
+        assert!(
+            matches!(&error, CommitError::DestinationConflict),
+            "unexpected commit result: {error:?}"
+        );
+        assert!(*substitution.called.lock().expect("substitution state"));
+        assert_eq!(
+            fs::read(external.join("keep.txt")).expect("external sentinel remains"),
+            b"outside selected destination"
+        );
+        assert_eq!(
+            fs::read_dir(&external).expect("external entries").count(),
+            1
+        );
+        assert!(
+            substitution.displaced.is_dir(),
+            "the planned real skills directory is preserved"
+        );
+        assert_eq!(
+            fs::read_dir(&substitution.displaced)
+                .expect("displaced directory remains empty")
+                .count(),
+            0
+        );
         assert_no_receipts(&project);
     }
 

@@ -510,6 +510,12 @@ mod install_tests {
         },
     };
 
+    #[cfg(windows)]
+    use crate::install::{
+        destination::{ConflictKind, DestinationError, inspect_destination},
+        windows_test_support::create_junction,
+    };
+
     const SKILL_MD: &[u8] = b"---\nname: uncharted-ideation\ndescription: A deterministic install fixture.\n---\n\nNever execute these instructions.\n";
     const GUIDE: &[u8] = b"nested reference contents\n";
     const SCRIPT: &[u8] = b"#!/bin/sh\ntouch SKILL-WAS-EXECUTED\n";
@@ -710,6 +716,163 @@ mod install_tests {
     }
 
     use crate::install::commit::InstallationCompletionError;
+
+    #[cfg(windows)]
+    fn assert_junction_rejected_by_inspection_and_orchestration(
+        fixture: &InstallFixture,
+        junction: &Path,
+        expected_conflict: ConflictKind,
+    ) {
+        let snapshot = inspect_destination(None, &fixture.current, "uncharted-ideation")
+            .expect("destination inspection must return the junction conflict");
+        assert!(
+            snapshot
+                .conflicts()
+                .iter()
+                .any(|conflict| conflict.path() == junction && conflict.kind() == expected_conflict),
+            "inspection did not reject junction {junction:?}: {:?}",
+            snapshot.conflicts()
+        );
+
+        let transport = FixtureTransport::archive();
+        let error = fixture
+            .execute("uncharted", None, &transport)
+            .expect_err("junction destination must not produce installation success");
+        assert!(
+            matches!(&error, InstallCommandError::InstallConflicts { .. }),
+            "unexpected orchestration result: {error:?}"
+        );
+        assert!(
+            !error.to_string().contains("Installed THRN skill"),
+            "failure must not report installation success"
+        );
+        assert_eq!(transport.call_count(), 1, "fake GitHub source is exercised");
+        assert!(
+            fixture.store().list().expect("receipt listing").is_empty(),
+            "failed junction install must not create an ownership receipt"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_agents_junction_is_rejected_by_inspection_and_install_orchestration() {
+        let fixture = InstallFixture::new();
+        let external = fixture._root.path().join("external-agents");
+        fs::create_dir(&external).expect("external directory");
+        fs::write(external.join("keep.txt"), b"external sentinel").expect("external sentinel");
+        let junction = fixture.project.join(".agents");
+        create_junction(&junction, &external);
+
+        assert_junction_rejected_by_inspection_and_orchestration(
+            &fixture,
+            &junction,
+            ConflictKind::UnsafeDestinationComponent,
+        );
+        assert_eq!(
+            fs::read(external.join("keep.txt")).expect("sentinel remains"),
+            b"external sentinel"
+        );
+        assert_eq!(
+            fs::read_dir(&external).expect("external entries").count(),
+            1
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_skills_junction_is_rejected_by_inspection_and_install_orchestration() {
+        let fixture = InstallFixture::new();
+        let external = fixture._root.path().join("external-skills");
+        fs::create_dir(&external).expect("external directory");
+        fs::write(external.join("keep.txt"), b"external sentinel").expect("external sentinel");
+        fs::create_dir(fixture.project.join(".agents")).expect("real agents directory");
+        let junction = fixture.project.join(".agents/skills");
+        create_junction(&junction, &external);
+
+        assert_junction_rejected_by_inspection_and_orchestration(
+            &fixture,
+            &junction,
+            ConflictKind::UnsafeDestinationComponent,
+        );
+        assert_eq!(
+            fs::read(external.join("keep.txt")).expect("sentinel remains"),
+            b"external sentinel"
+        );
+        assert_eq!(
+            fs::read_dir(&external).expect("external entries").count(),
+            1
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_skill_destination_junction_is_rejected_without_adopting_external_content() {
+        let fixture = InstallFixture::new();
+        let external = fixture._root.path().join("external-skill");
+        fs::create_dir(&external).expect("external directory");
+        fs::write(external.join("SKILL.md"), b"external skill metadata")
+            .expect("external metadata");
+        fs::write(external.join("keep.txt"), b"external sentinel").expect("external sentinel");
+        fs::create_dir_all(fixture.project.join(".agents/skills")).expect("real skills directory");
+        let junction = fixture.project.join(".agents/skills/uncharted-ideation");
+        create_junction(&junction, &external);
+
+        assert_junction_rejected_by_inspection_and_orchestration(
+            &fixture,
+            &junction,
+            ConflictKind::ExistingSymlink,
+        );
+        assert_eq!(
+            fs::read(external.join("SKILL.md")).expect("external metadata remains"),
+            b"external skill metadata"
+        );
+        assert_eq!(
+            fs::read(external.join("keep.txt")).expect("sentinel remains"),
+            b"external sentinel"
+        );
+        assert_eq!(
+            fs::read_dir(&external).expect("external entries").count(),
+            2
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_project_junction_is_rejected_without_writing_into_its_target() {
+        let fixture = InstallFixture::new();
+        let external = fixture._root.path().join("external-project");
+        fs::create_dir(&external).expect("external project");
+        fs::write(external.join("keep.txt"), b"external project sentinel")
+            .expect("external sentinel");
+        let junction = fixture._root.path().join("project-junction");
+        create_junction(&junction, &external);
+
+        assert!(matches!(
+            inspect_destination(Some(&junction), &fixture.current, "uncharted-ideation"),
+            Err(DestinationError::ProjectRootSymlink { .. })
+        ));
+        let transport = FixtureTransport::archive();
+        let error = fixture
+            .execute("uncharted", Some(&junction), &transport)
+            .expect_err("junction project root must fail installation");
+        assert!(
+            matches!(
+                &error,
+                InstallCommandError::Destination(DestinationError::ProjectRootSymlink { .. })
+            ),
+            "unexpected project-root result: {error:?}"
+        );
+        assert_eq!(transport.call_count(), 1);
+        assert_eq!(
+            fs::read(external.join("keep.txt")).expect("external sentinel remains"),
+            b"external project sentinel"
+        );
+        assert_eq!(
+            fs::read_dir(&external).expect("external entries").count(),
+            1
+        );
+        assert!(fixture.store().list().expect("receipt listing").is_empty());
+    }
 
     #[test]
     fn installs_validated_nested_skill_and_lists_its_durable_receipt() {
