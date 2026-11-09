@@ -836,6 +836,10 @@ impl ReceiptStore {
             .map_err(|error| RemovalError::Store(error.to_string()))?;
         let receipt_file_identity = SecureDir::file_identity(&receipt_file)
             .map_err(|error| RemovalError::Store(error.to_string()))?;
+        // Windows does not allow the receipt-backed removal engine to retire an open receipt
+        // file unless the original handle was opened with delete sharing. The identity has been
+        // captured, so release this read handle before asking removal to quarantine and retire.
+        drop(receipt_file);
         let directory_identity = reservation
             .directory
             .identity()

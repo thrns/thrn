@@ -4143,21 +4143,27 @@ mod install_tests {
             crate::agents::AgentId::Cursor,
         ];
         let scopes = batch_scopes(&fixture, &agents, InstallScope::Project, &fixture.project);
-        let error = match prepare_multi_install_plan(
+        let plan = match prepare_multi_install_plan(
             &fixture.catalog,
             "uncharted",
             &scopes,
             &FixtureTransport::archive(),
             &TestFactory(fixture.staging.clone()),
         ) {
-            Ok(_) => panic!("multi-agent planning must reject the junction before writes"),
-            Err(error) => error,
+            Ok(plan) => plan,
+            Err(error) => panic!("offline multi-agent plan must resolve: {error}"),
         };
-
-        assert!(matches!(
-            error,
-            crate::install::batch::MultiInstallPlanError::Destination(_)
-        ));
+        let store = fixture.store();
+        let preflight = inspect_multi_install_preflight(&plan, &scopes, &store)
+            .expect("read-only batch preflight");
+        assert!(
+            !preflight.is_eligible(),
+            "junction must make the complete batch ineligible"
+        );
+        assert!(preflight.conflicts.iter().any(|conflict| {
+            conflict.agent == Some(crate::agents::AgentId::ClaudeCode)
+                && conflict.path == fixture.project.join(".claude")
+        }));
         assert_eq!(
             fs::read(external.join("keep.txt")).expect("external sentinel remains"),
             b"external sentinel"
