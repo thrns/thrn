@@ -78,6 +78,32 @@ fn command_in(directory: &TestDir, args: &[&str]) -> Command {
     command
 }
 
+fn output_bounded(command: &mut Command) -> Output {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().expect("bounded CLI process starts");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if child
+            .try_wait()
+            .expect("inspect bounded CLI process")
+            .is_some()
+        {
+            return child
+                .wait_with_output()
+                .expect("collect bounded CLI process output");
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("CLI subprocess exceeded its 15 second test bound");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 fn cache_file(directory: &TestDir) -> PathBuf {
     directory.root().join("thrn-cache/catalog-v1.cache")
 }
@@ -1660,6 +1686,88 @@ fn install_requires_agent_and_identifier_arguments() {
     assert_eq!(missing_identifier.status.code(), Some(2));
     assert!(missing_identifier.stdout.is_empty());
     assert!(String::from_utf8_lossy(&missing_identifier.stderr).contains("<ID>"));
+}
+
+#[test]
+fn install_repeated_agents_are_explicit_and_no_input_fails_closed() {
+    let directory = TestDir::new();
+    let mut missing_command = command_in(
+        &directory,
+        &["skills", "install", "uncharted", "--no-input"],
+    );
+    let missing = output_bounded(&mut missing_command);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(missing.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("--agent <AGENT>"));
+
+    let mut duplicate_command = command_in(
+        &directory,
+        &[
+            "skills",
+            "install",
+            "uncharted",
+            "--agent",
+            "codex",
+            "--agent",
+            "codex",
+            "--no-input",
+        ],
+    );
+    let duplicate = output_bounded(&mut duplicate_command);
+    assert_eq!(duplicate.status.code(), Some(2));
+    assert!(duplicate.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("duplicate --agent"));
+
+    let mut invalid_command = command_in(
+        &directory,
+        &[
+            "skills",
+            "install",
+            "uncharted",
+            "--agent",
+            "not-an-agent",
+            "--agent",
+            "claude-code",
+            "--no-input",
+        ],
+    );
+    let invalid = output_bounded(&mut invalid_command);
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(invalid.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("unsupported agent"));
+
+    let mut explicit_command = command_in(
+        &directory,
+        &[
+            "skills",
+            "install",
+            "missing-resource",
+            "--agent",
+            "codex",
+            "--agent",
+            "claude-code",
+            "--no-input",
+        ],
+    );
+    let explicit = output_bounded(&mut explicit_command);
+    assert_eq!(explicit.status.code(), Some(1));
+    assert!(explicit.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&explicit.stderr).contains("no catalog entry matches"));
+    assert!(!directory.path().join(".agents").exists());
+    assert!(!directory.path().join(".claude").exists());
+    assert!(!receipt_directory(&directory).exists());
+}
+
+#[test]
+fn install_help_documents_repeated_agent_selection_and_no_input() {
+    let directory = TestDir::new();
+    let mut command = command_in(&directory, &["skills", "install", "--help"]);
+    let output = output_bounded(&mut command);
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("repeat for multiple agents"));
+    assert!(stdout.contains("--no-input"));
+    assert!(output.stderr.is_empty());
 }
 
 #[test]

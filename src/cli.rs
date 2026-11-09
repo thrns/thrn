@@ -9,6 +9,11 @@ use crate::{
     doctor,
     error::Result,
     install::{
+        batch::{
+            ExistingTargetState, MultiInstallPlan, TargetConflict,
+            execute_multi_install as run_multi_install, inspect_multi_install_preflight,
+            prepare_multi_install_plan,
+        },
         check::{self, CheckFinding},
         command::{InstallCommandError, format_dry_run, prepare_install_session_in_scope},
         commit::{InstallationCompletionError, InstallationSession},
@@ -76,9 +81,9 @@ enum SkillsCommand {
     Install {
         /// Exact catalog resource ID or explicit alias.
         id: String,
-        /// Select codex, claude-code, cursor, or gemini.
+        /// Select codex, claude-code, cursor, or gemini; repeat for multiple agents.
         #[arg(long, required = true, value_name = "AGENT")]
-        agent: String,
+        agent: Vec<String>,
         /// Select project (default) or user skill scope.
         #[arg(long, value_enum, default_value = "project")]
         scope: InstallScope,
@@ -88,6 +93,9 @@ enum SkillsCommand {
         /// Print the complete plan without changing the project.
         #[arg(long)]
         dry_run: bool,
+        /// Fail closed without prompting; M3-07 requires explicit agent targets.
+        #[arg(long)]
+        no_input: bool,
     },
     /// Remove one exactly verified THRN-managed skill.
     Remove {
@@ -169,6 +177,17 @@ pub fn run() -> Result<()> {
             "--project can only be used with --scope project",
         )));
     }
+    if matches!(
+        &command,
+        Command::Skills {
+            command: SkillsCommand::Install { agent, .. }
+        } if duplicate_agents(agent)
+    ) {
+        return Err(crate::error::ThrnError::Cli(clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "duplicate --agent selections are not allowed",
+        )));
+    }
     match command {
         Command::Doctor => doctor::run(),
         Command::Skills { command } => match command {
@@ -182,7 +201,8 @@ pub fn run() -> Result<()> {
                 scope,
                 project,
                 dry_run,
-            } => install_skill(&id, &agent, scope, project.as_deref(), dry_run),
+                no_input: _,
+            } => install_skill_targets(&id, &agent, scope, project.as_deref(), dry_run),
             SkillsCommand::Remove {
                 id,
                 agent,
@@ -547,6 +567,145 @@ fn install_skill(
     };
     report_cache_warning(selection.cache_warning.as_deref())?;
     write_stdout(&output)
+}
+
+fn duplicate_agents(agents: &[String]) -> bool {
+    agents
+        .iter()
+        .enumerate()
+        .any(|(index, agent)| agents[..index].contains(agent))
+}
+
+fn install_skill_targets(
+    identifier: &str,
+    agents: &[String],
+    scope: InstallScope,
+    project: Option<&Path>,
+    dry_run: bool,
+) -> Result<()> {
+    if agents.len() == 1 {
+        return install_skill(identifier, &agents[0], scope, project, dry_run);
+    }
+    let selected_agents = agents
+        .iter()
+        .map(|agent| {
+            crate::agents::AgentId::from_identifier(agent).ok_or_else(|| {
+                crate::error::ThrnError::Install(InstallCommandError::UnsupportedAgent(
+                    agent.clone(),
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let scopes = selected_agents
+        .iter()
+        .map(|agent| resolve_scope(agent.as_str(), scope, project))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let selection = CatalogService::for_system().discover()?;
+    let transport = crate::sources::github::UreqGithubTransport::new();
+    let plan = prepare_multi_install_plan(
+        &selection.catalog,
+        identifier,
+        &scopes,
+        &transport,
+        &crate::sources::staging::SystemTempDirFactory,
+    )?;
+    let store = ReceiptStore::for_system()?;
+    let output = if dry_run {
+        format_multi_dry_run(&plan, &scopes, &store)?
+    } else {
+        run_multi_install(&plan, &scopes, &store)?
+    };
+    report_cache_warning(selection.cache_warning.as_deref())?;
+    write_stdout(&output)
+}
+
+fn format_multi_dry_run(
+    plan: &MultiInstallPlan,
+    scopes: &[ResolvedScope],
+    store: &ReceiptStore,
+) -> Result<String> {
+    let preflight = inspect_multi_install_preflight(plan, scopes, store)?;
+
+    let first = plan.targets().first().ok_or_else(|| {
+        crate::error::ThrnError::Install(InstallCommandError::UnsupportedAgent(
+            "empty multi-agent target set".to_owned(),
+        ))
+    })?;
+    let mut output = format!(
+        "DRY RUN — no project or user-scope files were modified\nResource: {}\nScope: {}\nPinned revision: {}/{}@{}\nOrdered targets: {}\n",
+        plan.resource_id().as_str(),
+        plan.scope().as_str(),
+        first.plan().source_owner().as_str(),
+        first.plan().source_repository().as_str(),
+        first.plan().source_commit().as_str(),
+        plan.targets()
+            .iter()
+            .map(|target| target.agent().as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    output.push_str("Target conflict matrix (row -> column):\n");
+    for (row, cells) in plan
+        .conflict_matrix()
+        .agents()
+        .iter()
+        .zip(plan.conflict_matrix().cells())
+    {
+        output.push_str(&format!("  {}:", row.as_str()));
+        for (column, cell) in plan.conflict_matrix().agents().iter().zip(cells) {
+            let value = match cell {
+                TargetConflict::SameTarget => "same target".to_owned(),
+                TargetConflict::Independent => "independent".to_owned(),
+                TargetConflict::SharedDiscovery {
+                    shared_agent,
+                    discovering_agent,
+                } => format!(
+                    "conflict: {} writes a path also discovered by {}",
+                    shared_agent.as_str(),
+                    discovering_agent.as_str()
+                ),
+            };
+            output.push_str(&format!(" {}={value};", column.as_str()));
+        }
+        output.push('\n');
+    }
+    for (target, (_, state)) in plan.targets().iter().zip(&preflight.existing_targets) {
+        let state = match state {
+            ExistingTargetState::Absent => "absent",
+            ExistingTargetState::VerifiedManaged => "verified THRN-managed installation",
+            ExistingTargetState::ManagedContentChanged => {
+                "THRN receipt exists; installed content is not verified"
+            }
+            ExistingTargetState::Unmanaged => "unmanaged directory",
+            ExistingTargetState::FilesystemConflict => "filesystem collision",
+        };
+        output.push_str(&format!(
+            "\nAgent: {}\nDestination: {}\nExisting state: {state}\nFiles: {}\nBytes: {}\n",
+            target.agent().as_str(),
+            safe_path_display(target.plan().destination()),
+            target.plan().files().len(),
+            target.plan().total_file_bytes(),
+        ));
+    }
+    if !preflight.conflicts.is_empty() {
+        output.push_str("Conflicts:\n");
+        for conflict in &preflight.conflicts {
+            let agent = conflict
+                .agent
+                .map(|agent| format!("{}: ", agent.as_str()))
+                .unwrap_or_default();
+            output.push_str(&format!(
+                "  - {agent}{} — {}\n",
+                safe_path_display(&conflict.path),
+                conflict.detail
+            ));
+        }
+    }
+    output.push_str(&format!(
+        "\nBatch eligible to proceed: {}\nNo project or user-scope files were modified.\n",
+        if preflight.is_eligible() { "yes" } else { "no" }
+    ));
+    Ok(output)
 }
 
 /// Run the non-dry-run CLI flow with injectable source, staging, receipt-store, and completion
@@ -1023,13 +1182,17 @@ mod install_tests {
     use super::{
         InstallCommandError, InstallContext, InstallationSession, ReceiptStore,
         execute_install_in_scope_with, execute_install_with, execute_remove_in_scope_with,
-        execute_remove_with, format_dry_run, installed_listing_with,
+        execute_remove_with, format_dry_run, format_multi_dry_run, installed_listing_with,
         prepare_install_session_in_scope,
     };
     use crate::{
         install::{
+            batch::{
+                ExistingTargetState, execute_multi_install, execute_multi_install_with_faults,
+                inspect_multi_install_preflight, prepare_multi_install_plan,
+            },
             check::{CheckStatus, classify},
-            commit::InstallFaultInjector,
+            commit::{InstallFaultInjector, InstallOperation},
             journal::NoJournalFaults,
             plan::InstallScope,
             receipt_store::{
@@ -1103,6 +1266,17 @@ mod install_tests {
             tempfile::Builder::new()
                 .prefix("m207-stage-")
                 .tempdir_in(&self.0)
+        }
+    }
+
+    struct FailingFactory;
+
+    impl TempDirFactory for FailingFactory {
+        fn create_private(&self) -> io::Result<TempDir> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected staging failure",
+            ))
         }
     }
 
@@ -3924,6 +4098,707 @@ mod install_tests {
         assert_eq!(receipts.len(), 2);
         assert!(receipts.iter().any(|receipt| receipt.scope() == "project"));
         assert!(receipts.iter().any(|receipt| receipt.scope() == "user"));
+    }
+
+    fn batch_scopes(
+        _fixture: &InstallFixture,
+        agents: &[crate::agents::AgentId],
+        scope: InstallScope,
+        root: &Path,
+    ) -> Vec<ResolvedScope> {
+        let root = fs::canonicalize(root).expect("canonical multi-agent scope root");
+        agents
+            .iter()
+            .map(|agent| ResolvedScope::from_agent_validated(*agent, scope, root.clone()))
+            .collect()
+    }
+
+    fn prepare_batch_plan(
+        fixture: &InstallFixture,
+        identifier: &str,
+        scopes: &[ResolvedScope],
+        transport: &FixtureTransport,
+    ) -> crate::install::batch::MultiInstallPlan {
+        prepare_multi_install_plan(
+            &fixture.catalog,
+            identifier,
+            scopes,
+            transport,
+            &TestFactory(fixture.staging.clone()),
+        )
+        .expect("offline multi-agent plan")
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_multi_agent_preflight_rejects_real_agent_directory_junction() {
+        let fixture = InstallFixture::new();
+        let external = fixture._root.path().join("external-claude");
+        fs::create_dir(&external).expect("external directory");
+        fs::write(external.join("keep.txt"), b"external sentinel").expect("external sentinel");
+        create_junction(&fixture.project.join(".claude"), &external);
+
+        let agents = [
+            crate::agents::AgentId::ClaudeCode,
+            crate::agents::AgentId::Cursor,
+        ];
+        let scopes = batch_scopes(&fixture, &agents, InstallScope::Project, &fixture.project);
+        let error = prepare_multi_install_plan(
+            &fixture.catalog,
+            "uncharted",
+            &scopes,
+            &FixtureTransport::archive(),
+            &TestFactory(fixture.staging.clone()),
+        )
+        .expect_err("multi-agent planning must reject the junction before writes");
+
+        assert!(matches!(
+            error,
+            crate::install::batch::MultiInstallPlanError::Destination(_)
+        ));
+        assert_eq!(
+            fs::read(external.join("keep.txt")).expect("external sentinel remains"),
+            b"external sentinel"
+        );
+        assert_eq!(
+            fs::read_dir(&external)
+                .expect("external directory remains untouched")
+                .count(),
+            1
+        );
+        assert!(!fixture.project.join(".cursor").exists());
+    }
+
+    struct FailNthCommit {
+        nth: usize,
+        calls: AtomicUsize,
+        mutate_before_failure: Option<(PathBuf, Vec<u8>)>,
+    }
+
+    impl InstallFaultInjector for FailNthCommit {
+        fn before(&self, operation: InstallOperation) -> io::Result<()> {
+            if operation != InstallOperation::CommitNoReplace
+                || self.calls.fetch_add(1, Ordering::SeqCst) + 1 != self.nth
+            {
+                return Ok(());
+            }
+            if let Some((destination, contents)) = &self.mutate_before_failure {
+                fs::write(destination.join("SKILL.md"), contents)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+            }
+            Err(io::Error::other("injected batch target failure"))
+        }
+    }
+
+    #[test]
+    fn two_agent_batch_installs_once_and_publishes_independent_receipts() {
+        let fixture = InstallFixture::new();
+        let scopes = batch_scopes(
+            &fixture,
+            &[
+                crate::agents::AgentId::ClaudeCode,
+                crate::agents::AgentId::Cursor,
+            ],
+            InstallScope::Project,
+            &fixture.project,
+        );
+        let transport = FixtureTransport::archive();
+        let plan = prepare_batch_plan(&fixture, "creative-session", &scopes, &transport);
+        let output =
+            execute_multi_install(&plan, &scopes, &fixture.store()).expect("both targets install");
+
+        assert_eq!(
+            transport.call_count(),
+            1,
+            "the pinned archive is fetched once"
+        );
+        assert!(output.contains("Installed THRN skill for multiple agents"));
+        assert!(output.contains("Resource: uncharted"));
+        assert!(output.contains("Targets completed: 2/2"));
+        assert!(output.contains("Agent: claude-code"));
+        assert!(output.contains("Agent: cursor"));
+        assert!(output.contains("Files installed: 4"));
+        assert!(output.contains("Bytes installed:"));
+        assert!(output.contains("Batch status: complete"));
+        assert!(
+            fixture
+                .project
+                .join(".claude/skills/uncharted-ideation/SKILL.md")
+                .is_file()
+        );
+        assert!(
+            fixture
+                .project
+                .join(".cursor/skills/uncharted-ideation/SKILL.md")
+                .is_file()
+        );
+        assert!(
+            !fixture
+                .project
+                .join(".agents/skills/uncharted-ideation")
+                .exists()
+        );
+        assert_eq!(fixture.store().list().expect("batch receipts").len(), 2);
+        assert!(!fixture.project.join("SKILL-WAS-EXECUTED").exists());
+    }
+
+    #[test]
+    fn three_agent_batch_and_user_scope_batch_keep_targets_separate() {
+        let fixture = InstallFixture::new();
+        let project_scopes = batch_scopes(
+            &fixture,
+            &[
+                crate::agents::AgentId::ClaudeCode,
+                crate::agents::AgentId::Cursor,
+                crate::agents::AgentId::Gemini,
+            ],
+            InstallScope::Project,
+            &fixture.project,
+        );
+        let project_transport = FixtureTransport::archive();
+        let project_plan =
+            prepare_batch_plan(&fixture, "uncharted", &project_scopes, &project_transport);
+        assert!(!project_plan.conflict_matrix().has_conflicts());
+        let project_output =
+            execute_multi_install(&project_plan, &project_scopes, &fixture.store())
+                .expect("three independent targets install");
+        assert!(project_output.contains("Targets completed: 3/3"));
+        assert_eq!(project_transport.call_count(), 1);
+
+        let home = fixture._root.path().join("home");
+        fs::create_dir(&home).expect("isolated user root");
+        let user_scopes = batch_scopes(
+            &fixture,
+            &[
+                crate::agents::AgentId::ClaudeCode,
+                crate::agents::AgentId::Gemini,
+            ],
+            InstallScope::User,
+            &home,
+        );
+        let user_transport = FixtureTransport::archive();
+        let user_plan = prepare_batch_plan(&fixture, "uncharted", &user_scopes, &user_transport);
+        let user_output = execute_multi_install(&user_plan, &user_scopes, &fixture.store())
+            .expect("user-scope targets install");
+
+        assert!(user_output.contains("Scope: user"));
+        assert!(user_output.contains("Targets completed: 2/2"));
+        assert_eq!(user_transport.call_count(), 1);
+        assert!(
+            home.join(".claude/skills/uncharted-ideation/SKILL.md")
+                .is_file()
+        );
+        assert!(
+            home.join(".gemini/skills/uncharted-ideation/SKILL.md")
+                .is_file()
+        );
+        assert!(
+            fixture
+                .store()
+                .list()
+                .expect("all scoped receipts")
+                .iter()
+                .any(|receipt| receipt.scope() == "project" && receipt.agent() == "cursor")
+        );
+        assert!(
+            fixture
+                .store()
+                .list()
+                .expect("all scoped receipts")
+                .iter()
+                .any(|receipt| receipt.scope() == "user" && receipt.agent() == "gemini")
+        );
+        assert!(!fixture.project.join("SKILL-WAS-EXECUTED").exists());
+    }
+
+    #[test]
+    fn alias_dry_run_reports_canonical_resource_conflicts_and_writes_nothing() {
+        let fixture = InstallFixture::new();
+        let scopes = batch_scopes(
+            &fixture,
+            &[
+                crate::agents::AgentId::Codex,
+                crate::agents::AgentId::Cursor,
+            ],
+            InstallScope::Project,
+            &fixture.project,
+        );
+        let transport = FixtureTransport::archive();
+        let plan = prepare_batch_plan(&fixture, "uncharted", &scopes, &transport);
+        let output = format_multi_dry_run(&plan, &scopes, &fixture.store())
+            .expect("read-only complete dry-run");
+        let preflight = inspect_multi_install_preflight(&plan, &scopes, &fixture.store())
+            .expect("preflight remains inspectable");
+
+        assert!(output.contains("Resource: uncharted"));
+        assert!(output.contains("Target conflict matrix"));
+        assert!(output.contains("Batch eligible to proceed: no"));
+        assert!(output.contains("shared .agents/skills discovery"));
+        assert!(!preflight.is_eligible());
+        assert_eq!(transport.call_count(), 1);
+        assert!(!fixture.project.join(".agents").exists());
+        assert!(!fixture.project.join(".cursor").exists());
+        assert!(!fixture.data.exists());
+    }
+
+    #[test]
+    fn batch_source_and_staging_failures_leave_all_targets_untouched() {
+        let fixture = InstallFixture::new();
+        let scopes = batch_scopes(
+            &fixture,
+            &[
+                crate::agents::AgentId::ClaudeCode,
+                crate::agents::AgentId::Cursor,
+            ],
+            InstallScope::Project,
+            &fixture.project,
+        );
+        let source_failure = FixtureTransport::with_response(Err(TransportError::Connection));
+        let error = prepare_multi_install_plan(
+            &fixture.catalog,
+            "uncharted",
+            &scopes,
+            &source_failure,
+            &TestFactory(fixture.staging.clone()),
+        )
+        .err()
+        .expect("failed pinned-source download aborts complete planning");
+        assert!(!error.to_string().is_empty());
+        assert_eq!(source_failure.call_count(), 1);
+
+        let staging_failure = prepare_multi_install_plan(
+            &fixture.catalog,
+            "uncharted",
+            &scopes,
+            &FixtureTransport::archive(),
+            &FailingFactory,
+        )
+        .err()
+        .expect("staging failure aborts complete planning");
+        assert!(staging_failure.to_string().contains("staging"));
+        assert!(!fixture.project.join(".claude").exists());
+        assert!(!fixture.project.join(".cursor").exists());
+        assert!(!fixture.data.exists());
+    }
+
+    #[test]
+    fn codex_with_cursor_or_gemini_is_rejected_before_any_target_write() {
+        for discoverer in [
+            crate::agents::AgentId::Cursor,
+            crate::agents::AgentId::Gemini,
+        ] {
+            let fixture = InstallFixture::new();
+            let scopes = batch_scopes(
+                &fixture,
+                &[crate::agents::AgentId::Codex, discoverer],
+                InstallScope::Project,
+                &fixture.project,
+            );
+            let plan =
+                prepare_batch_plan(&fixture, "uncharted", &scopes, &FixtureTransport::archive());
+            let error = execute_multi_install(&plan, &scopes, &fixture.store())
+                .expect_err("shared discovery pair is incompatible");
+            assert!(
+                error
+                    .to_string()
+                    .contains("shared .agents/skills discovery")
+            );
+            assert!(!fixture.project.join(".agents").exists());
+            assert!(!fixture.project.join(".cursor").exists());
+            assert!(!fixture.project.join(".gemini").exists());
+            assert!(
+                fixture
+                    .store()
+                    .list()
+                    .expect("no ownership receipts")
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn existing_unmanaged_target_and_post_plan_substitution_fail_closed() {
+        let unmanaged = InstallFixture::new();
+        let scopes = batch_scopes(
+            &unmanaged,
+            &[
+                crate::agents::AgentId::ClaudeCode,
+                crate::agents::AgentId::Cursor,
+            ],
+            InstallScope::Project,
+            &unmanaged.project,
+        );
+        let existing = unmanaged.project.join(".claude/skills/uncharted-ideation");
+        fs::create_dir_all(&existing).expect("unmanaged destination");
+        fs::write(existing.join("SKILL.md"), b"user-owned").expect("user content");
+        let plan = prepare_batch_plan(
+            &unmanaged,
+            "uncharted",
+            &scopes,
+            &FixtureTransport::archive(),
+        );
+        let preflight = inspect_multi_install_preflight(&plan, &scopes, &unmanaged.store())
+            .expect("inspect unmanaged target");
+        assert_eq!(
+            preflight.existing_targets[0].1,
+            ExistingTargetState::Unmanaged
+        );
+        assert!(!preflight.is_eligible());
+        assert_eq!(fs::read(existing.join("SKILL.md")).unwrap(), b"user-owned");
+        assert!(!unmanaged.project.join(".cursor").exists());
+        assert!(unmanaged.store().list().expect("no receipt").is_empty());
+
+        let substituted = InstallFixture::new();
+        let scopes = batch_scopes(
+            &substituted,
+            &[
+                crate::agents::AgentId::ClaudeCode,
+                crate::agents::AgentId::Cursor,
+            ],
+            InstallScope::Project,
+            &substituted.project,
+        );
+        let plan = prepare_batch_plan(
+            &substituted,
+            "uncharted",
+            &scopes,
+            &FixtureTransport::archive(),
+        );
+        fs::create_dir(substituted.project.join(".claude"))
+            .expect("substitute destination parent after planning");
+        let error = execute_multi_install(&plan, &scopes, &substituted.store())
+            .expect_err("post-plan identity change blocks all writes");
+        assert!(error.to_string().contains("changed after planning"));
+        assert!(
+            !substituted
+                .project
+                .join(".claude/skills/uncharted-ideation")
+                .exists()
+        );
+        assert!(!substituted.project.join(".cursor").exists());
+        assert!(substituted.store().list().expect("no receipt").is_empty());
+        assert!(!substituted.data.join("batches").exists());
+    }
+
+    #[test]
+    fn second_target_failure_compensates_first_receipt_backed_install() {
+        let fixture = InstallFixture::new();
+        let scopes = batch_scopes(
+            &fixture,
+            &[
+                crate::agents::AgentId::ClaudeCode,
+                crate::agents::AgentId::Cursor,
+            ],
+            InstallScope::Project,
+            &fixture.project,
+        );
+        let plan = prepare_batch_plan(&fixture, "uncharted", &scopes, &FixtureTransport::archive());
+        let failure = FailNthCommit {
+            nth: 2,
+            calls: AtomicUsize::new(0),
+            mutate_before_failure: None,
+        };
+        let error = execute_multi_install_with_faults(
+            &plan,
+            &scopes,
+            &fixture.store(),
+            &failure,
+            &NoReceiptFaults,
+            &NoJournalFaults,
+        )
+        .expect_err("target two fails after target one commits");
+
+        assert!(error.to_string().contains("compensation succeeded"));
+        assert!(
+            !fixture
+                .project
+                .join(".claude/skills/uncharted-ideation")
+                .exists()
+        );
+        assert!(
+            !fixture
+                .project
+                .join(".cursor/skills/uncharted-ideation")
+                .exists()
+        );
+        assert!(fixture.store().list().expect("receipts retired").is_empty());
+        assert_eq!(failure.calls.load(Ordering::SeqCst), 2);
+        assert!(!fixture.project.join("SKILL-WAS-EXECUTED").exists());
+    }
+
+    #[test]
+    fn compensation_refuses_modified_content_and_restart_preserves_it() {
+        let fixture = InstallFixture::new();
+        let scopes = batch_scopes(
+            &fixture,
+            &[
+                crate::agents::AgentId::ClaudeCode,
+                crate::agents::AgentId::Cursor,
+            ],
+            InstallScope::Project,
+            &fixture.project,
+        );
+        let plan = prepare_batch_plan(&fixture, "uncharted", &scopes, &FixtureTransport::archive());
+        let user_contents = b"user modification during batch failure".to_vec();
+        let failure = FailNthCommit {
+            nth: 2,
+            calls: AtomicUsize::new(0),
+            mutate_before_failure: Some((
+                fixture.project.join(".claude/skills/uncharted-ideation"),
+                user_contents.clone(),
+            )),
+        };
+        let error = execute_multi_install_with_faults(
+            &plan,
+            &scopes,
+            &fixture.store(),
+            &failure,
+            &NoReceiptFaults,
+            &NoJournalFaults,
+        )
+        .expect_err("modified successful target cannot be removed");
+        assert!(
+            error
+                .to_string()
+                .contains("partial batch requires inspection")
+        );
+        let modified_file = fixture
+            .project
+            .join(".claude/skills/uncharted-ideation/SKILL.md");
+        assert_eq!(fs::read(&modified_file).unwrap(), user_contents);
+
+        fixture
+            .store()
+            .recover_scope_with_faults(&scopes[0], &NoJournalFaults, &NoReceiptFaults)
+            .expect_err("restart recovery retries only receipt-verified compensation");
+        assert_eq!(fs::read(&modified_file).unwrap(), user_contents);
+        assert!(
+            fixture
+                .store()
+                .list()
+                .expect_err("partial batch still requires inspection")
+                .to_string()
+                .contains("recovery is required")
+        );
+    }
+
+    #[test]
+    fn receipt_publication_failure_is_compensated_and_crash_recovery_is_idempotent() {
+        let fixture = InstallFixture::new();
+        let scopes = batch_scopes(
+            &fixture,
+            &[
+                crate::agents::AgentId::ClaudeCode,
+                crate::agents::AgentId::Cursor,
+            ],
+            InstallScope::Project,
+            &fixture.project,
+        );
+        let plan = prepare_batch_plan(&fixture, "uncharted", &scopes, &FixtureTransport::archive());
+        let error = execute_multi_install_with_faults(
+            &plan,
+            &scopes,
+            &fixture.store(),
+            &NoInstallFaults,
+            &FailReceiptAt(ReceiptOperation::CreateTemporaryReceipt),
+            &NoJournalFaults,
+        )
+        .expect_err("receipt publication failure is not batch success");
+        assert!(error.to_string().contains("compensation succeeded"));
+        assert!(
+            !fixture
+                .project
+                .join(".claude/skills/uncharted-ideation")
+                .exists()
+        );
+        assert!(fixture.store().list().expect("no receipts").is_empty());
+
+        let crashed = InstallFixture::new();
+        let scopes = batch_scopes(
+            &crashed,
+            &[
+                crate::agents::AgentId::ClaudeCode,
+                crate::agents::AgentId::Cursor,
+            ],
+            InstallScope::Project,
+            &crashed.project,
+        );
+        let plan = prepare_batch_plan(&crashed, "uncharted", &scopes, &FixtureTransport::archive());
+        let installed_at = 1_800_000_000;
+        let record = plan
+            .initial_journal_record(installed_at)
+            .expect("versioned batch intent");
+        let receipt_intents = record.expected_receipts();
+        let store = crashed.store();
+        let mut reservation = store
+            .reserve(receipt_intents[0].clone(), &NoReceiptFaults)
+            .expect("shared writer reservation");
+        reservation
+            .validate_receipt_intents(&receipt_intents)
+            .expect("all target receipt intents");
+        let mut batch_journal = store
+            .batch_journal_store()
+            .expect("batch journal store")
+            .prepare(record)
+            .expect("durable batch journal before target commit");
+        batch_journal.begin_target(0).expect("target-start record");
+        let first = plan.targets()[0]
+            .session()
+            .commit_and_record_under_reservation_at_with_journal(
+                &mut reservation,
+                installed_at,
+                &NoInstallFaults,
+                &NoReceiptFaults,
+                &NoJournalFaults,
+                &[],
+            )
+            .expect("first target commits under batch lock");
+        assert_eq!(first.agent(), "claude-code");
+        reservation.release().expect("simulate process exit unlock");
+
+        let batch_files = fs::read_dir(crashed.data.join("batches"))
+            .expect("durable batch operation record")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .collect::<Vec<_>>();
+        assert!(!batch_files.is_empty());
+        let latest_batch_file = batch_files
+            .iter()
+            .max_by_key(|entry| entry.file_name())
+            .expect("latest batch record");
+        let json: serde_json::Value = serde_json::from_slice(
+            &fs::read(latest_batch_file.path()).expect("batch record bytes"),
+        )
+        .expect("batch record JSON");
+        assert_eq!(json["schemaVersion"], 1);
+        assert_eq!(json["targets"][0]["state"], "committing");
+
+        store
+            .recover_scope_with_faults(&scopes[0], &NoJournalFaults, &NoReceiptFaults)
+            .expect("crash between target commits is compensated");
+        store
+            .recover_scope_with_faults(&scopes[0], &NoJournalFaults, &NoReceiptFaults)
+            .expect("batch restart recovery is idempotent");
+        assert!(
+            !crashed
+                .project
+                .join(".claude/skills/uncharted-ideation")
+                .exists()
+        );
+        assert!(
+            !crashed
+                .project
+                .join(".cursor/skills/uncharted-ideation")
+                .exists()
+        );
+        assert!(
+            store
+                .list()
+                .expect("all batch receipts compensated")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .batch_journal_store()
+                .expect("batch store")
+                .pending_count()
+                .expect("batch record cleanup"),
+            0
+        );
+    }
+
+    #[test]
+    fn crash_after_removal_during_compensation_recovers_idempotently() {
+        let fixture = InstallFixture::new();
+        let scopes = batch_scopes(
+            &fixture,
+            &[
+                crate::agents::AgentId::ClaudeCode,
+                crate::agents::AgentId::Cursor,
+            ],
+            InstallScope::Project,
+            &fixture.project,
+        );
+        let plan = prepare_batch_plan(&fixture, "uncharted", &scopes, &FixtureTransport::archive());
+        let installed_at = 1_800_000_001;
+        let record = plan
+            .initial_journal_record(installed_at)
+            .expect("batch intent");
+        let receipt_intents = record.expected_receipts();
+        let store = fixture.store();
+        let mut reservation = store
+            .reserve(receipt_intents[0].clone(), &NoReceiptFaults)
+            .expect("batch writer lock");
+        reservation
+            .validate_receipt_intents(&receipt_intents)
+            .expect("all intents");
+        let batch_store = store.batch_journal_store().expect("batch store");
+        let mut journal = batch_store.prepare(record).expect("batch intent persisted");
+        journal.begin_target(0).expect("first target begins");
+        let receipt = plan.targets()[0]
+            .session()
+            .commit_and_record_under_reservation_at_with_journal(
+                &mut reservation,
+                installed_at,
+                &NoInstallFaults,
+                &NoReceiptFaults,
+                &NoJournalFaults,
+                &[],
+            )
+            .expect("first target committed");
+        journal
+            .mark_verified(0, receipt.clone())
+            .expect("batch target verification recorded");
+        journal
+            .begin_compensation_all()
+            .expect("compensation intent recorded before removal");
+        store
+            .compensate_batch_target(&reservation, &receipt)
+            .expect("receipt-backed compensation runs");
+        reservation.release().expect("simulate crash unlock");
+
+        fixture
+            .store()
+            .recover_scope_with_faults(&scopes[0], &NoJournalFaults, &NoReceiptFaults)
+            .expect("recovery observes removal already completed");
+        fixture
+            .store()
+            .recover_scope_with_faults(&scopes[0], &NoJournalFaults, &NoReceiptFaults)
+            .expect("second recovery is idempotent");
+        assert!(
+            !fixture
+                .project
+                .join(".claude/skills/uncharted-ideation")
+                .exists()
+        );
+        assert!(fixture.store().list().expect("receipts gone").is_empty());
+    }
+
+    #[test]
+    fn shared_writer_lock_contention_prevents_batch_preflight_or_commit() {
+        let fixture = InstallFixture::new();
+        let scopes = batch_scopes(
+            &fixture,
+            &[
+                crate::agents::AgentId::ClaudeCode,
+                crate::agents::AgentId::Cursor,
+            ],
+            InstallScope::Project,
+            &fixture.project,
+        );
+        let plan = prepare_batch_plan(&fixture, "uncharted", &scopes, &FixtureTransport::archive());
+        let record = plan.initial_journal_record(1_800_000_002).unwrap();
+        let intent = record.expected_receipts()[0].clone();
+        let reservation = fixture
+            .store()
+            .reserve(intent, &NoReceiptFaults)
+            .expect("external lifecycle holds shared lock");
+        let error = execute_multi_install(&plan, &scopes, &fixture.store())
+            .expect_err("batch cannot bypass the held writer lock");
+        assert!(error.to_string().contains("busy") || error.to_string().contains("locked"));
+        assert!(!fixture.project.join(".claude").exists());
+        assert!(!fixture.project.join(".cursor").exists());
+        reservation.release().expect("release test lock");
     }
 
     fn sha256_hex(value: &[u8]) -> String {

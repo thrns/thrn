@@ -1,3 +1,4 @@
+pub mod batch;
 pub(crate) mod check;
 pub mod command;
 pub(crate) mod commit;

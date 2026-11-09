@@ -18,7 +18,7 @@ use super::{
     destination::FileIdentity,
     journal::{
         JournalDirectory, JournalError, JournalFaultInjector, JournalRecord, JournalStore,
-        OperationState,
+        NoJournalFaults, OperationState,
     },
     receipt::{
         InstallationReceipt, MAX_RECEIPT_BYTES, MAX_RECEIPTS, ReceiptFile, ReceiptValidationError,
@@ -445,13 +445,14 @@ impl ReceiptStore {
         let directory = SecureDir::open_or_create_absolute(&self.directory)
             .map_err(|error| map_directory_error("create or inspect", error))?;
         let lock = WriterLock::acquire(directory.clone(), faults)?;
+        let journal_store = self.journal_store()?;
         let reservation = ReceiptReservation {
             directory,
             receipt,
             lock,
+            journal_store: journal_store.clone(),
             released: false,
         };
-        let journal_store = self.journal_store()?;
         let journal_records =
             journal_store
                 .read_all()
@@ -470,9 +471,19 @@ impl ReceiptStore {
             .map_err(|error| ReceiptStoreError::Journal {
                 detail: error.to_string(),
             })?;
-        if !journal_records.is_empty() || removal_count != 0 || update_count != 0 {
+        let batch_count = self
+            .batch_journal_store()?
+            .pending_count()
+            .map_err(|error| ReceiptStoreError::Journal {
+                detail: error.to_string(),
+            })?;
+        if !journal_records.is_empty()
+            || removal_count != 0
+            || update_count != 0
+            || batch_count != 0
+        {
             return Err(ReceiptStoreError::RecoveryRequired {
-                operation_count: journal_records.len() + removal_count + update_count,
+                operation_count: journal_records.len() + removal_count + update_count + batch_count,
             });
         }
         let existing = read_receipts(&reservation.directory, true);
@@ -513,6 +524,18 @@ impl ReceiptStore {
             .parent()
             .ok_or(ReceiptStoreError::UnsafeDirectory)?;
         Ok(UpdateJournalStore::new(data_directory.join("updates")))
+    }
+
+    pub(crate) fn batch_journal_store(
+        &self,
+    ) -> Result<super::batch::BatchJournalStore, ReceiptStoreError> {
+        let data_directory = self
+            .directory
+            .parent()
+            .ok_or(ReceiptStoreError::UnsafeDirectory)?;
+        Ok(super::batch::BatchJournalStore::new(
+            data_directory.join("batches"),
+        ))
     }
 
     /// Recover any prior lifecycle operation, then replace one still-matching immutable update
@@ -631,7 +654,13 @@ impl ReceiptStore {
             .map_err(|error| ReceiptStoreError::Journal {
                 detail: error.to_string(),
             })?;
-        let operation_count = install_count + removal_count + update_count;
+        let batch_count = self
+            .batch_journal_store()?
+            .pending_count()
+            .map_err(|error| ReceiptStoreError::Journal {
+                detail: error.to_string(),
+            })?;
+        let operation_count = install_count + removal_count + update_count + batch_count;
         if operation_count != 0 {
             return Err(ReceiptStoreError::RecoveryRequired { operation_count });
         }
@@ -651,12 +680,245 @@ impl ReceiptStore {
             .map_err(|error| ReceiptStoreError::Journal {
                 detail: error.to_string(),
             })?;
-        if removal_count != 0 || update_count != 0 {
+        let batch_count = self
+            .batch_journal_store()?
+            .pending_count()
+            .map_err(|error| ReceiptStoreError::Journal {
+                detail: error.to_string(),
+            })?;
+        if removal_count != 0 || update_count != 0 || batch_count != 0 {
             return Err(ReceiptStoreError::RecoveryRequired {
-                operation_count: removal_count + update_count,
+                operation_count: removal_count + update_count + batch_count,
             });
         }
         Ok(())
+    }
+
+    /// Recover one child lifecycle operation while a batch reservation already owns the shared
+    /// writer lock. This avoids recursively acquiring the non-reentrant OS lock.
+    pub(crate) fn recover_batch_children_under_reservation(
+        &self,
+        reservation: &ReceiptReservation,
+        expected_receipts: &[InstallationReceipt],
+    ) -> Result<(), RecoveryError> {
+        reservation.lock.validate().map_err(RecoveryError::Store)?;
+        let journal_store = reservation.journal_store().map_err(RecoveryError::Store)?;
+        let records = journal_store.read_all().map_err(RecoveryError::Journal)?;
+        let removal_store = self.removal_journal_store().map_err(RecoveryError::Store)?;
+        let update_store = self.update_journal_store().map_err(RecoveryError::Store)?;
+        let removal_records = removal_store
+            .read_all()
+            .map_err(|error| RecoveryError::Removal(error.to_string()))?;
+        let update_records = update_store
+            .read_all()
+            .map_err(|error| RecoveryError::Update(error.to_string()))?;
+        let belongs_to_batch = |receipt: &InstallationReceipt| {
+            expected_receipts.iter().any(|expected| {
+                receipt.agent() == expected.agent()
+                    && receipt.scope() == expected.scope()
+                    && receipt.root_path() == expected.root_path()
+                    && receipt.destination_path() == expected.destination_path()
+                    && (receipt == expected
+                        || expected.is_install_intent()
+                            && receipt
+                                .installed_directory_identity()
+                                .is_some_and(|identity| {
+                                    receipt.is_identity_upgrade_of(expected, identity)
+                                }))
+            })
+        };
+        if records
+            .iter()
+            .any(|record| !belongs_to_batch(record.receipt()))
+            || removal_records
+                .iter()
+                .any(|record| !belongs_to_batch(record.receipt()))
+            || update_records
+                .iter()
+                .any(|record| !belongs_to_batch(record.receipt()))
+        {
+            return Err(RecoveryError::ForeignOperation);
+        }
+        let removal_count = removal_records.len();
+        let update_count = update_records.len();
+        if (!records.is_empty() && (removal_count != 0 || update_count != 0))
+            || (removal_count != 0 && update_count != 0)
+        {
+            return Err(RecoveryError::LifecycleConflict);
+        }
+        for record in records {
+            reservation.lock.validate().map_err(RecoveryError::Store)?;
+            recover_operation(
+                &journal_store,
+                &record,
+                &reservation.directory,
+                &NoRecoveryInstallFaults,
+                &NoJournalFaults,
+                &NoReceiptFaults,
+            )?;
+        }
+        super::removal::recover_all(
+            &removal_store,
+            &reservation.directory,
+            &reservation.lock,
+            &NoRemovalFaults,
+        )
+        .map_err(|error| RecoveryError::Removal(error.to_string()))?;
+        super::update::recover_all(
+            &update_store,
+            &reservation.directory,
+            &reservation.lock,
+            &NoReceiptFaults,
+            &NoUpdateFaults,
+        )
+        .map_err(RecoveryError::Update)?;
+        Ok(())
+    }
+
+    /// Compensate only when the current durable receipt is the expected receipt (or its exact
+    /// installation-time identity upgrade) and the existing removal engine verifies the full
+    /// installed tree before quarantine.
+    pub(crate) fn compensate_batch_target(
+        &self,
+        reservation: &ReceiptReservation,
+        expected: &InstallationReceipt,
+    ) -> Result<bool, RemovalError> {
+        reservation
+            .lock
+            .validate()
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+        let receipts = read_receipts(&reservation.directory, true)
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+        validate_unique_destinations(&receipts)
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+        let expected_name = expected.receipt_filename().map_err(|error| {
+            RemovalError::Conflict(format!("invalid batch receipt identity: {error}"))
+        })?;
+        let current = receipts.iter().find(|(name, _)| name == &expected_name);
+        let Some((name, receipt)) = current else {
+            let agent = AgentId::from_identifier(expected.agent()).ok_or_else(|| {
+                RemovalError::Conflict("batch receipt names an unsupported agent".to_owned())
+            })?;
+            let root = expected.root_path();
+            let snapshot = super::destination::inspect_destination_for_agent(
+                agent,
+                Some(&root),
+                &root,
+                expected.skill_name(),
+            )
+            .map_err(|error| RemovalError::Conflict(error.to_string()))?;
+            if snapshot.skill_state() == super::destination::ComponentState::Missing
+                && snapshot.conflicts().is_empty()
+            {
+                return Ok(false);
+            }
+            return Err(RemovalError::Conflict(
+                "batch destination exists without its expected durable receipt; content is preserved for inspection".to_owned(),
+            ));
+        };
+        let matches_expected = receipt == expected;
+        let matches_intent = expected.is_install_intent()
+            && receipt
+                .installed_directory_identity()
+                .is_some_and(|identity| receipt.is_identity_upgrade_of(expected, identity));
+        if receipt.destination_path() != expected.destination_path()
+            || receipt.agent() != expected.agent()
+            || receipt.scope() != expected.scope()
+            || !(matches_expected || matches_intent)
+        {
+            return Err(RemovalError::Conflict(
+                "active receipt does not match the batch's expected target identity; content is preserved".to_owned(),
+            ));
+        }
+        let receipt_file = reservation
+            .directory
+            .open_regular_file(name)
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+        let receipt_file_identity = SecureDir::file_identity(&receipt_file)
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+        let directory_identity = reservation
+            .directory
+            .identity()
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+        let plan = RemovalPlan::verify(
+            receipt.clone(),
+            name.clone(),
+            directory_identity,
+            receipt_file_identity,
+        )?;
+        let removal_store = self
+            .removal_journal_store()
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+        super::removal::remove_plan(
+            &plan,
+            &removal_store,
+            reservation.directory.clone(),
+            &reservation.lock,
+            &NoRemovalFaults,
+        )?;
+        Ok(true)
+    }
+
+    pub(crate) fn inspect_batch_target_receipt(
+        &self,
+        reservation: &ReceiptReservation,
+        expected: &InstallationReceipt,
+    ) -> Result<Option<InstallationReceipt>, RemovalError> {
+        reservation
+            .lock
+            .validate()
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+        let receipts = read_receipts(&reservation.directory, true)
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+        validate_unique_destinations(&receipts)
+            .map_err(|error| RemovalError::Store(error.to_string()))?;
+        let expected_name = expected.receipt_filename().map_err(|error| {
+            RemovalError::Conflict(format!("invalid batch receipt identity: {error}"))
+        })?;
+        let Some((_, receipt)) = receipts.iter().find(|(name, _)| name == &expected_name) else {
+            let agent = AgentId::from_identifier(expected.agent()).ok_or_else(|| {
+                RemovalError::Conflict("batch receipt names an unsupported agent".to_owned())
+            })?;
+            let root = expected.root_path();
+            let snapshot = super::destination::inspect_destination_for_agent(
+                agent,
+                Some(&root),
+                &root,
+                expected.skill_name(),
+            )
+            .map_err(|error| RemovalError::Conflict(error.to_string()))?;
+            if snapshot.skill_state() == super::destination::ComponentState::Missing
+                && snapshot.conflicts().is_empty()
+            {
+                return Ok(None);
+            }
+            return Err(RemovalError::Conflict(
+                "batch destination exists without its expected durable receipt; content is preserved for inspection".to_owned(),
+            ));
+        };
+        let matches_intent = expected.is_install_intent()
+            && receipt
+                .installed_directory_identity()
+                .is_some_and(|identity| receipt.is_identity_upgrade_of(expected, identity));
+        if receipt.destination_path() != expected.destination_path()
+            || receipt.agent() != expected.agent()
+            || receipt.scope() != expected.scope()
+            || (receipt != expected && !matches_intent)
+        {
+            return Err(RemovalError::Conflict(
+                "active receipt does not match the batch's expected target identity; content is preserved".to_owned(),
+            ));
+        }
+        if verify_receipt_tree(receipt, receipt.installed_directory_identity())
+            .map_err(|error| RemovalError::Conflict(error.to_string()))?
+            != ReceiptContentState::Verified
+        {
+            return Err(RemovalError::Conflict(
+                "batch-owned receipt content is missing or modified; content is preserved"
+                    .to_owned(),
+            ));
+        }
+        Ok(Some(receipt.clone()))
     }
 
     /// Internal startup/retry API. Recovery and installation share the same OS-backed writer lock.
@@ -710,6 +972,43 @@ impl ReceiptStore {
             WriterLock::acquire(directory.clone(), receipt_faults).map_err(RecoveryError::Store)?;
         lock.validate().map_err(RecoveryError::Store)?;
         let journal_store = self.journal_store().map_err(RecoveryError::Store)?;
+        let batch_store = self.batch_journal_store().map_err(RecoveryError::Store)?;
+        let batch_records = batch_store
+            .read_all()
+            .map_err(|error| RecoveryError::Batch(error.to_string()))?;
+        if !batch_records.is_empty() {
+            if batch_records.len() != 1 {
+                return Err(RecoveryError::LifecycleConflict);
+            }
+            let batch_record = &batch_records[0];
+            if selected_scope.is_some_and(|scope| !batch_record.contains_scope(scope)) {
+                return Err(RecoveryError::ForeignOperation);
+            }
+            let receipt = batch_record
+                .expected_receipts()
+                .into_iter()
+                .next()
+                .ok_or(RecoveryError::LifecycleConflict)?;
+            let mut reservation = ReceiptReservation {
+                directory,
+                receipt,
+                lock,
+                journal_store,
+                released: false,
+            };
+            let result = super::batch::recover_all(self, &mut reservation, batch_records)
+                .map_err(RecoveryError::Batch);
+            return match result {
+                Ok(()) => {
+                    reservation.release().map_err(RecoveryError::Store)?;
+                    Ok(Vec::new())
+                }
+                Err(error) => {
+                    let _ = reservation.release();
+                    Err(error)
+                }
+            };
+        }
         let result = (|| {
             let records = journal_store.read_all().map_err(RecoveryError::Journal)?;
             let removal_store = self.removal_journal_store().map_err(RecoveryError::Store)?;
@@ -964,10 +1263,84 @@ pub(crate) struct ReceiptReservation {
     directory: SecureDir,
     receipt: InstallationReceipt,
     lock: WriterLock,
+    journal_store: JournalStore,
     released: bool,
 }
 
 impl ReceiptReservation {
+    pub(crate) fn receipt_intent(&self) -> &InstallationReceipt {
+        &self.receipt
+    }
+
+    pub(crate) fn journal_store(&self) -> Result<JournalStore, ReceiptStoreError> {
+        Ok(self.journal_store.clone())
+    }
+
+    pub(crate) fn validate_receipt_intents(
+        &self,
+        receipts: &[InstallationReceipt],
+    ) -> Result<(), ReceiptStoreError> {
+        self.lock.validate()?;
+        let mut claims = read_receipts(&self.directory, true)?;
+        for receipt in receipts {
+            receipt
+                .validate_install_intent()
+                .map_err(|source| validation_error("pending receipt", source))?;
+            validate_new_claim(receipt, &claims)?;
+            claims.push((
+                receipt
+                    .receipt_filename()
+                    .map_err(|source| validation_error("pending receipt", source))?,
+                receipt.clone(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn verify_published_receipt(
+        &self,
+        expected: &InstallationReceipt,
+    ) -> Result<(), ReceiptStoreError> {
+        self.lock.validate()?;
+        let name = expected
+            .receipt_filename()
+            .map_err(|source| validation_error("published receipt", source))?;
+        let published = read_receipt_file(&self.directory, &name)?;
+        if &published != expected {
+            return Err(ReceiptStoreError::TemporaryReceiptMismatch);
+        }
+        match verify_receipt_tree(&published, published.installed_directory_identity())? {
+            ReceiptContentState::Verified => {}
+            ReceiptContentState::Missing => return Err(ReceiptStoreError::CommittedContentMissing),
+            ReceiptContentState::Modified => {
+                return Err(ReceiptStoreError::CommittedContentModified);
+            }
+        }
+        let receipts = read_receipts(&self.directory, true)?;
+        if !receipts
+            .iter()
+            .any(|(existing_name, receipt)| existing_name == &name && receipt == &published)
+        {
+            return Err(ReceiptStoreError::SnapshotChanged);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_receipt_intent(
+        &mut self,
+        receipt: InstallationReceipt,
+        _faults: &dyn ReceiptFaultInjector,
+    ) -> Result<(), ReceiptStoreError> {
+        receipt
+            .validate_install_intent()
+            .map_err(|source| validation_error("pending receipt", source))?;
+        self.lock.validate()?;
+        let existing = read_receipts(&self.directory, true)?;
+        validate_new_claim(&receipt, &existing)?;
+        self.receipt = receipt;
+        Ok(())
+    }
+
     pub(crate) fn release(mut self) -> Result<(), ReceiptStoreError> {
         self.release_inner()
     }
@@ -3062,6 +3435,8 @@ pub(crate) enum RecoveryError {
     Removal(String),
     #[error("update recovery is incomplete or conflicted: {0}")]
     Update(String),
+    #[error("batch recovery is incomplete or conflicted: {0}")]
+    Batch(String),
     #[error(
         "installation, removal, and update journals conflict; preserve them for manual recovery"
     )]

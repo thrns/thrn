@@ -1,6 +1,6 @@
 # CLI contract
 
-This page describes the executable that exists today. The CLI supports offline catalog discovery, installed-resource listing and update checking, explicit catalog refresh, local skill validation, `doctor`, and receipt-backed Codex, Claude Code, Cursor, and Gemini CLI project/user installation, check, update, and removal. Agent selection is explicit; there is no automatic selection, multi-agent targeting, completions, JSON output, or noninteractive mode. Read-only host capability inspection can identify CLI executables on `PATH`; it does not infer installation targets or prove that an agent loads a particular destination.
+This page describes the executable that exists today. The CLI supports offline catalog discovery, installed-resource listing and update checking, explicit catalog refresh, local skill validation, `doctor`, receipt-backed Codex, Claude Code, Cursor, and Gemini CLI project/user installation, check, update, and removal, plus recoverable multi-agent installation. Agent selection is explicit; there is no automatic selection, multi-agent update/removal, completions, or JSON output. Read-only host capability inspection can identify CLI executables on `PATH`; it does not infer installation targets or prove that an agent loads a particular destination.
 
 ## Available commands
 
@@ -21,6 +21,9 @@ This page describes the executable that exists today. The CLI supports offline c
 | `thrn skills install <id> --agent codex --project <path>` | Install into the selected existing project directory instead of the current directory. |
 | `thrn skills install <id> --agent codex --project <path> --dry-run` | Print a read-only plan for the selected existing project directory. |
 | `thrn skills install <id> --agent codex --scope user [--dry-run]` | Install under `<home>/.agents/skills/<skillName>` only when user scope is explicitly selected. |
+| `thrn skills install <id> --agent codex --agent claude-code` | Install one catalog resource into both explicitly selected targets in order under a recoverable batch journal. |
+| `thrn skills install <id> --agent cursor --agent gemini --scope user --dry-run` | Inspect the complete user-scope batch, including destinations, counts, conflicts, shared-path state, and the target-conflict matrix. |
+| `thrn skills install <id> --agent cursor --agent gemini --no-input` | Run with explicit targets and no prompting. Missing targets fail with a usage error. |
 | `thrn skills remove <canonical-id> --agent codex` | Remove one fully verified receipt-backed project skill by default. Does not use the catalog or network. |
 | `thrn skills remove <canonical-id> --agent codex --project <path>` | Remove one fully verified receipt-backed skill from the selected existing project. |
 | `thrn skills remove <canonical-id> --agent codex --dry-run` | Print the exact verified destination, receipt-listed files, counts, and bytes without changing the project or receipt store. |
@@ -175,6 +178,9 @@ thrn skills install frontend-design --agent codex
 thrn skills install frontend-design --agent codex --project ./my-project
 thrn skills install frontend-design --agent codex --scope user --dry-run
 thrn skills install frontend-design --agent codex --scope user
+thrn skills install uncharted --agent codex --agent claude-code
+thrn skills install uncharted --agent cursor --agent gemini --scope user --dry-run
+thrn skills install uncharted --agent cursor --agent gemini --no-input
 ```
 
 The catalog is loaded with `CatalogService` from the newest validated local cache or bundled
@@ -183,26 +189,42 @@ then fetches the resource's full pinned GitHub commit, validates the archive and
 and stages its files privately. Both dry-run and installation can contact GitHub and download the
 pinned archive. Installation does not automatically refresh the catalog.
 
-`--agent codex`, `--agent claude-code`, `--agent cursor`, or `--agent gemini` is required. Project scope is the default and uses the current directory unless
+At least one explicit `--agent codex`, `--agent claude-code`, `--agent cursor`, or `--agent gemini` is required. Repeat `--agent` to select an ordered multi-agent batch. Project scope is the default and uses the current directory unless
 `--project` selects another existing project. Explicit `--scope user` selects the validated OS
-home and cannot be combined with `--project`. Destinations are respectively
+home and cannot be combined with `--project`. One command cannot mix project and user scopes. Destinations are respectively
 `<project-root>/.agents/skills/<validated-skillName>` and
 `<home>/.agents/skills/<validated-skillName>` for Codex, or `<project-root>/.claude/skills/` and
 `<home>/.claude/skills/` for Claude Code. Catalog IDs and aliases are resolved through
 validated metadata and are never used as the destination folder name.
 
-Dry-run output shows the resource, skill name, pinned repository and revision, agent, scope, selected
+Single-agent dry-run output shows the resource, skill name, pinned repository and revision, agent, scope, selected
 scope root, destination, directories, every regular file and its size, and total counts. It creates
 no target files or receipt. Project output retains its existing labels.
 
-Without `--dry-run`, the command keeps the same validated staged content and immutable plan alive
-through the M2-06 recovery-aware `commit_and_record` operation. The engine revalidates the
+Multi-agent dry-run shows the canonical resource ID, scope, full pinned revision, ordered agents,
+the deterministic target-conflict matrix, each exact destination and file/byte totals, existing
+managed or unmanaged conflicts, shared-path collisions, and whether the full batch can proceed.
+It may fetch and stage the pinned source but does not create or change project files, receipts,
+journals, or configuration. Codex cannot be batched with Cursor or Gemini when their shared
+`.agents/skills` discovery would conflict. `--no-input` never prompts or selects a default; explicit
+valid agents can proceed, while missing, duplicate, or unsupported selections fail closed.
+
+Without `--dry-run`, a single-target command keeps its validated staged content and immutable plan alive
+through the recovery-aware `commit_and_record` operation. A batch resolves, fetches, validates, and
+stages its pinned source once, and creates one immutable destination plan and receipt identity per
+target. The coordinator validates all targets, writes a versioned batch intent before the first
+project mutation, and holds one shared writer lock through each target commit and receipt verification.
+The existing target engine revalidates the
 destination, rejects conflicts, commits without replacement, captures the committed directory
 identity through the secure handle layer, persists it in the install journal and strict scope-bound
 receipt, verifies installed hashes, records journal completion, and returns a verified receipt. Only
-then does the CLI print `Installed THRN skill`, the canonical resource ID, installed skill name,
+then does the single-target CLI print `Installed THRN skill`, the canonical resource ID, installed skill name,
 the selected agent and scope, exact destination, pinned source revision, file and byte counts from that receipt, and
-`Ownership receipt: recorded`.
+`Ownership receipt: recorded`. Multi-agent success is printed only after every target receipt and
+tree verifies. If a target fails, THRN stops starting targets and attempts reverse-order
+receipt-backed compensation through the existing removal engine. Mismatched or modified content is
+preserved with a partial batch journal requiring inspection. A committed target may be visible
+before later targets finish; the batch is recoverable but is not cross-target atomic.
 
 Agent selection is explicit. User scope is never inferred and no home write occurs before
 `--scope user` is selected. The user home must exist as a safe real directory; THRN does not
@@ -314,4 +336,4 @@ Default `skills list`, `skills search`, and `skills info` are offline. They try 
 
 `thrn skills search --refresh [query]` is the catalog-refresh network path. It fetches only `https://raw.githubusercontent.com/thrns/thrn/main/src/registry/builtin-v1.json`. The request requires HTTPS certificate verification, follows no redirects, uses connection/body/overall timeouts, and reads no more than 1 MiB. The response must be UTF-8 and pass the catalog schema validator before it is persisted. A failed request, response validation, or cache commit exits nonzero on stderr. A failed commit leaves the earlier cache intact. The refresh command never fetches skill directories or executes catalog or skill content. `skills install --dry-run` separately fetches only the selected resource's pinned GitHub archive through the M2-02 source pipeline.
 
-The endpoint is curated and operated by THRN. HTTPS protects the connection to that endpoint; neither the endpoint, catalog inclusion, nor a full Git commit SHA proves the identity or safety of an individual skill publisher. Process-level CLI tests use temporary cache roots and injected environment, and catalog service tests use fake transports, clocks, and cache directories. No test contacts the public endpoint or reads a real user cache. When a future command supports `--no-input`, tests must verify that ambiguous choices fail with an actionable error rather than selecting a target implicitly.
+The endpoint is curated and operated by THRN. HTTPS protects the connection to that endpoint; neither the endpoint, catalog inclusion, nor a full Git commit SHA proves the identity or safety of an individual skill publisher. Process-level CLI tests use temporary cache roots and injected environment, and catalog service tests use fake transports, clocks, and cache directories. No test contacts the public endpoint or reads a real user cache. `--no-input` requires explicit install targets and fails with a usage error when they are missing or ambiguous.

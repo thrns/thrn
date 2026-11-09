@@ -6,6 +6,7 @@ use std::{
     fs,
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
+    sync::Arc,
 };
 
 use ring::{
@@ -19,8 +20,8 @@ use crate::sources::staging::StagedSkill;
 
 use super::{
     destination::{
-        ComponentState, DestinationSnapshot, FileIdentity, ObjectKind,
-        inspect_destination_for_agent,
+        ComponentState, DestinationFileSystem, DestinationSnapshot, FileIdentity, ObjectKind,
+        RealDestinationFileSystem, inspect_destination_for_agent,
     },
     inventory::{StagedInventory, inspect_staged_skill},
     journal::{
@@ -35,13 +36,25 @@ const TEMP_NAME_ATTEMPTS: usize = 32;
 
 /// Owns the validated source for as long as a plan can be committed.
 pub(crate) struct InstallationSession {
-    staged: StagedSkill,
+    staged: Arc<StagedSkill>,
     inventory: StagedInventory,
     plan: InstallPlan,
 }
 
 impl InstallationSession {
     pub(crate) fn new(staged: StagedSkill, inventory: StagedInventory, plan: InstallPlan) -> Self {
+        Self {
+            staged: Arc::new(staged),
+            inventory,
+            plan,
+        }
+    }
+
+    pub(crate) fn new_shared(
+        staged: Arc<StagedSkill>,
+        inventory: StagedInventory,
+        plan: InstallPlan,
+    ) -> Self {
         Self {
             staged,
             inventory,
@@ -117,13 +130,61 @@ impl InstallationSession {
         store
             .recover_scope_with_faults(&resolved_scope, journal_faults, receipt_faults)
             .map_err(InstallationCompletionError::Recovery)?;
-        let journal_receipt = receipt.clone();
         let mut reservation = store
             .reserve(receipt, receipt_faults)
             .map_err(InstallationCompletionError::ReceiptPreflight)?;
+        let published = self.commit_and_record_under_reservation_at_with_journal(
+            &mut reservation,
+            installed_at_unix_seconds,
+            commit_faults,
+            receipt_faults,
+            journal_faults,
+            &[],
+        )?;
+        reservation
+            .release()
+            .map_err(InstallationCompletionError::ReceiptAfterCommit)?;
+        Ok(published)
+    }
+
+    /// Complete one target while reusing a caller-owned writer reservation. Multi-target
+    /// coordination holds this reservation across target commits to prevent another THRN
+    /// lifecycle operation from changing receipt or journal assumptions between them.
+    pub(crate) fn commit_and_record_under_reservation_at_with_journal(
+        &self,
+        reservation: &mut super::receipt_store::ReceiptReservation,
+        installed_at_unix_seconds: u64,
+        commit_faults: &dyn InstallFaultInjector,
+        receipt_faults: &dyn super::receipt_store::ReceiptFaultInjector,
+        journal_faults: &dyn JournalFaultInjector,
+        allowed_batch_directories: &[(String, FileIdentity)],
+    ) -> Result<super::receipt::InstallationReceipt, InstallationCompletionError> {
+        validate_shared_path_snapshot(&self.plan).map_err(InstallationCompletionError::Commit)?;
+        let project_identity = self
+            .plan
+            .destination_snapshot()
+            .project_identity()
+            .ok_or(InstallationCompletionError::InvalidProjectIdentity)?;
+        let receipt = super::receipt::InstallationReceipt::from_committed_plan(
+            &self.plan,
+            &self.inventory,
+            project_identity,
+            installed_at_unix_seconds,
+        )
+        .map_err(|source| {
+            InstallationCompletionError::ReceiptPreflight(
+                super::receipt_store::ReceiptStoreError::Validation {
+                    name: "pending receipt".to_owned(),
+                    source,
+                },
+            )
+        })?;
+        reservation
+            .set_receipt_intent(receipt, receipt_faults)
+            .map_err(InstallationCompletionError::ReceiptPreflight)?;
         let staging_name = new_staging_name()
             .map_err(|error| InstallationCompletionError::JournalPrepareIo(error.kind()))?;
-        let journal_store = store
+        let journal_store = reservation
             .journal_store()
             .map_err(InstallationCompletionError::ReceiptPreflight)?;
         let create_agents_directory =
@@ -133,7 +194,7 @@ impl InstallationSession {
         let mut journal = journal_store
             .prepare(
                 super::journal::JournalIntent {
-                    receipt: journal_receipt,
+                    receipt: reservation.receipt_intent().clone(),
                     staging_name,
                     create_agents_directory,
                     create_skills_directory,
@@ -146,11 +207,16 @@ impl InstallationSession {
         journal
             .transition(OperationState::FilesystemCommitInProgress, journal_faults)
             .map_err(InstallationCompletionError::JournalBeforeCommit)?;
-        let committed =
-            match commit_session_journaled(self, commit_faults, &mut journal, journal_faults) {
-                Ok(committed) => committed,
-                Err(commit_error) => return Err(InstallationCompletionError::Commit(commit_error)),
-            };
+        let committed = match commit_session_journaled(
+            self,
+            commit_faults,
+            &mut journal,
+            journal_faults,
+            allowed_batch_directories,
+        ) {
+            Ok(committed) => committed,
+            Err(commit_error) => return Err(InstallationCompletionError::Commit(commit_error)),
+        };
         journal
             .set_destination_identity(committed.destination_identity(), journal_faults)
             .map_err(InstallationCompletionError::JournalAfterDirectoryCommit)?;
@@ -173,9 +239,6 @@ impl InstallationSession {
         journal_store
             .cleanup_completed(&operation_id, journal_faults)
             .map_err(InstallationCompletionError::JournalAfterReceipt)?;
-        reservation
-            .release()
-            .map_err(InstallationCompletionError::ReceiptAfterCommit)?;
         Ok(published)
     }
 
@@ -321,7 +384,7 @@ fn commit_session(
     session: &InstallationSession,
     faults: &dyn InstallFaultInjector,
 ) -> Result<CommittedInstallation, CommitError> {
-    commit_session_inner(session, faults, None)
+    commit_session_inner(session, faults, None, &[])
 }
 
 fn commit_session_journaled(
@@ -329,6 +392,7 @@ fn commit_session_journaled(
     faults: &dyn InstallFaultInjector,
     journal: &mut OperationJournal,
     journal_faults: &dyn JournalFaultInjector,
+    allowed_batch_directories: &[(String, FileIdentity)],
 ) -> Result<CommittedInstallation, CommitError> {
     commit_session_inner(
         session,
@@ -337,6 +401,7 @@ fn commit_session_journaled(
             journal,
             faults: journal_faults,
         }),
+        allowed_batch_directories,
     )
 }
 
@@ -344,6 +409,7 @@ fn commit_session_inner(
     session: &InstallationSession,
     faults: &dyn InstallFaultInjector,
     mut journal: Option<CommitJournal<'_>>,
+    allowed_batch_directories: &[(String, FileIdentity)],
 ) -> Result<CommittedInstallation, CommitError> {
     validate_session_identity(session)?;
     if !session.plan.conflicts().is_empty() {
@@ -371,7 +437,7 @@ fn commit_session_inner(
         session.plan.skill_name().as_str(),
     )
     .map_err(|_| CommitError::DestinationChanged)?;
-    if &current != snapshot {
+    if !destination_snapshot_matches_batch_changes(snapshot, &current, allowed_batch_directories) {
         return Err(if current.conflicts().is_empty() {
             CommitError::DestinationChanged
         } else {
@@ -542,6 +608,7 @@ fn commit_session_inner(
         created_agents,
         created_skills,
         None,
+        allowed_batch_directories,
     ) || latest.project_identity() != Some(root_identity)
         || latest.agents_identity() != Some(agents_identity)
         || latest.skills_identity() != Some(skills_identity)
@@ -661,6 +728,7 @@ fn commit_session_inner(
         created_agents,
         created_skills,
         Some(&temp.name),
+        allowed_batch_directories,
     ) || latest.project_identity() != Some(root_identity)
         || latest.agents_identity() != Some(agents_identity)
         || latest.skills_identity() != Some(skills_identity)
@@ -852,6 +920,88 @@ pub(crate) fn validate_shared_path_snapshot(plan: &InstallPlan) -> Result<(), Co
     Ok(())
 }
 
+/// Revalidate the no-follow source and destination snapshots for a complete batch before its
+/// first project write. Each individual commit repeats these checks at its own commit boundary.
+pub(crate) fn validate_install_session_preflight(
+    session: &InstallationSession,
+) -> Result<(), CommitError> {
+    validate_install_session_preflight_with_batch_directories(session, &[])
+}
+
+pub(crate) fn validate_install_session_preflight_with_batch_directories(
+    session: &InstallationSession,
+    allowed_batch_directories: &[(String, FileIdentity)],
+) -> Result<(), CommitError> {
+    validate_session_identity(session)?;
+    if !session.plan.conflicts().is_empty() {
+        return Err(CommitError::DestinationConflict);
+    }
+    let inventory =
+        inspect_staged_skill(&session.staged).map_err(|_| CommitError::SourceChanged)?;
+    if inventory != session.inventory {
+        return Err(CommitError::SourceChanged);
+    }
+    validate_shared_path_snapshot(&session.plan)?;
+    let snapshot = session.plan.destination_snapshot();
+    let current = inspect_destination_for_agent(
+        session.plan.agent(),
+        Some(session.plan.scope_root()),
+        session.plan.scope_root(),
+        session.plan.skill_name().as_str(),
+    )
+    .map_err(|_| CommitError::DestinationChanged)?;
+    if !destination_snapshot_matches_batch_changes(snapshot, &current, allowed_batch_directories) {
+        return Err(if current.conflicts().is_empty() {
+            CommitError::DestinationChanged
+        } else {
+            CommitError::DestinationConflict
+        });
+    }
+    let project = SecureDir::open_absolute(session.plan.scope_root())
+        .map_err(|_| CommitError::DestinationChanged)?;
+    ensure_identity(&project, snapshot.project_identity())
+}
+
+fn destination_snapshot_matches_batch_changes(
+    expected: &DestinationSnapshot,
+    current: &DestinationSnapshot,
+    allowed_batch_directories: &[(String, FileIdentity)],
+) -> bool {
+    if allowed_batch_directories.is_empty() {
+        return expected == current;
+    }
+    if !expected.same_destination_state_except_project_entries(current) {
+        return false;
+    }
+    let mut filtered_current = current.existing_project_entries().to_vec();
+    for (name, identity) in allowed_batch_directories {
+        if expected
+            .existing_project_entries()
+            .iter()
+            .any(|entry| entry.name().to_string_lossy().eq_ignore_ascii_case(name))
+        {
+            return false;
+        }
+        let mut matching = current
+            .existing_project_entries()
+            .iter()
+            .filter(|entry| entry.name() == std::ffi::OsStr::new(name));
+        let Some(entry) = matching.next() else {
+            return false;
+        };
+        if matching.next().is_some() || entry.kind() != ObjectKind::Directory {
+            return false;
+        }
+        let path = expected.project_root().join(name);
+        let file_system = RealDestinationFileSystem;
+        if file_system.object_identity(&path).ok().flatten() != Some(*identity) {
+            return false;
+        }
+        filtered_current.retain(|candidate| candidate.name() != std::ffi::OsStr::new(name));
+    }
+    filtered_current == expected.existing_project_entries()
+}
+
 fn operation_error(
     operation: InstallOperation,
     error: io::Error,
@@ -980,6 +1130,7 @@ fn snapshot_matches_after_parent_creation(
     created_agents: bool,
     created_skills: bool,
     temp_name: Option<&str>,
+    allowed_batch_directories: &[(String, FileIdentity)],
 ) -> bool {
     if planned.project_root() != current.project_root()
         || planned.project_identity() != current.project_identity()
@@ -989,6 +1140,34 @@ fn snapshot_matches_after_parent_creation(
         return false;
     }
     let mut expected_project_entries = planned.existing_project_entries().to_vec();
+    for (name, identity) in allowed_batch_directories {
+        if planned
+            .existing_project_entries()
+            .iter()
+            .any(|entry| entry.name().to_string_lossy().eq_ignore_ascii_case(name))
+        {
+            return false;
+        }
+        let mut matching = current
+            .existing_project_entries()
+            .iter()
+            .filter(|entry| entry.name() == std::ffi::OsStr::new(name));
+        let Some(entry) = matching.next() else {
+            return false;
+        };
+        if matching.next().is_some() || entry.kind() != ObjectKind::Directory {
+            return false;
+        }
+        let path = planned.project_root().join(name);
+        let file_system = RealDestinationFileSystem;
+        if file_system.object_identity(&path).ok().flatten() != Some(*identity) {
+            return false;
+        }
+        expected_project_entries.push(super::destination::DirectoryEntrySnapshot::new(
+            name.into(),
+            ObjectKind::Directory,
+        ));
+    }
     if created_agents {
         expected_project_entries.push(super::destination::DirectoryEntrySnapshot::new(
             planned.agent_directory().into(),
