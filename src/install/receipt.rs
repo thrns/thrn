@@ -22,6 +22,7 @@ pub(crate) const LEGACY_SCHEMA_VERSION: u64 = 1;
 pub(crate) const SCHEMA_VERSION: u64 = 2;
 pub(crate) const USER_SCHEMA_VERSION: u64 = 3;
 pub(crate) const CLAUDE_SCHEMA_VERSION: u64 = 4;
+pub(crate) const ADAPTER_SCHEMA_VERSION: u64 = 5;
 pub(crate) const MAX_RECEIPT_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_RECEIPTS: usize = 4_096;
 pub(crate) const MAX_RECEIPT_PATH_BYTES: usize = 32_768;
@@ -137,8 +138,11 @@ impl InstallationReceipt {
 
         let user_scope = plan.scope() == super::plan::InstallScope::User;
         let claude = plan.agent() == AgentId::ClaudeCode;
+        let cursor_or_gemini = matches!(plan.agent(), AgentId::Cursor | AgentId::Gemini);
         let mut receipt = Self {
-            schema_version: if claude {
+            schema_version: if cursor_or_gemini {
+                ADAPTER_SCHEMA_VERSION
+            } else if claude {
                 CLAUDE_SCHEMA_VERSION
             } else if user_scope {
                 USER_SCHEMA_VERSION
@@ -177,9 +181,10 @@ impl InstallationReceipt {
                 volume: project_identity.volume(),
                 object: project_identity.object(),
             }),
-            destination_layout: claude.then(|| plan.agent().adapter().layout_id().to_owned()),
+            destination_layout: (claude || cursor_or_gemini)
+                .then(|| plan.agent().adapter().layout_id().to_owned()),
         };
-        if claude || user_scope {
+        if claude || cursor_or_gemini || user_scope {
             receipt.content_digest = receipt.calculated_install_intent_digest()?;
             receipt.validate_install_intent()?;
         } else {
@@ -234,7 +239,11 @@ impl InstallationReceipt {
     fn validate_inner(&self, allow_user_intent: bool) -> Result<(), ReceiptValidationError> {
         if !matches!(
             self.schema_version,
-            LEGACY_SCHEMA_VERSION | SCHEMA_VERSION | USER_SCHEMA_VERSION | CLAUDE_SCHEMA_VERSION
+            LEGACY_SCHEMA_VERSION
+                | SCHEMA_VERSION
+                | USER_SCHEMA_VERSION
+                | CLAUDE_SCHEMA_VERSION
+                | ADAPTER_SCHEMA_VERSION
         ) {
             return Err(ReceiptValidationError::UnsupportedSchema(
                 self.schema_version,
@@ -260,13 +269,19 @@ impl InstallationReceipt {
             && self.destination_layout.as_deref()
                 == Some(AgentId::ClaudeCode.adapter().layout_id())
             && (project_paths || user_paths);
-        let shape_valid = codex_shape || claude_shape;
+        let adapter_shape = matches!(self.agent.as_str(), "cursor" | "gemini")
+            && self.schema_version == ADAPTER_SCHEMA_VERSION
+            && self.destination_layout.as_deref()
+                == AgentId::from_identifier(&self.agent).map(|agent| agent.adapter().layout_id())
+            && (project_paths || user_paths);
+        let shape_valid = codex_shape || claude_shape || adapter_shape;
         let install_intent = allow_user_intent
             && shape_valid
             && self.installed_directory_identity.is_none()
             && (self.schema_version == LEGACY_SCHEMA_VERSION
                 || self.schema_version == USER_SCHEMA_VERSION
-                || self.schema_version == CLAUDE_SCHEMA_VERSION);
+                || self.schema_version == CLAUDE_SCHEMA_VERSION
+                || self.schema_version == ADAPTER_SCHEMA_VERSION);
         if !shape_valid
             || (self.schema_version == LEGACY_SCHEMA_VERSION
                 && self.installed_directory_identity.is_some())
@@ -274,7 +289,7 @@ impl InstallationReceipt {
                 && self.installed_directory_identity.is_none())
             || (matches!(
                 self.schema_version,
-                USER_SCHEMA_VERSION | CLAUDE_SCHEMA_VERSION
+                USER_SCHEMA_VERSION | CLAUDE_SCHEMA_VERSION | ADAPTER_SCHEMA_VERSION
             ) && self.installed_directory_identity.is_none()
                 && !install_intent)
         {
@@ -286,8 +301,10 @@ impl InstallationReceipt {
             .map_err(|_| ReceiptValidationError::InvalidMetadata)?;
         let agent = if self.agent == AgentId::Codex.as_str() {
             AgentId::Codex
-        } else {
+        } else if self.agent == AgentId::ClaudeCode.as_str() {
             AgentId::ClaudeCode
+        } else {
+            AgentId::from_identifier(&self.agent).ok_or(ReceiptValidationError::InvalidMetadata)?
         };
         if agent.adapter().rejects_skill_name(skill_name.as_str()) {
             return Err(ReceiptValidationError::InvalidMetadata);
@@ -415,7 +432,9 @@ impl InstallationReceipt {
         let digest = digest
             .strip_prefix("sha256:")
             .ok_or(ReceiptValidationError::IdentityDigest)?;
-        let version = if self.schema_version == CLAUDE_SCHEMA_VERSION {
+        let version = if self.schema_version == ADAPTER_SCHEMA_VERSION {
+            "v5"
+        } else if self.schema_version == CLAUDE_SCHEMA_VERSION {
             "v4"
         } else if self.schema_version == USER_SCHEMA_VERSION {
             "v2"
@@ -450,11 +469,10 @@ impl InstallationReceipt {
     }
 
     pub(crate) fn agent_directory(&self) -> &'static str {
-        if self.agent == AgentId::ClaudeCode.as_str() {
-            AgentId::ClaudeCode.adapter().skill_directory()
-        } else {
-            AgentId::Codex.adapter().skill_directory()
-        }
+        AgentId::from_identifier(&self.agent)
+            .unwrap_or(AgentId::Codex)
+            .adapter()
+            .skill_directory()
     }
 
     /// Upgrade an install intent with the identity captured from the committed destination
@@ -468,7 +486,8 @@ impl InstallationReceipt {
             && self.installed_directory_identity.is_none();
         let complete_intent = self.installed_directory_identity.is_none()
             && (self.schema_version == USER_SCHEMA_VERSION
-                || self.schema_version == CLAUDE_SCHEMA_VERSION);
+                || self.schema_version == CLAUDE_SCHEMA_VERSION
+                || self.schema_version == ADAPTER_SCHEMA_VERSION);
         if !upgrade_project && !complete_intent {
             return Err(ReceiptValidationError::InvalidInstalledDirectoryIdentity);
         }
@@ -505,7 +524,9 @@ impl InstallationReceipt {
     }
 
     pub(crate) fn is_user_intent(&self) -> bool {
-        (self.schema_version == USER_SCHEMA_VERSION || self.schema_version == CLAUDE_SCHEMA_VERSION)
+        (self.schema_version == USER_SCHEMA_VERSION
+            || self.schema_version == CLAUDE_SCHEMA_VERSION
+            || self.schema_version == ADAPTER_SCHEMA_VERSION)
             && self.installed_directory_identity.is_none()
     }
 
@@ -513,7 +534,10 @@ impl InstallationReceipt {
         self.installed_directory_identity.is_none()
             && matches!(
                 self.schema_version,
-                LEGACY_SCHEMA_VERSION | USER_SCHEMA_VERSION | CLAUDE_SCHEMA_VERSION
+                LEGACY_SCHEMA_VERSION
+                    | USER_SCHEMA_VERSION
+                    | CLAUDE_SCHEMA_VERSION
+                    | ADAPTER_SCHEMA_VERSION
             )
     }
 
@@ -521,7 +545,10 @@ impl InstallationReceipt {
         self.installed_directory_identity.is_some()
             && matches!(
                 self.schema_version,
-                SCHEMA_VERSION | USER_SCHEMA_VERSION | CLAUDE_SCHEMA_VERSION
+                SCHEMA_VERSION
+                    | USER_SCHEMA_VERSION
+                    | CLAUDE_SCHEMA_VERSION
+                    | ADAPTER_SCHEMA_VERSION
             )
     }
 
@@ -598,7 +625,33 @@ impl InstallationReceipt {
 
     fn identity_digest(&self) -> Result<String, ReceiptValidationError> {
         let mut context = Context::new(&SHA256);
-        if self.schema_version == CLAUDE_SCHEMA_VERSION {
+        if self.schema_version == ADAPTER_SCHEMA_VERSION {
+            context.update(b"THRN-RECEIPT-IDENTITY-V5\0");
+            update_field(&mut context, self.agent.as_bytes())?;
+            update_field(&mut context, self.scope.as_bytes())?;
+            update_field(
+                &mut context,
+                self.destination_layout
+                    .as_deref()
+                    .ok_or(ReceiptValidationError::IdentityDigest)?
+                    .as_bytes(),
+            )?;
+            update_field(
+                &mut context,
+                self.canonical_project_root
+                    .as_deref()
+                    .or(self.canonical_scope_root.as_deref())
+                    .ok_or(ReceiptValidationError::IdentityDigest)?
+                    .as_bytes(),
+            )?;
+            let root = self
+                .project_root_identity
+                .as_ref()
+                .or(self.scope_root_identity.as_ref())
+                .ok_or(ReceiptValidationError::IdentityDigest)?;
+            context.update(&root.volume.to_be_bytes());
+            context.update(&root.object.to_be_bytes());
+        } else if self.schema_version == CLAUDE_SCHEMA_VERSION {
             context.update(b"THRN-RECEIPT-IDENTITY-V4\0");
             update_field(&mut context, self.agent.as_bytes())?;
             update_field(&mut context, self.scope.as_bytes())?;
@@ -691,6 +744,37 @@ impl InstallationReceipt {
             context.update(&root.object.to_be_bytes());
             context.update(&destination.volume.to_be_bytes());
             context.update(&destination.object.to_be_bytes());
+        } else if self.schema_version == ADAPTER_SCHEMA_VERSION {
+            context.update(b"THRN-CONTENT-INVENTORY-V5\0");
+            update_field(&mut context, self.agent.as_bytes())?;
+            update_field(&mut context, self.scope.as_bytes())?;
+            update_field(
+                &mut context,
+                self.destination_layout
+                    .as_deref()
+                    .ok_or(ReceiptValidationError::InvalidMetadata)?
+                    .as_bytes(),
+            )?;
+            let root = self
+                .project_root_identity
+                .as_ref()
+                .or(self.scope_root_identity.as_ref())
+                .ok_or(ReceiptValidationError::InvalidScopePath)?;
+            let destination = self
+                .installed_directory_identity
+                .ok_or(ReceiptValidationError::InvalidInstalledDirectoryIdentity)?;
+            update_field(
+                &mut context,
+                self.canonical_project_root
+                    .as_deref()
+                    .or(self.canonical_scope_root.as_deref())
+                    .ok_or(ReceiptValidationError::InvalidScopePath)?
+                    .as_bytes(),
+            )?;
+            context.update(&root.volume.to_be_bytes());
+            context.update(&root.object.to_be_bytes());
+            context.update(&destination.volume.to_be_bytes());
+            context.update(&destination.object.to_be_bytes());
         } else {
             context.update(b"THRN-CONTENT-INVENTORY-V3\0");
             let root = self
@@ -731,6 +815,38 @@ impl InstallationReceipt {
     }
 
     fn calculated_install_intent_digest(&self) -> Result<String, ReceiptValidationError> {
+        if self.schema_version == ADAPTER_SCHEMA_VERSION
+            && self.installed_directory_identity.is_none()
+        {
+            let mut context = Context::new(&SHA256);
+            context.update(b"THRN-CONTENT-INSTALL-INTENT-V5\0");
+            update_field(&mut context, self.agent.as_bytes())?;
+            update_field(&mut context, self.scope.as_bytes())?;
+            update_field(
+                &mut context,
+                self.destination_layout
+                    .as_deref()
+                    .ok_or(ReceiptValidationError::InvalidMetadata)?
+                    .as_bytes(),
+            )?;
+            let root = self
+                .project_root_identity
+                .as_ref()
+                .or(self.scope_root_identity.as_ref())
+                .ok_or(ReceiptValidationError::InvalidScopePath)?;
+            update_field(
+                &mut context,
+                self.canonical_project_root
+                    .as_deref()
+                    .or(self.canonical_scope_root.as_deref())
+                    .ok_or(ReceiptValidationError::InvalidScopePath)?
+                    .as_bytes(),
+            )?;
+            context.update(&root.volume.to_be_bytes());
+            context.update(&root.object.to_be_bytes());
+            self.update_inventory_digest(&mut context)?;
+            return Ok(hex_digest(context.finish().as_ref()));
+        }
         if self.schema_version == CLAUDE_SCHEMA_VERSION
             && self.installed_directory_identity.is_none()
         {
@@ -941,6 +1057,7 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeSet,
         fs,
         io::{Cursor, Write},
         path::{Path, PathBuf},
@@ -952,9 +1069,12 @@ mod tests {
 
     use crate::{
         install::{
-            destination::{FileIdentity, inspect_destination},
+            destination::{FileIdentity, inspect_destination, inspect_destination_for_agent},
             inventory::inspect_staged_skill,
-            plan::{InstallScope, build_install_plan, build_install_plan_for_scope},
+            plan::{
+                InstallAgent, InstallScope, build_install_plan, build_install_plan_for_agent_scope,
+                build_install_plan_for_scope,
+            },
         },
         registry::catalog::parse_catalog_json,
         sources::{
@@ -1064,6 +1184,28 @@ mod tests {
         .expect("user receipt intent")
     }
 
+    fn adapter_receipt_fixture(
+        agent: InstallAgent,
+        scope: InstallScope,
+        root: &Path,
+        staged: &StagedSkill,
+    ) -> InstallationReceipt {
+        let inventory = inspect_staged_skill(staged).expect("inventory");
+        let destination =
+            inspect_destination_for_agent(agent, Some(root), root, staged.skill_name().as_str())
+                .expect("agent destination");
+        let plan =
+            build_install_plan_for_agent_scope(staged, &inventory, destination, agent, scope)
+                .expect("adapter install plan");
+        InstallationReceipt::from_committed_plan(
+            &plan,
+            &inventory,
+            FileIdentity::new(7, 9),
+            1_800_000_000,
+        )
+        .expect("adapter receipt intent")
+    }
+
     #[test]
     fn legacy_schema_v1_round_trips_and_keeps_catalog_id_distinct_from_skill_name() {
         let receipt = receipt_fixture();
@@ -1158,6 +1300,95 @@ mod tests {
             project_as_user.validate(),
             Err(ReceiptValidationError::InvalidInstalledDirectoryIdentity)
         ));
+    }
+
+    #[test]
+    fn schema_v5_is_strict_and_separates_cursor_gemini_and_scope_receipt_keys() {
+        let parent = tempdir().expect("parent");
+        let root = parent.path().canonicalize().expect("canonical root");
+        let project = root.join("project");
+        let home = root.join("home");
+        fs::create_dir(&project).expect("project");
+        fs::create_dir(&home).expect("home");
+        let staged = staged_skill(&root);
+
+        let cursor_project = adapter_receipt_fixture(
+            InstallAgent::Cursor,
+            InstallScope::Project,
+            &project,
+            &staged,
+        );
+        let gemini_project = adapter_receipt_fixture(
+            InstallAgent::Gemini,
+            InstallScope::Project,
+            &project,
+            &staged,
+        );
+        let cursor_user =
+            adapter_receipt_fixture(InstallAgent::Cursor, InstallScope::User, &home, &staged);
+        let gemini_user =
+            adapter_receipt_fixture(InstallAgent::Gemini, InstallScope::User, &home, &staged);
+        for receipt in [&cursor_project, &gemini_project, &cursor_user, &gemini_user] {
+            assert_eq!(receipt.schema_version(), 5);
+            assert!(receipt.is_user_intent());
+            assert!(receipt.validate_install_intent().is_ok());
+            assert!(receipt.validate().is_err());
+            let key = receipt.receipt_filename().expect("v5 identity");
+            assert!(key.starts_with("v5-"));
+            let completed = receipt
+                .clone()
+                .with_installed_directory_identity(FileIdentity::new(17, 23))
+                .expect("installation-time identity");
+            assert!(completed.supports_lifecycle());
+            assert_eq!(
+                InstallationReceipt::from_json(&completed.to_json().expect("serialize v5"))
+                    .expect("strict v5 parse"),
+                completed
+            );
+        }
+        let keys = [
+            cursor_project
+                .receipt_filename()
+                .expect("Cursor project key"),
+            gemini_project
+                .receipt_filename()
+                .expect("Gemini project key"),
+            cursor_user.receipt_filename().expect("Cursor user key"),
+            gemini_user.receipt_filename().expect("Gemini user key"),
+        ];
+        assert_eq!(keys.iter().collect::<BTreeSet<_>>().len(), 4);
+        assert_ne!(cursor_project.content_digest, gemini_project.content_digest);
+
+        let mut missing_layout: serde_json::Value = serde_json::from_slice(
+            &cursor_project
+                .to_journal_intent_json()
+                .expect("intent JSON"),
+        )
+        .expect("JSON value");
+        missing_layout
+            .as_object_mut()
+            .expect("receipt object")
+            .remove("destinationLayout");
+        assert!(
+            InstallationReceipt::from_json(
+                &serde_json::to_vec(&missing_layout).expect("serialize malformed v5")
+            )
+            .is_err()
+        );
+
+        let mut wrong_agent: serde_json::Value = serde_json::from_slice(
+            &cursor_project
+                .to_journal_intent_json()
+                .expect("intent JSON"),
+        )
+        .expect("JSON value");
+        wrong_agent["agent"] = serde_json::json!("gemini");
+        assert!(
+            InstallationReceipt::from_json(
+                &serde_json::to_vec(&wrong_agent).expect("serialize wrong-agent v5")
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1281,10 +1512,10 @@ mod tests {
         let receipt = receipt_fixture();
         let mut value: serde_json::Value =
             serde_json::from_slice(&receipt.to_json().expect("json")).expect("value");
-        value["schemaVersion"] = serde_json::json!(5);
+        value["schemaVersion"] = serde_json::json!(6);
         assert!(matches!(
             InstallationReceipt::from_json(&serde_json::to_vec(&value).expect("json")),
-            Err(ReceiptValidationError::UnsupportedSchema(5))
+            Err(ReceiptValidationError::UnsupportedSchema(6))
         ));
         assert!(matches!(
             InstallationReceipt::from_json(b"{\"schemaVersion\":1"),

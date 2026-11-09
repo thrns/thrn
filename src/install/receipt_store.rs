@@ -33,6 +33,8 @@ use super::{
     },
 };
 
+use crate::agents::AgentId;
+
 const IO_CHUNK_BYTES: usize = 8 * 1024;
 const WRITER_LOCK_NAME: &str = ".writer.lock";
 const TEMP_NAME_ATTEMPTS: usize = 32;
@@ -54,6 +56,15 @@ pub(crate) struct ProjectInstallationInspection {
 pub(crate) struct ProjectInspectionSnapshot {
     pub(crate) project_root: PathBuf,
     pub(crate) installations: Vec<ProjectInstallationInspection>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SharedSkillStatus {
+    Absent,
+    ManagedByCodex,
+    UnverifiedCodexReceipt,
+    Unmanaged,
+    ChangedSincePlanning,
 }
 
 impl ReceiptStore {
@@ -166,6 +177,50 @@ impl ReceiptStore {
             project_root: scope.root().to_path_buf(),
             installations: inspections,
         })
+    }
+
+    /// Classify an explicitly named skill in the shared Codex-compatible path without adopting,
+    /// changing, or recovering it. The planning snapshot is compared again after receipt reads.
+    pub(crate) fn inspect_shared_skill(
+        &self,
+        scope: super::plan::InstallScope,
+        root: &std::path::Path,
+        skill_name: &str,
+        expected: &super::destination::DestinationSnapshot,
+    ) -> Result<SharedSkillStatus, ReceiptStoreError> {
+        let current = super::destination::inspect_destination_for_agent(
+            AgentId::Codex,
+            Some(root),
+            root,
+            skill_name,
+        )
+        .map_err(|error| ReceiptStoreError::ProjectInspection(error.to_string()))?;
+        if !expected.same_shared_path_state(&current) {
+            return Ok(SharedSkillStatus::ChangedSincePlanning);
+        }
+        if current.skill_state() == super::destination::ComponentState::Missing
+            && current.conflicts().is_empty()
+        {
+            return Ok(SharedSkillStatus::Absent);
+        }
+
+        let codex_scope = super::scope::ResolvedScope::from_agent_validated(
+            AgentId::Codex,
+            scope,
+            root.to_path_buf(),
+        );
+        let snapshot = self.inspect_scope(&codex_scope)?;
+        match snapshot
+            .installations
+            .iter()
+            .find(|installation| installation.receipt.skill_name() == skill_name)
+        {
+            Some(installation) if installation.content == ReceiptContentState::Verified => {
+                Ok(SharedSkillStatus::ManagedByCodex)
+            }
+            Some(_) => Ok(SharedSkillStatus::UnverifiedCodexReceipt),
+            None => Ok(SharedSkillStatus::Unmanaged),
+        }
     }
 
     /// Build a read-only removal plan from one exact canonical-ID receipt and its current tree.
@@ -476,6 +531,11 @@ impl ReceiptStore {
         lock.validate()
             .map_err(|error| UpdateError::RecoveryRequired(error.to_string()))?;
         let result = (|| {
+            super::commit::validate_shared_path_snapshot(plan.replacement()).map_err(|error| {
+                UpdateError::Conflict(format!(
+                    "shared .agents/skills compatibility state changed before update: {error}"
+                ))
+            })?;
             let install_store = self
                 .journal_store()
                 .map_err(|error| UpdateError::Store(error.to_string()))?;
@@ -3319,7 +3379,10 @@ fn destination_conflict(receipt: &InstallationReceipt) -> ReceiptStoreError {
     ReceiptStoreError::DestinationConflict {
         agent: match receipt.agent() {
             "codex" => "Codex",
-            _ => "Claude Code",
+            "claude-code" => "Claude Code",
+            "cursor" => "Cursor",
+            "gemini" => "Gemini CLI",
+            _ => "unknown agent",
         },
         scope: match receipt.scope() {
             "project" => "project",
@@ -3333,6 +3396,7 @@ fn valid_receipt_filename(name: &str) -> bool {
         .strip_prefix("v1-")
         .or_else(|| name.strip_prefix("v2-"))
         .or_else(|| name.strip_prefix("v4-"))
+        .or_else(|| name.strip_prefix("v5-"))
         .and_then(|name| name.strip_suffix(".json"));
     let Some(hex) = hex else { return false };
     hex.len() == 64

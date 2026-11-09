@@ -273,6 +273,23 @@ pub struct DestinationSnapshot {
 }
 
 impl DestinationSnapshot {
+    pub(crate) fn same_shared_path_state(&self, other: &Self) -> bool {
+        self.agent == AgentId::Codex
+            && other.agent == AgentId::Codex
+            && self.project_root == other.project_root
+            && self.project_identity == other.project_identity
+            && self.agents_state == other.agents_state
+            && self.agents_identity == other.agents_identity
+            && self.skills_state == other.skills_state
+            && self.skills_identity == other.skills_identity
+            && self.skill_state == other.skill_state
+            && self.destination == other.destination
+            && self.existing_agents_entries == other.existing_agents_entries
+            && self.existing_skill_entries == other.existing_skill_entries
+        // Top-level project entries are intentionally excluded: creating the selected agent's
+        // native directory does not alter the shared .agents/skills compatibility state.
+    }
+
     pub(crate) fn agent(&self) -> AgentId {
         self.agent
     }
@@ -987,6 +1004,35 @@ mod tests {
             fs::read(external.join("keep.txt")).expect("external target unchanged"),
             b"outside content"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cursor_and_gemini_adapters_reject_real_windows_project_junctions() {
+        let temporary = tempdir().expect("temporary root");
+        let project = temporary.path().join("project");
+        let external = temporary.path().join("external");
+        fs::create_dir(&project).expect("project");
+        fs::create_dir(&external).expect("external target");
+        fs::write(external.join("keep.txt"), b"outside content").expect("external sentinel");
+
+        for agent in [AgentId::Cursor, AgentId::Gemini] {
+            let adapter_root = project.join(agent.adapter().skill_directory());
+            create_junction(&adapter_root, &external);
+            let snapshot = inspect_destination_for_agent(agent, None, &project, "skill-name")
+                .expect("junction is a plan conflict");
+            assert_eq!(snapshot.conflicts().len(), 1, "agent={agent:?}");
+            assert_eq!(
+                snapshot.conflicts()[0].kind(),
+                ConflictKind::UnsafeDestinationComponent,
+                "agent={agent:?}"
+            );
+            assert_eq!(
+                fs::read(external.join("keep.txt")).expect("external target unchanged"),
+                b"outside content"
+            );
+            fs::remove_dir(&adapter_root).expect("remove test junction before next adapter");
+        }
     }
 
     #[cfg(unix)]

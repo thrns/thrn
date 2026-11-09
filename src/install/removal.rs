@@ -25,6 +25,7 @@ use super::{
 const PROJECT_REMOVAL_JOURNAL_SCHEMA_VERSION: u64 = 1;
 const USER_REMOVAL_JOURNAL_SCHEMA_VERSION: u64 = 2;
 const CLAUDE_REMOVAL_JOURNAL_SCHEMA_VERSION: u64 = 3;
+const ADAPTER_REMOVAL_JOURNAL_SCHEMA_VERSION: u64 = 4;
 const MAX_REMOVAL_JOURNAL_BYTES: usize = 10 * 1024 * 1024;
 const MAX_REMOVAL_JOURNAL_FILES: usize = 16_384;
 const MAX_REMOVAL_JOURNAL_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
@@ -660,7 +661,9 @@ impl RemovalRecord {
     }
 
     fn validate(&self) -> Result<(), RemovalJournalError> {
-        let expected_schema = if self.receipt.agent() == "claude-code" {
+        let expected_schema = if matches!(self.receipt.agent(), "cursor" | "gemini") {
+            ADAPTER_REMOVAL_JOURNAL_SCHEMA_VERSION
+        } else if self.receipt.agent() == "claude-code" {
             CLAUDE_REMOVAL_JOURNAL_SCHEMA_VERSION
         } else if self.receipt.scope() == "user" {
             USER_REMOVAL_JOURNAL_SCHEMA_VERSION
@@ -786,7 +789,9 @@ impl RemovalJournalStore {
             random_id().map_err(|error| map_journal_io("name removal operation", error))?;
         let mut objects = plan.objects.clone();
         objects.sort_by(|left, right| left.order_key().cmp(&right.order_key()));
-        let schema_version = if plan.receipt.agent() == "claude-code" {
+        let schema_version = if matches!(plan.receipt.agent(), "cursor" | "gemini") {
+            ADAPTER_REMOVAL_JOURNAL_SCHEMA_VERSION
+        } else if plan.receipt.agent() == "claude-code" {
             CLAUDE_REMOVAL_JOURNAL_SCHEMA_VERSION
         } else if plan.receipt.scope() == "user" {
             USER_REMOVAL_JOURNAL_SCHEMA_VERSION
@@ -1780,7 +1785,9 @@ fn record_plan(record: &RemovalRecord) -> Result<RemovalPlan, RemovalError> {
 fn plan_record(plan: &RemovalPlan) -> RemovalRecord {
     let operation_id = "00000000000000000000000000000000".to_owned();
     RemovalRecord {
-        schema_version: if plan.receipt.agent() == "claude-code" {
+        schema_version: if matches!(plan.receipt.agent(), "cursor" | "gemini") {
+            ADAPTER_REMOVAL_JOURNAL_SCHEMA_VERSION
+        } else if plan.receipt.agent() == "claude-code" {
             CLAUDE_REMOVAL_JOURNAL_SCHEMA_VERSION
         } else if plan.receipt.scope() == "user" {
             USER_REMOVAL_JOURNAL_SCHEMA_VERSION

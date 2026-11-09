@@ -1,9 +1,10 @@
 # Installation, update, and removal recovery
 
 M2-06 introduced the recovery protocol for Codex project installation. M3-04 added Codex user scope;
-M3-05 extends the same receipt store, OS-backed writer lock, staging, no-replace commitment, removal
-quarantine, update backup, and recovery paths to Claude Code project and user scope. `thrn skills
-install` enters it through `InstallationSession::commit_and_record`; recovery itself has no network
+M3-05 extended the same receipt store, OS-backed writer lock, staging, no-replace commitment, removal
+quarantine, update backup, and recovery paths to Claude Code project and user scope. M3-06 extends
+that shared lifecycle to Cursor and Gemini CLI without adding agent-specific transaction engines.
+`thrn skills install` enters it through `InstallationSession::commit_and_record`; recovery itself has no network
 dependency and tests use isolated application-data, project, and home directories.
 
 ## Scope-bound recovery
@@ -11,19 +12,23 @@ dependency and tests use isolated application-data, project, and home directorie
 Project operations retain their original journal formats and resolve the selected project root.
 Explicit user operations resolve the validated OS home and require agent, receipt scope, canonical
 root, root filesystem identity, destination, and journal identities to agree. Codex project journals
-retain schema version 1; Codex user and Claude Code project/user journals use lifecycle-specific
-schema v2 and v3 records. A record cannot switch agent, scope, or root during recovery. Codex uses
-`<project>/.agents/skills/<skillName>` or `<home>/.agents/skills/<skillName>`; Claude Code uses
-`<project>/.claude/skills/<skillName>` or `<home>/.claude/skills/<skillName>`. User operations do
-not use the current working directory as a fallback. Both agents and scopes hold the same
-`.writer.lock` through recovery and transaction completion.
+retain schema version 1; Codex user journals use schema v2, Claude Code project/user journals use
+schema v3, and Cursor/Gemini CLI install, removal, and update journals use
+schema v4. A record cannot switch agent, scope, layout, or root during recovery. Codex uses
+`.agents/skills`, Claude Code uses `.claude/skills`, Cursor uses `.cursor/skills`, and Gemini CLI uses
+`.gemini/skills`, under the selected project or validated home. User operations do not use the current
+working directory as a fallback. All agents and scopes hold the same `.writer.lock` through recovery
+and transaction completion. A Cursor/Gemini recovery validates the exact agent, scope, layout,
+canonical root, receipt, destination identity, complete inventory, and operation-owned identities.
+In particular, a pending Gemini transaction cannot recover by changing a Cursor or Codex tree, even
+when the skill name and pinned source match.
 
 ## Journal storage and schema
 
 Operation records live in the application-data `operations` directory, beside and separate from
 `receipts` and the catalog cache. Each operation is a sequence of immutable JSON snapshots named
 `op-<random-128-bit-id>-<zero-padded-sequence>.json`. Project schema version 1, Codex user schema
-version 2, and Claude Code schema version 3 reject unknown fields,
+version 2, Claude Code schema version 3, and Cursor/Gemini CLI schema version 4 reject unknown fields,
 unsupported versions, malformed names, missing or duplicate sequence entries, unsafe object types,
 invalid receipt data, and records larger than 10 MiB. The store is bounded to 16,384 entries and
 256 MiB total; inventory paths and record counts are validated against the receipt and archive
@@ -36,8 +41,7 @@ identities, whether THRN intended to create those parents, the staging and final
 paths and filesystem identities of operation-created files and directories. A new operation begins
 with a scope-specific receipt intent needed for reservation. After the no-replace commit, the journal
 records the committed destination identity and matching Codex project schema-v2, Codex user
-schema-v3, or Claude Code schema-v4 receipt
-together before it can advance to `DirectoryCommitVerified`. The receipt's identity must equal the
+schema-v3, Claude Code schema-v4, or Cursor/Gemini CLI schema-v5 receipt together before it can advance to `DirectoryCommitVerified`. The receipt's identity must equal the
 journal's destination identity. Historical project v1 journal snapshots remain readable; they keep
 their original strict receipt data until recovery can prove an in-progress installation from its
 recorded staging identity. The
@@ -165,8 +169,8 @@ operations fail closed.
 ## Receipt-backed removal state machine
 
 M3-01 adds a separate versioned removal journal in application-data `removals`; project removal
-requires a Codex schema-v2 or Claude schema-v4 installation receipt for project scope, and user
-removal requires Codex schema v3 or Claude schema v4. Neither weakens the
+requires a Codex schema-v2, Claude schema-v4, or Cursor/Gemini schema-v5 installation receipt for
+project scope; user removal requires Codex schema-v3 or Claude/Cursor/Gemini schema-v4/v5 receipts. Neither weakens the
 install journal. Removal and
 installation hold the same exclusive `.writer.lock` from recovery/admission through transaction
 completion. Install admission rejects any unresolved removal record, and receipt listing remains
@@ -254,7 +258,8 @@ recovery may need to preserve and report a conflict.
 M3-02 uses a separate strict versioned journal in application-data `updates`. It shares the
 persistent `.writer.lock` with installation and removal. Codex project updates use journal schema
 v1 and receipt schema v2; Codex user updates use journal schema v2 and receipt schema v3; Claude
-Code project/user updates use journal schema v3 and receipt schema v4. The record captures the old
+Code project/user updates use journal schema v3 and receipt schema v4; Cursor/Gemini updates use
+journal schema v4 and receipt schema v5. The record captures the old
 scope-appropriate receipt, its raw-byte SHA-256 and filesystem identity, the complete old and
 replacement inventories, scope-root and selected agent parent identities, stage and destination
 directory identities, receipt transition temporary/backup identities, operation-owned names, and
@@ -291,7 +296,8 @@ private sibling stage on the destination filesystem, verifies every expected byt
 records the stage identity/inventory before moving the original. It then performs two separate
 no-replace renames: original to operation-owned backup, then stage to original destination. This is
 not an atomic swap. The replacement's committed directory identity is captured through the secure
-handle and bound into the new Codex project schema-v2, Codex user schema-v3, or Claude schema-v4 receipt.
+handle and bound into the new Codex project schema-v2, Codex user schema-v3, Claude schema-v4, or
+Cursor/Gemini schema-v5 receipt.
 
 Receipt transition retains the deterministic receipt filename. The exact old receipt remains active
 until the journal has the new receipt contents and temp identity. THRN moves the exact old receipt
@@ -302,7 +308,9 @@ and fails closed if any install, removal, or update operation is pending, so it 
 success during this transition. Recovery accepts only the states and object identities recorded by
 the journal; matching hashes do not establish ownership of a new destination.
 
-Recovery runs under the writer lock and is idempotent. It revalidates the active old receipt and
+Recovery runs under the writer lock and is idempotent. It revalidates agent, scope, layout, receipt identity,
+canonical root, destination identity, complete inventory, and operation-owned object identities before
+mutation. It revalidates the active old receipt and
 whole old tree before the backup rename, then verifies complete old/new trees and parent identities
 at every later state. Before replacement staging has been durably recorded, an unexpected partial
 stage is preserved and reported for inspection; the original remains under its receipt-backed
@@ -331,7 +339,7 @@ stage and both skill directories are siblings and therefore use same-filesystem 
 storage may reside on another filesystem with a separately journaled transition. On Linux and
 macOS, files and containing directories are synchronized where supported. The Windows secure
 directory-handle layer cannot flush directory-entry metadata, matching existing install/removal
-power-loss limitations.
+power-loss limitations. These guarantees do not claim power-loss atomicity across filesystems.
 
 ## Read-only listing and troubleshooting
 

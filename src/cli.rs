@@ -76,7 +76,7 @@ enum SkillsCommand {
     Install {
         /// Exact catalog resource ID or explicit alias.
         id: String,
-        /// Select codex or claude-code.
+        /// Select codex, claude-code, cursor, or gemini.
         #[arg(long, required = true, value_name = "AGENT")]
         agent: String,
         /// Select project (default) or user skill scope.
@@ -93,7 +93,7 @@ enum SkillsCommand {
     Remove {
         /// Exact canonical resource ID recorded in a THRN ownership receipt.
         id: String,
-        /// Select codex or claude-code.
+        /// Select codex, claude-code, cursor, or gemini.
         #[arg(long, required = true, value_name = "AGENT")]
         agent: String,
         /// Select project (default) or user skill scope.
@@ -110,7 +110,7 @@ enum SkillsCommand {
     Update {
         /// Exact canonical resource ID recorded in a THRN ownership receipt.
         id: String,
-        /// Select codex or claude-code.
+        /// Select codex, claude-code, cursor, or gemini.
         #[arg(long, required = true, value_name = "AGENT")]
         agent: String,
         /// Select project (default) or user skill scope.
@@ -132,7 +132,7 @@ enum SkillsCommand {
         #[arg(long, value_name = "PATH")]
         project: Option<std::path::PathBuf>,
         /// Defaults to codex for backward compatibility.
-        #[arg(long, value_name = "AGENT", value_parser = ["codex", "claude-code"])]
+        #[arg(long, value_name = "AGENT", value_parser = ["codex", "claude-code", "cursor", "gemini"])]
         agent: Option<String>,
     },
 }
@@ -242,6 +242,8 @@ fn resolve_scope(
     let agent_id = match agent {
         "codex" => crate::agents::AgentId::Codex,
         "claude-code" => crate::agents::AgentId::ClaudeCode,
+        "cursor" => crate::agents::AgentId::Cursor,
+        "gemini" => crate::agents::AgentId::Gemini,
         other => {
             return Err(
                 crate::install::scope::ScopeResolutionError::UnsupportedAgent(other.to_owned()),
@@ -523,6 +525,10 @@ fn install_skill(
             &transport,
             &crate::sources::staging::SystemTempDirFactory,
         )?;
+        let store = ReceiptStore::for_system()?;
+        if let Some(detail) = shared_path_collision_detail(&session, &store)? {
+            return Err(InstallCommandError::SharedPathCollision(detail).into());
+        }
         format_dry_run(session.plan())?
     } else {
         execute_install_in_scope_with(
@@ -626,6 +632,19 @@ where
         &ReceiptStore,
     ) -> std::result::Result<InstallationReceipt, InstallationCompletionError>,
 {
+    if !session.plan().shared_path_conflicts().is_empty() {
+        let store = receipt_store().map_err(InstallCommandError::ReceiptStore)?;
+        let detail = shared_path_collision_detail(&session, &store)?.unwrap_or_else(|| {
+            "shared-path conflict was detected but could not be classified".to_owned()
+        });
+        return Err(InstallCommandError::SharedPathCollision(detail));
+    }
+    crate::install::commit::validate_shared_path_snapshot(session.plan()).map_err(|error| {
+        InstallCommandError::SharedPathCollision(format!(
+            "shared .agents/skills compatibility state changed before commitment: {error}"
+        ))
+    })?;
+
     if !session.plan().conflicts().is_empty() {
         // A read-only receipt lookup lets the CLI distinguish an existing THRN-owned install
         // from a manually installed directory. Reconcile a valid interrupted operation first;
@@ -662,6 +681,62 @@ where
     let store = receipt_store().map_err(InstallCommandError::ReceiptStore)?;
     let receipt = complete(&session, &store)?;
     Ok(format_install_success(&receipt))
+}
+
+fn shared_path_collision_detail(
+    session: &InstallationSession,
+    store: &ReceiptStore,
+) -> std::result::Result<Option<String>, InstallCommandError> {
+    if session.plan().shared_path_conflicts().is_empty() {
+        return Ok(None);
+    }
+    let plan = session.plan();
+    let Some(snapshot) = plan.shared_path_snapshot() else {
+        return Ok(Some(
+            "shared-path compatibility evidence is unavailable; installation fails closed"
+                .to_owned(),
+        ));
+    };
+    let status = store
+        .inspect_shared_skill(
+            plan.scope(),
+            plan.scope_root(),
+            plan.skill_name().as_str(),
+            snapshot,
+        )
+        .map_err(InstallCommandError::ReceiptStore)?;
+    let agent_note = match plan.agent() {
+        crate::agents::AgentId::Gemini => {
+            "Gemini CLI gives .agents/skills precedence over .gemini/skills at the same scope."
+        }
+        crate::agents::AgentId::Cursor => {
+            "Cursor also loads .agents/skills, and documented precedence for same-named shared and native skills is unclear."
+        }
+        _ => "the selected agent does not have shared-path interoperability",
+    };
+    let ownership = match status {
+        crate::install::receipt_store::SharedSkillStatus::ManagedByCodex => {
+            "A verified THRN-managed Codex skill may already be discoverable there; its update and removal remain Codex-owned operations."
+        }
+        crate::install::receipt_store::SharedSkillStatus::UnverifiedCodexReceipt => {
+            "A Codex ownership receipt exists but its current tree is not fully verified; preserve it and resolve it through Codex before changing that path."
+        }
+        crate::install::receipt_store::SharedSkillStatus::Unmanaged => {
+            "The shared skill has no verified Codex ownership receipt and is treated as unmanaged external content."
+        }
+        crate::install::receipt_store::SharedSkillStatus::Absent => {
+            "The shared-path entry changed during inspection, so it is left untouched and installation fails closed."
+        }
+        crate::install::receipt_store::SharedSkillStatus::ChangedSincePlanning => {
+            "The shared path changed after planning, so it is left untouched and installation fails closed."
+        }
+    };
+    Ok(Some(format!(
+        "cannot install {} skill {:?} into {} because a same-named shared skill conflicts at .agents/skills/; {agent_note} {ownership} No shared content was changed or adopted.",
+        plan.agent().as_str(),
+        plan.skill_name().as_str(),
+        plan.scope().as_str(),
+    )))
 }
 
 fn format_install_success(receipt: &InstallationReceipt) -> String {
@@ -953,10 +1028,13 @@ mod install_tests {
     };
     use crate::{
         install::{
+            check::{CheckStatus, classify},
             commit::InstallFaultInjector,
             journal::NoJournalFaults,
             plan::InstallScope,
-            receipt_store::{NoReceiptFaults, ReceiptFaultInjector, ReceiptOperation},
+            receipt_store::{
+                NoReceiptFaults, ReceiptFaultInjector, ReceiptOperation, SharedSkillStatus,
+            },
             removal::{NoRemovalFaults, RemovalFaultInjector, RemovalOperation},
             scope::ResolvedScope,
         },
@@ -2718,6 +2796,449 @@ mod install_tests {
     }
 
     #[test]
+    fn all_four_agents_install_check_and_remove_independently_at_both_scopes() {
+        let mut receipt_keys = std::collections::BTreeSet::new();
+        for agent in [
+            crate::agents::AgentId::Codex,
+            crate::agents::AgentId::ClaudeCode,
+            crate::agents::AgentId::Cursor,
+            crate::agents::AgentId::Gemini,
+        ] {
+            let fixture = InstallFixture::new();
+            let home = fixture
+                ._root
+                .path()
+                .canonicalize()
+                .expect("canonical fixture root")
+                .join("home");
+            fs::create_dir(&home).expect("user home");
+            let scopes = [
+                ResolvedScope::from_agent_validated(
+                    agent,
+                    InstallScope::Project,
+                    fixture.project.clone(),
+                ),
+                ResolvedScope::from_agent_validated(agent, InstallScope::User, home.clone()),
+            ];
+
+            for scope in &scopes {
+                let output = fixture
+                    .execute_in_scope("uncharted", scope, &FixtureTransport::archive())
+                    .expect("adapter install");
+                assert!(output.contains(&format!(
+                    "Agent: {}\nScope: {}\n",
+                    agent.as_str(),
+                    scope.scope().as_str()
+                )));
+                let destination = agent
+                    .adapter()
+                    .destination_path(
+                        scope.scope(),
+                        scope.root().to_path_buf(),
+                        "uncharted-ideation",
+                    )
+                    .expect("supported native target");
+                assert!(destination.join("SKILL.md").is_file());
+            }
+
+            let receipts = fixture.store().list().expect("all adapter receipts list");
+            assert_eq!(receipts.len(), 2);
+            for receipt in &receipts {
+                let expected_schema = match agent {
+                    crate::agents::AgentId::Codex if receipt.scope() == "project" => 2,
+                    crate::agents::AgentId::Codex => 3,
+                    crate::agents::AgentId::ClaudeCode => 4,
+                    crate::agents::AgentId::Cursor | crate::agents::AgentId::Gemini => 5,
+                };
+                assert_eq!(receipt.agent(), agent.as_str());
+                assert_eq!(receipt.schema_version(), expected_schema);
+                assert!(
+                    receipt_keys.insert(receipt.receipt_filename().expect("unique receipt key")),
+                    "receipt key must be distinct for {} {}",
+                    agent.as_str(),
+                    receipt.scope()
+                );
+            }
+
+            for scope in &scopes {
+                let inspected = fixture
+                    .store()
+                    .inspect_scope(scope)
+                    .expect("read-only scope check");
+                let findings = classify(&fixture.catalog, inspected.installations);
+                assert_eq!(findings.len(), 1);
+                assert_eq!(findings[0].status(), CheckStatus::UpToDate);
+                let removed = execute_remove_in_scope_with(
+                    "uncharted",
+                    agent.as_str(),
+                    scope,
+                    &fixture.store(),
+                    false,
+                    &NoRemovalFaults,
+                )
+                .expect("receipt-backed scoped removal");
+                assert!(removed.contains(&format!("Agent: {}", agent.as_str())));
+                assert!(
+                    !scope
+                        .root()
+                        .join(agent.adapter().skill_directory())
+                        .join("skills/uncharted-ideation")
+                        .exists()
+                );
+            }
+            assert!(fixture.store().list().expect("receipts retired").is_empty());
+            assert!(!fixture.project.join("SKILL-WAS-EXECUTED").exists());
+        }
+        assert_eq!(receipt_keys.len(), 8);
+    }
+
+    #[test]
+    fn cursor_and_gemini_install_receipts_recover_at_project_and_user_scopes() {
+        for agent in [
+            crate::agents::AgentId::Cursor,
+            crate::agents::AgentId::Gemini,
+        ] {
+            let fixture = InstallFixture::new();
+            let home = fixture
+                ._root
+                .path()
+                .canonicalize()
+                .expect("canonical fixture root")
+                .join("home");
+            fs::create_dir(&home).expect("home");
+            let scopes = [
+                ResolvedScope::from_agent_validated(
+                    agent,
+                    InstallScope::Project,
+                    fixture.project.clone(),
+                ),
+                ResolvedScope::from_agent_validated(agent, InstallScope::User, home),
+            ];
+            for scope in &scopes {
+                let factory = TestFactory(fixture.staging.clone());
+                let failed = execute_install_in_scope_with(
+                    "uncharted",
+                    agent.as_str(),
+                    scope,
+                    InstallContext {
+                        catalog: &fixture.catalog,
+                        _current_directory: &fixture.current,
+                        transport: &FixtureTransport::archive(),
+                        tempdir_factory: &factory,
+                        receipt_store: || Ok(fixture.store()),
+                        complete: |session: &InstallationSession, store: &ReceiptStore| {
+                            session.commit_and_record_at_with_journal(
+                                store,
+                                1_900_000_000,
+                                &NoInstallFaults,
+                                &FailReceiptAt(ReceiptOperation::PublishNoReplace),
+                                &NoJournalFaults,
+                            )
+                        },
+                    },
+                );
+                assert!(
+                    failed.is_err(),
+                    "agent={} scope={}",
+                    agent.as_str(),
+                    scope.scope().as_str()
+                );
+                let journal_path = fs::read_dir(fixture.data.join("operations"))
+                    .expect("install journal directory")
+                    .next()
+                    .expect("pending install journal")
+                    .expect("journal entry")
+                    .path();
+                let journal: serde_json::Value = serde_json::from_slice(
+                    &fs::read(&journal_path).expect("install journal bytes"),
+                )
+                .expect("install journal JSON");
+                assert_eq!(journal["schemaVersion"], 4);
+                assert_eq!(journal["receipt"]["agent"], agent.as_str());
+                assert_eq!(journal["receipt"]["schemaVersion"], 5);
+
+                fixture
+                    .store()
+                    .recover_scope_with_faults(scope, &NoJournalFaults, &NoReceiptFaults)
+                    .expect("recover adapter install");
+                fixture
+                    .store()
+                    .recover_scope_with_faults(scope, &NoJournalFaults, &NoReceiptFaults)
+                    .expect("adapter install recovery is idempotent");
+                assert!(
+                    fixture
+                        .store()
+                        .list()
+                        .expect("published receipt")
+                        .iter()
+                        .any(|receipt| receipt.agent() == agent.as_str()
+                            && receipt.scope() == scope.scope().as_str()
+                            && receipt.schema_version() == 5)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_and_gemini_removal_journals_recover_without_cross_scope_changes() {
+        for agent in [
+            crate::agents::AgentId::Cursor,
+            crate::agents::AgentId::Gemini,
+        ] {
+            let fixture = InstallFixture::new();
+            let home = fixture
+                ._root
+                .path()
+                .canonicalize()
+                .expect("canonical fixture root")
+                .join("home");
+            fs::create_dir(&home).expect("home");
+            let project_scope = ResolvedScope::from_agent_validated(
+                agent,
+                InstallScope::Project,
+                fixture.project.clone(),
+            );
+            let user_scope = ResolvedScope::from_agent_validated(agent, InstallScope::User, home);
+            fixture
+                .execute_in_scope("uncharted", &project_scope, &FixtureTransport::archive())
+                .expect("project install");
+            fixture
+                .execute_in_scope("uncharted", &user_scope, &FixtureTransport::archive())
+                .expect("user install");
+            let project_destination = fixture.project.join(format!(
+                "{}/skills/uncharted-ideation",
+                agent.adapter().skill_directory()
+            ));
+            let user_destination = user_scope.root().join(format!(
+                "{}/skills/uncharted-ideation",
+                agent.adapter().skill_directory()
+            ));
+
+            fixture
+                .store()
+                .remove_by_id_in_scope(
+                    "uncharted",
+                    &project_scope,
+                    &FailRemovalBoundary {
+                        operation: RemovalOperation::RenameToQuarantine,
+                        timing: FaultTiming::After,
+                        fired: std::sync::atomic::AtomicBool::new(false),
+                    },
+                )
+                .expect_err("post-quarantine fault leaves a recoverable journal");
+            let journal_path = fs::read_dir(fixture.data.join("removals"))
+                .expect("removal journals")
+                .next()
+                .expect("pending removal")
+                .expect("journal entry")
+                .path();
+            let journal: serde_json::Value =
+                serde_json::from_slice(&fs::read(&journal_path).expect("removal journal bytes"))
+                    .expect("removal journal JSON");
+            assert_eq!(journal["schemaVersion"], 4);
+            assert_eq!(journal["receipt"]["agent"], agent.as_str());
+            assert_eq!(journal["receipt"]["schemaVersion"], 5);
+
+            fixture
+                .store()
+                .recover_scope_with_faults(&project_scope, &NoJournalFaults, &NoReceiptFaults)
+                .expect("recover project removal");
+            fixture
+                .store()
+                .recover_scope_with_faults(&project_scope, &NoJournalFaults, &NoReceiptFaults)
+                .expect("removal recovery is idempotent");
+            assert!(!project_destination.exists());
+            assert!(user_destination.join("SKILL.md").is_file());
+            assert!(
+                fixture
+                    .store()
+                    .list()
+                    .expect("user receipt remains")
+                    .iter()
+                    .any(|receipt| receipt.agent() == agent.as_str() && receipt.scope() == "user")
+            );
+
+            fixture
+                .store()
+                .remove_by_id_in_scope("uncharted", &user_scope, &NoRemovalFaults)
+                .expect("remove user installation");
+            assert!(!user_destination.exists());
+        }
+    }
+
+    #[test]
+    fn shared_skill_collisions_are_classified_and_never_adopted() {
+        let managed_fixture = InstallFixture::new();
+        let codex_scope =
+            ResolvedScope::from_validated(InstallScope::Project, managed_fixture.project.clone());
+        managed_fixture
+            .execute_in_scope("uncharted", &codex_scope, &FixtureTransport::archive())
+            .expect("install shared Codex skill");
+        let cursor_scope = ResolvedScope::from_agent_validated(
+            crate::agents::AgentId::Cursor,
+            InstallScope::Project,
+            managed_fixture.project.clone(),
+        );
+        let cursor_error = managed_fixture
+            .execute_in_scope("uncharted", &cursor_scope, &FixtureTransport::archive())
+            .expect_err("shared Codex path blocks native Cursor installation");
+        assert!(
+            cursor_error
+                .to_string()
+                .contains("verified THRN-managed Codex skill")
+        );
+        assert!(cursor_error.to_string().contains("remain Codex-owned"));
+        assert!(
+            !managed_fixture
+                .project
+                .join(".cursor/skills/uncharted-ideation")
+                .exists()
+        );
+        let cursor_plan = prepare_install_session_in_scope(
+            &managed_fixture.catalog,
+            "uncharted",
+            "cursor",
+            &cursor_scope,
+            &FixtureTransport::archive(),
+            &TestFactory(managed_fixture.staging.clone()),
+        )
+        .expect("read-only Cursor compatibility plan");
+        assert_eq!(
+            managed_fixture
+                .store()
+                .inspect_shared_skill(
+                    InstallScope::Project,
+                    &managed_fixture.project,
+                    "uncharted-ideation",
+                    cursor_plan
+                        .plan()
+                        .shared_path_snapshot()
+                        .expect("shared snapshot")
+                )
+                .expect("classify shared path"),
+            SharedSkillStatus::ManagedByCodex
+        );
+        fs::write(
+            managed_fixture
+                .project
+                .join(".agents/skills/uncharted-ideation/SKILL.md"),
+            b"changed after the Codex receipt",
+        )
+        .expect("simulate modified Codex-managed shared skill");
+        let unverified_error = managed_fixture
+            .execute_in_scope("uncharted", &cursor_scope, &FixtureTransport::archive())
+            .expect_err("modified shared Codex content remains a conflict");
+        assert!(
+            unverified_error
+                .to_string()
+                .contains("Codex ownership receipt exists")
+        );
+        assert!(
+            !managed_fixture
+                .project
+                .join(".cursor/skills/uncharted-ideation")
+                .exists()
+        );
+
+        let external_fixture = InstallFixture::new();
+        let external_home = external_fixture
+            ._root
+            .path()
+            .canonicalize()
+            .expect("canonical external fixture")
+            .join("home");
+        fs::create_dir(&external_home).expect("external user home");
+        let external_skill = external_home.join(".agents/skills/uncharted-ideation");
+        fs::create_dir_all(&external_skill).expect("unmanaged shared skill");
+        fs::write(external_skill.join("SKILL.md"), SKILL_MD).expect("unmanaged skill file");
+        let gemini_scope = ResolvedScope::from_agent_validated(
+            crate::agents::AgentId::Gemini,
+            InstallScope::User,
+            external_home.clone(),
+        );
+        let gemini_error = external_fixture
+            .execute_in_scope("uncharted", &gemini_scope, &FixtureTransport::archive())
+            .expect_err("unmanaged shared skill shadows Gemini native path");
+        assert!(
+            gemini_error
+                .to_string()
+                .contains("Gemini CLI gives .agents/skills precedence")
+        );
+        assert!(
+            gemini_error
+                .to_string()
+                .contains("unmanaged external content")
+        );
+        assert!(external_skill.join("SKILL.md").is_file());
+        assert!(
+            !external_home
+                .join(".gemini/skills/uncharted-ideation")
+                .exists()
+        );
+        assert!(
+            external_fixture
+                .store()
+                .list()
+                .expect("no adoption receipt")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn shared_directory_substitution_after_planning_blocks_commit_without_writes() {
+        let fixture = InstallFixture::new();
+        let shared_skills = fixture.project.join(".agents/skills");
+        fs::create_dir_all(shared_skills.join("other-skill")).expect("shared skills root");
+        fs::write(shared_skills.join("other-skill/SKILL.md"), b"unrelated")
+            .expect("unrelated skill");
+        let scope = ResolvedScope::from_agent_validated(
+            crate::agents::AgentId::Gemini,
+            InstallScope::Project,
+            fixture.project.clone(),
+        );
+        let session = prepare_install_session_in_scope(
+            &fixture.catalog,
+            "uncharted",
+            "gemini",
+            &scope,
+            &FixtureTransport::archive(),
+            &TestFactory(fixture.staging.clone()),
+        )
+        .expect("plan with no same-named shared skill");
+        let displaced = fixture.project.join("displaced-agents-directory");
+        fs::rename(fixture.project.join(".agents"), &displaced)
+            .expect("substitute shared root after planning");
+        fs::create_dir_all(shared_skills.join("other-skill")).expect("replacement shared root");
+        fs::write(shared_skills.join("other-skill/SKILL.md"), b"unrelated")
+            .expect("replacement content");
+
+        let error = session
+            .commit_and_record_at(&fixture.store(), 101, &NoInstallFaults, &NoReceiptFaults)
+            .expect_err("shared root substitution fails closed");
+        assert!(
+            error
+                .to_string()
+                .contains("shared .agents/skills path changed after installation planning"),
+            "unexpected conflict: {error}"
+        );
+        assert!(
+            !fixture
+                .project
+                .join(".gemini/skills/uncharted-ideation")
+                .exists()
+        );
+        assert!(displaced.join("skills/other-skill/SKILL.md").is_file());
+        assert!(
+            fixture
+                .store()
+                .list()
+                .expect("no installation receipt")
+                .is_empty()
+        );
+        assert!(!fixture.data.join("operations").exists());
+    }
+
+    #[test]
     fn claude_dry_run_is_read_only_and_reserved_skill_names_are_rejected() {
         let fixture = InstallFixture::new();
         let scope = ResolvedScope::from_agent_validated(
@@ -3066,6 +3587,88 @@ mod install_tests {
     }
 
     #[test]
+    fn pending_gemini_install_cannot_recover_through_cursor_or_codex() {
+        let fixture = InstallFixture::new();
+        let gemini_scope = ResolvedScope::from_agent_validated(
+            crate::agents::AgentId::Gemini,
+            InstallScope::Project,
+            fixture.project.clone(),
+        );
+        let factory = TestFactory(fixture.staging.clone());
+        execute_install_in_scope_with(
+            "uncharted",
+            "gemini",
+            &gemini_scope,
+            InstallContext {
+                catalog: &fixture.catalog,
+                _current_directory: &fixture.current,
+                transport: &FixtureTransport::archive(),
+                tempdir_factory: &factory,
+                receipt_store: || Ok(fixture.store()),
+                complete: |session: &InstallationSession, store: &ReceiptStore| {
+                    session.commit_and_record_at_with_journal(
+                        store,
+                        1_900_000_000,
+                        &NoInstallFaults,
+                        &FailReceiptAt(ReceiptOperation::PublishNoReplace),
+                        &NoJournalFaults,
+                    )
+                },
+            },
+        )
+        .expect_err("failed publication leaves a Gemini recovery journal");
+
+        let journal_path = fs::read_dir(fixture.data.join("operations"))
+            .expect("pending operation directory")
+            .next()
+            .expect("pending Gemini journal")
+            .expect("journal entry")
+            .path();
+        let before = fs::read(&journal_path).expect("Gemini journal bytes");
+        let record: serde_json::Value = serde_json::from_slice(&before).expect("journal JSON");
+        assert_eq!(record["schemaVersion"], 4);
+        assert_eq!(record["receipt"]["agent"], "gemini");
+        assert_eq!(record["receipt"]["schemaVersion"], 5);
+        let gemini_destination = fixture.project.join(".gemini/skills/uncharted-ideation");
+        assert!(gemini_destination.join("SKILL.md").is_file());
+
+        for agent in [
+            crate::agents::AgentId::Cursor,
+            crate::agents::AgentId::Codex,
+        ] {
+            let other_scope = ResolvedScope::from_agent_validated(
+                agent,
+                InstallScope::Project,
+                fixture.project.clone(),
+            );
+            assert!(
+                fixture
+                    .store()
+                    .recover_scope_with_faults(&other_scope, &NoJournalFaults, &NoReceiptFaults)
+                    .is_err(),
+                "{} cannot recover Gemini's operation",
+                agent.as_str()
+            );
+            assert!(gemini_destination.join("SKILL.md").is_file());
+            assert_eq!(
+                fs::read(&journal_path).expect("Gemini journal remains unchanged"),
+                before
+            );
+            assert!(!fixture.project.join(".cursor").exists());
+            assert!(!fixture.project.join(".agents").exists());
+        }
+
+        fixture
+            .store()
+            .recover_scope_with_faults(&gemini_scope, &NoJournalFaults, &NoReceiptFaults)
+            .expect("Gemini recovers its own exact operation");
+        let receipts = fixture.store().list().expect("published Gemini receipt");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].agent(), "gemini");
+        assert!(gemini_destination.join("SKILL.md").is_file());
+    }
+
+    #[test]
     fn claude_removal_journal_recovers_after_quarantine_and_preserves_codex() {
         let fixture = InstallFixture::new();
         let codex_scope =
@@ -3195,6 +3798,8 @@ mod install_tests {
         for agent in [
             crate::agents::AgentId::Codex,
             crate::agents::AgentId::ClaudeCode,
+            crate::agents::AgentId::Cursor,
+            crate::agents::AgentId::Gemini,
         ] {
             let fixture = InstallFixture::new();
             let scope = ResolvedScope::from_agent_validated(
