@@ -4143,14 +4143,16 @@ mod install_tests {
             crate::agents::AgentId::Cursor,
         ];
         let scopes = batch_scopes(&fixture, &agents, InstallScope::Project, &fixture.project);
-        let error = prepare_multi_install_plan(
+        let error = match prepare_multi_install_plan(
             &fixture.catalog,
             "uncharted",
             &scopes,
             &FixtureTransport::archive(),
             &TestFactory(fixture.staging.clone()),
-        )
-        .expect_err("multi-agent planning must reject the junction before writes");
+        ) {
+            Ok(_) => panic!("multi-agent planning must reject the junction before writes"),
+            Err(error) => error,
+        };
 
         assert!(matches!(
             error,
