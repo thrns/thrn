@@ -341,6 +341,35 @@ macOS, files and containing directories are synchronized where supported. The Wi
 directory-handle layer cannot flush directory-entry metadata, matching existing install/removal
 power-loss limitations. These guarantees do not claim power-loss atomicity across filesystems.
 
+## Multi-agent batch journal
+
+M3-07 adds a separate schema-v1 sequence journal in application-data `batches`. It records the
+canonical resource and full source pin, ordered agent IDs and conflict matrix, one selected scope
+root and its filesystem identity, exact per-agent destinations, preflight absence and parent
+identity evidence, receipt identities, target commit/publication state, verification state,
+compensation state, and final batch outcome. The initial record is durably published before the
+first target changes. Only one unfinished batch can reserve the receipt store at a time.
+
+The coordinator holds the same `.writer.lock` across all target commits. Each target still uses its
+ordinary installation journal and receipt publication. Previously created native agent directories
+are allowed to appear as exact, identity-checked project-root additions during later target commits;
+other changes to the planned root snapshot remain conflicts. This permits compatible batches to
+install into separate native roots while preserving single-target snapshot checks.
+
+After interruption, a lifecycle command that selects a batch participant acquires the writer lock
+and recovers matching child install/removal/update operations under that reservation. If every
+target has its exact verified receipt and current content, recovery can finalize the batch. Otherwise
+recovery records compensation intent and visits targets in reverse order through the receipt-backed
+removal/quarantine engine. A target is never deleted based only on a batch journal entry. If the
+receipt, directory identity, parent state, or complete tree does not verify, recovery preserves the
+content and retains a partial batch record. A later recovery may retry compensation after
+revalidating the same proof.
+
+The batch is a recoverable sequence, not a cross-target atomic transaction. A successfully
+committed target can be visible while later targets are still in progress. Linux/macOS synchronize
+files and containing directories where supported. Windows directory-entry flush limitations and
+cross-filesystem power-loss limits remain the same as the single-target lifecycle.
+
 ## Read-only listing and troubleshooting
 
 `skills list --installed` remains offline and read-only. It lists validated receipts only and does
@@ -352,7 +381,7 @@ destination inspection also reconciles pending install records before reporting 
 or an unreceipted conflict.
 
 When recovery reports a conflict, preserve the project tree, receipt store, `operations`, `removals`,
-and `updates` directories as found. Record the operation ID and actionable error for the architect or
+`updates`, and `batches` directories as found. Record the operation ID and actionable error for the architect or
 maintainer. Do not delete a skill directory, quarantine, `.writer.lock`, `.pending-*` file, receipt,
 or journal because its name looks temporary or stale. Do not copy an unreceipted directory into the
 managed list. A retry through `thrn skills install`, `thrn skills update`, or `thrn skills remove` is safe only when

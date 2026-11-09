@@ -273,6 +273,22 @@ pub struct DestinationSnapshot {
 }
 
 impl DestinationSnapshot {
+    pub(crate) fn same_destination_state_except_project_entries(&self, other: &Self) -> bool {
+        self.agent == other.agent
+            && self.agent_directory == other.agent_directory
+            && self.project_root == other.project_root
+            && self.project_identity == other.project_identity
+            && self.agents_state == other.agents_state
+            && self.agents_identity == other.agents_identity
+            && self.skills_state == other.skills_state
+            && self.skills_identity == other.skills_identity
+            && self.skill_state == other.skill_state
+            && self.destination == other.destination
+            && self.existing_agents_entries == other.existing_agents_entries
+            && self.existing_skill_entries == other.existing_skill_entries
+            && self.conflicts == other.conflicts
+    }
+
     pub(crate) fn same_shared_path_state(&self, other: &Self) -> bool {
         self.agent == AgentId::Codex
             && other.agent == AgentId::Codex

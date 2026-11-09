@@ -291,6 +291,7 @@ pub(crate) trait JournalFaultInjector: Send + Sync {
 pub(crate) struct NoJournalFaults;
 impl JournalFaultInjector for NoJournalFaults {}
 
+#[derive(Clone)]
 pub(crate) struct JournalStore {
     directory: PathBuf,
 }

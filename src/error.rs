@@ -11,6 +11,12 @@ pub enum ThrnError {
     #[error(transparent)]
     Install(#[from] crate::install::command::InstallCommandError),
     #[error(transparent)]
+    MultiInstallPlan(#[from] crate::install::batch::MultiInstallPlanError),
+    #[error(transparent)]
+    MultiInstallPreflight(#[from] crate::install::batch::MultiInstallPreflightError),
+    #[error(transparent)]
+    BatchInstall(#[from] crate::install::batch::BatchInstallError),
+    #[error(transparent)]
     InstalledListing(#[from] crate::install::receipt_store::ReceiptStoreError),
     #[error(transparent)]
     Removal(#[from] crate::install::removal::RemovalError),
