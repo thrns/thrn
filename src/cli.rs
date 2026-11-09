@@ -1164,10 +1164,11 @@ fn write_stdout(output: &str) -> Result<()> {
 #[cfg(test)]
 mod install_tests {
     use std::{
+        collections::BTreeMap,
         fs,
         io::{self, Cursor, Write},
         path::{Path, PathBuf},
-        process::{Child, Command, ExitStatus},
+        process::{Child, Command, ExitStatus, Stdio},
         sync::{
             Arc, Barrier,
             atomic::{AtomicUsize, Ordering},
@@ -1188,8 +1189,10 @@ mod install_tests {
     use crate::{
         install::{
             batch::{
-                ExistingTargetState, execute_multi_install, execute_multi_install_with_faults,
-                inspect_multi_install_preflight, prepare_multi_install_plan,
+                BatchCrashPoint, BatchFaultInjector, BatchTestFaults, ExistingTargetState,
+                execute_multi_install, execute_multi_install_with_faults,
+                execute_multi_install_with_test_faults, inspect_multi_install_preflight,
+                prepare_multi_install_plan,
             },
             check::{CheckStatus, classify},
             commit::{InstallFaultInjector, InstallOperation},
@@ -1227,6 +1230,10 @@ mod install_tests {
     impl FixtureTransport {
         fn archive() -> Self {
             Self::with_response(Ok(make_archive()))
+        }
+
+        fn archive_for_skill_name(skill_name: &str) -> Self {
+            Self::with_response(Ok(make_archive_for_name(skill_name)))
         }
 
         fn with_response(response: Result<Vec<u8>, TransportError>) -> Self {
@@ -1329,6 +1336,30 @@ mod install_tests {
             }
         }
 
+        fn from_existing_root(root_path: &Path) -> Self {
+            let root = tempdir().expect("child test anchor");
+            let root_path = root_path
+                .canonicalize()
+                .expect("canonical shared fixture root");
+            let current = root_path.join("project");
+            let staging = root_path.join("staging");
+            let data = root_path.join("data");
+            assert!(current.is_dir(), "shared project fixture exists");
+            assert!(staging.is_dir(), "shared staging fixture exists");
+            let catalog = parse_catalog_json(include_bytes!(
+                "../tests/fixtures/catalog/test-only-valid-v1.json"
+            ))
+            .expect("offline catalog fixture");
+            Self {
+                _root: root,
+                current: current.clone(),
+                project: current,
+                staging,
+                data,
+                catalog,
+            }
+        }
+
         fn store(&self) -> ReceiptStore {
             ReceiptStore::new(self.data.join("receipts"))
         }
@@ -1419,6 +1450,15 @@ mod install_tests {
             zip.finish().expect("complete ZIP archive");
         }
         bytes.into_inner()
+    }
+
+    fn catalog_for_skill_name(skill_name: &str) -> crate::models::catalog::Catalog {
+        let catalog_json = std::str::from_utf8(include_bytes!(
+            "../tests/fixtures/catalog/test-only-valid-v1.json"
+        ))
+        .expect("catalog fixture is UTF-8")
+        .replace("uncharted-ideation", skill_name);
+        parse_catalog_json(catalog_json.as_bytes()).expect("renamed offline catalog fixture")
     }
 
     fn run_with_completion<C>(
@@ -4129,6 +4169,450 @@ mod install_tests {
         .expect("offline multi-agent plan")
     }
 
+    const BATCH_TEST_MODE_ENV: &str = "THRN_TEST_M307_BATCH_MODE";
+    const BATCH_TEST_SCENARIO_ENV: &str = "THRN_TEST_M307_BATCH_SCENARIO";
+    const BATCH_TEST_ROOT_ENV: &str = "THRN_TEST_M307_BATCH_ROOT";
+    const BATCH_TEST_RECOVERY_ENV: &str = "THRN_TEST_M307_BATCH_RECOVERY";
+
+    struct ExitAtBatchBoundary {
+        scenario: String,
+    }
+
+    impl BatchFaultInjector for ExitAtBatchBoundary {
+        fn reached(&self, point: BatchCrashPoint) {
+            let exit_code = match (self.scenario.as_str(), point) {
+                ("between-targets", BatchCrashPoint::TargetVerified(0)) => Some(90),
+                ("compensation-intent", BatchCrashPoint::CompensationIntentRecorded) => Some(93),
+                ("terminal-cleanup", BatchCrashPoint::CompleteOutcomeRecorded) => Some(94),
+                _ => None,
+            };
+            if let Some(exit_code) = exit_code {
+                std::process::exit(exit_code);
+            }
+        }
+    }
+
+    struct ExitDuringSecondReceipt {
+        scenario: String,
+        attempts: AtomicUsize,
+    }
+
+    impl ReceiptFaultInjector for ExitDuringSecondReceipt {
+        fn before(&self, operation: ReceiptOperation) -> io::Result<()> {
+            if self.scenario == "second-target-commit"
+                && operation == ReceiptOperation::CreateTemporaryReceipt
+                && self.attempts.fetch_add(1, Ordering::SeqCst) == 1
+            {
+                std::process::exit(91);
+            }
+            Ok(())
+        }
+    }
+
+    struct FailSecondBatchCommit {
+        commits: AtomicUsize,
+    }
+
+    impl InstallFaultInjector for FailSecondBatchCommit {
+        fn before(&self, operation: InstallOperation) -> io::Result<()> {
+            if operation == InstallOperation::CommitNoReplace
+                && self.commits.fetch_add(1, Ordering::SeqCst) == 1
+            {
+                return Err(io::Error::other("injected second target commit failure"));
+            }
+            Ok(())
+        }
+    }
+
+    struct ExitAfterCompensationQuarantine {
+        scenario: String,
+    }
+
+    impl RemovalFaultInjector for ExitAfterCompensationQuarantine {
+        fn after(&self, operation: RemovalOperation) -> io::Result<()> {
+            if self.scenario == "compensation-quarantine"
+                && operation == RemovalOperation::RenameToQuarantine
+            {
+                std::process::exit(92);
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum FixtureTreeEntry {
+        Directory(PathBuf),
+        File(PathBuf, Vec<u8>),
+    }
+
+    fn snapshot_tree(root: &Path) -> Vec<FixtureTreeEntry> {
+        fn visit(root: &Path, directory: &Path, entries: &mut Vec<FixtureTreeEntry>) {
+            let mut children = fs::read_dir(directory)
+                .expect("snapshot installation tree")
+                .map(|entry| entry.expect("snapshot directory entry"))
+                .collect::<Vec<_>>();
+            children.sort_by_key(|entry| entry.file_name());
+            for child in children {
+                let path = child.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("tree entry under snapshot root")
+                    .to_path_buf();
+                let kind = fs::symlink_metadata(&path)
+                    .expect("snapshot tree metadata")
+                    .file_type();
+                if kind.is_dir() {
+                    entries.push(FixtureTreeEntry::Directory(relative));
+                    visit(root, &path, entries);
+                } else {
+                    assert!(
+                        kind.is_file(),
+                        "fixture installation contains regular files only"
+                    );
+                    entries.push(FixtureTreeEntry::File(
+                        relative,
+                        fs::read(&path).expect("snapshot file bytes"),
+                    ));
+                }
+            }
+        }
+
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries);
+        entries
+    }
+
+    struct BatchUnchangedSnapshot {
+        codex_tree: Vec<FixtureTreeEntry>,
+        gemini_tree: Vec<FixtureTreeEntry>,
+        outside_receipts: Vec<crate::install::receipt::InstallationReceipt>,
+        outside_receipt_bytes: BTreeMap<PathBuf, Vec<u8>>,
+        unmanaged: BTreeMap<PathBuf, Vec<u8>>,
+    }
+
+    fn prepare_batch_isolation_fixture() -> (InstallFixture, BatchUnchangedSnapshot) {
+        let mut fixture = InstallFixture::new();
+        let codex_scope = ResolvedScope::from_agent_validated(
+            crate::agents::AgentId::Codex,
+            InstallScope::Project,
+            fixture.project.clone(),
+        );
+        let gemini_scope = ResolvedScope::from_agent_validated(
+            crate::agents::AgentId::Gemini,
+            InstallScope::Project,
+            fixture.project.clone(),
+        );
+        for (scope, skill_name) in [
+            (&codex_scope, "codex-background-skill"),
+            (&gemini_scope, "gemini-background-skill"),
+        ] {
+            fixture.catalog = catalog_for_skill_name(skill_name);
+            fixture
+                .execute_in_scope(
+                    "uncharted",
+                    scope,
+                    &FixtureTransport::archive_for_skill_name(skill_name),
+                )
+                .expect("install unrelated background agent target");
+        }
+        fixture.catalog = catalog_for_skill_name("uncharted-ideation");
+
+        let mut unmanaged = BTreeMap::new();
+        for (relative, contents) in [
+            ("HAND-MADE.txt", b"project user file".as_slice()),
+            (
+                ".claude/skills/keep-user.txt",
+                b"Claude user file".as_slice(),
+            ),
+            (
+                ".cursor/skills/keep-user.txt",
+                b"Cursor user file".as_slice(),
+            ),
+        ] {
+            let path = fixture.project.join(relative);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("unmanaged fixture parent");
+            }
+            fs::write(&path, contents).expect("unmanaged fixture file");
+            unmanaged.insert(path, contents.to_vec());
+        }
+
+        let outside_receipts: Vec<crate::install::receipt::InstallationReceipt> = fixture
+            .store()
+            .list()
+            .expect("background installation receipts")
+            .into_iter()
+            .filter(|receipt| matches!(receipt.agent(), "codex" | "gemini"))
+            .collect();
+        let outside_receipt_bytes = outside_receipts
+            .iter()
+            .map(|receipt| {
+                let path = fixture.data.join("receipts").join(
+                    receipt
+                        .receipt_filename()
+                        .expect("background receipt filename"),
+                );
+                (
+                    path.clone(),
+                    fs::read(path).expect("background receipt bytes"),
+                )
+            })
+            .collect();
+        let snapshot = BatchUnchangedSnapshot {
+            codex_tree: snapshot_tree(&fixture.project.join(".agents/skills")),
+            gemini_tree: snapshot_tree(&fixture.project.join(".gemini/skills")),
+            outside_receipts,
+            outside_receipt_bytes,
+            unmanaged,
+        };
+        (fixture, snapshot)
+    }
+
+    fn assert_batch_files_unchanged(fixture: &InstallFixture, snapshot: &BatchUnchangedSnapshot) {
+        assert_eq!(
+            snapshot_tree(&fixture.project.join(".agents/skills")),
+            snapshot.codex_tree,
+            "pre-existing Codex installation remains unchanged"
+        );
+        assert_eq!(
+            snapshot_tree(&fixture.project.join(".gemini/skills")),
+            snapshot.gemini_tree,
+            "pre-existing Gemini installation remains unchanged"
+        );
+        for (path, contents) in &snapshot.outside_receipt_bytes {
+            assert_eq!(fs::read(path).expect("outside receipt remains"), *contents);
+        }
+        for (path, contents) in &snapshot.unmanaged {
+            assert_eq!(
+                fs::read(path).expect("unmanaged user file remains"),
+                *contents
+            );
+        }
+        assert!(!fixture.project.join("SKILL-WAS-EXECUTED").exists());
+    }
+
+    fn assert_batch_isolation_unchanged(
+        fixture: &InstallFixture,
+        snapshot: &BatchUnchangedSnapshot,
+    ) {
+        assert_batch_files_unchanged(fixture, snapshot);
+        let outside_receipts = fixture
+            .store()
+            .list()
+            .expect("receipt store is readable after completed recovery")
+            .into_iter()
+            .filter(|receipt| matches!(receipt.agent(), "codex" | "gemini"))
+            .collect::<Vec<_>>();
+        assert_eq!(outside_receipts, snapshot.outside_receipts);
+    }
+
+    fn latest_json_record(directory: &Path) -> serde_json::Value {
+        let mut files = fs::read_dir(directory)
+            .expect("journal directory exists")
+            .map(|entry| entry.expect("journal entry").path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .collect::<Vec<_>>();
+        files.sort();
+        let path = files.last().expect("journal record exists");
+        serde_json::from_slice(&fs::read(path).expect("journal record bytes"))
+            .expect("journal record JSON")
+    }
+
+    fn journal_json_count(directory: &Path) -> usize {
+        let Ok(entries) = fs::read_dir(directory) else {
+            return 0;
+        };
+        entries
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .count()
+    }
+
+    fn assert_writer_lock_released(fixture: &InstallFixture) {
+        let error = fixture
+            .store()
+            .list()
+            .expect_err("interrupted batch remains pending before recovery");
+        assert!(
+            error.to_string().contains("recovery is required"),
+            "OS writer lock was released and the durable journal blocks reads: {error}"
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains("busy or left by an interrupted write"),
+            "process termination released the OS writer lock: {error}"
+        );
+    }
+
+    fn launch_batch_test_process(
+        fixture: &InstallFixture,
+        test_name: &str,
+        mode: &str,
+        scenario: &str,
+        recovery: Option<&str>,
+    ) -> (ExitStatus, String) {
+        let root = fixture.project.parent().expect("fixture root");
+        let stdout_path = root.join(format!("{mode}-{scenario}-stdout.log"));
+        let stderr_path = root.join(format!("{mode}-{scenario}-stderr.log"));
+        let stdout = fs::File::create(&stdout_path).expect("child stdout log");
+        let stderr = fs::File::create(&stderr_path).expect("child stderr log");
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .current_dir(&fixture.project)
+            .env(BATCH_TEST_MODE_ENV, mode)
+            .env(BATCH_TEST_SCENARIO_ENV, scenario)
+            .env(BATCH_TEST_ROOT_ENV, root)
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+        if let Some(recovery) = recovery {
+            command.env(BATCH_TEST_RECOVERY_ENV, recovery);
+        }
+        let mut child = command.spawn().expect("start bounded batch test process");
+        let status = wait_for_child(&mut child, std::time::Duration::from_secs(60))
+            .unwrap_or_else(|error| panic!("batch subprocess did not finish in time: {error}"));
+        let stdout = fs::read_to_string(stdout_path).expect("child stdout bytes");
+        let stderr = fs::read_to_string(stderr_path).expect("child stderr bytes");
+        assert!(
+            !stdout.contains("Targets completed:"),
+            "crashed or recovering child did not report batch-install success: {stdout}"
+        );
+        (status, format!("{stdout}{stderr}"))
+    }
+
+    fn run_batch_crash_test_child() -> bool {
+        let Some(mode) = std::env::var_os(BATCH_TEST_MODE_ENV) else {
+            return false;
+        };
+        let mode = mode.to_string_lossy();
+        let scenario = std::env::var(BATCH_TEST_SCENARIO_ENV).expect("batch crash scenario");
+        let root = PathBuf::from(std::env::var_os(BATCH_TEST_ROOT_ENV).expect("fixture root"));
+        let fixture = InstallFixture::from_existing_root(&root);
+        let agents = [
+            crate::agents::AgentId::ClaudeCode,
+            crate::agents::AgentId::Cursor,
+        ];
+        let scopes = batch_scopes(&fixture, &agents, InstallScope::Project, &fixture.project);
+
+        if mode == "install" {
+            let plan =
+                prepare_batch_plan(&fixture, "uncharted", &scopes, &FixtureTransport::archive());
+            let install_faults = FailSecondBatchCommit {
+                commits: AtomicUsize::new(0),
+            };
+            let receipt_faults = ExitDuringSecondReceipt {
+                scenario: scenario.clone(),
+                attempts: AtomicUsize::new(0),
+            };
+            let removal_faults = ExitAfterCompensationQuarantine {
+                scenario: scenario.clone(),
+            };
+            let batch_faults = ExitAtBatchBoundary {
+                scenario: scenario.clone(),
+            };
+            let no_install_faults = NoInstallFaults;
+            let install_faults: &dyn InstallFaultInjector = if scenario.starts_with("compensation")
+            {
+                &install_faults
+            } else {
+                &no_install_faults
+            };
+            let journal_faults = NoJournalFaults;
+            let test_faults = BatchTestFaults::new(
+                install_faults,
+                &receipt_faults,
+                &journal_faults,
+                &removal_faults,
+                &batch_faults,
+            );
+            let _ = execute_multi_install_with_test_faults(
+                &plan,
+                &scopes,
+                &fixture.store(),
+                &test_faults,
+            );
+            panic!("batch installation returned without exiting at the requested crash boundary");
+        }
+
+        assert_eq!(mode, "recover", "unknown child mode");
+        let recovery = std::env::var(BATCH_TEST_RECOVERY_ENV).expect("recovery expectation");
+        let result = fixture.store().recover_scope_with_faults(
+            &scopes[0],
+            &NoJournalFaults,
+            &NoReceiptFaults,
+        );
+        if recovery == "conflict" {
+            let error = result.expect_err("modified installed content must fail closed");
+            assert!(
+                ["preserv", "conflict", "changed", "unexpected", "journal"]
+                    .iter()
+                    .any(|marker| error.to_string().contains(marker)),
+                "recovery conflict explains preserved content: {error}"
+            );
+            return true;
+        }
+
+        result.expect("new recovery process completes the interrupted batch safely");
+        let receipts = fixture.store().list().expect("receipts after recovery");
+        let installed = matches!(
+            scenario.as_str(),
+            "second-target-commit" | "terminal-cleanup"
+        );
+        let selected = receipts
+            .iter()
+            .filter(|receipt| matches!(receipt.agent(), "claude-code" | "cursor"))
+            .count();
+        assert_eq!(selected, if installed { 2 } else { 0 });
+        if installed {
+            for scope in &scopes {
+                let inspection = fixture
+                    .store()
+                    .inspect_scope(scope)
+                    .expect("inspect recovered target");
+                assert_eq!(inspection.installations.len(), 1);
+                assert_eq!(
+                    inspection.installations[0].content,
+                    crate::install::receipt_store::ReceiptContentState::Verified
+                );
+            }
+        }
+        assert_eq!(
+            fixture
+                .store()
+                .batch_journal_store()
+                .expect("batch journal store")
+                .pending_count()
+                .expect("batch journal state after recovery"),
+            0
+        );
+        assert!(
+            fixture
+                .store()
+                .journal_store()
+                .expect("child installation journal store")
+                .read_all()
+                .expect("child installation journal state after recovery")
+                .is_empty()
+        );
+        assert_eq!(
+            journal_json_count(&fixture.data.join("removals")),
+            0,
+            "child removal journals are finalized after recovery"
+        );
+        true
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_multi_agent_preflight_rejects_real_agent_directory_junction() {
@@ -4780,6 +5264,488 @@ mod install_tests {
                 .exists()
         );
         assert!(fixture.store().list().expect("receipts gone").is_empty());
+    }
+
+    fn assert_selected_batch_state(fixture: &InstallFixture, installed: bool) {
+        let scopes = batch_scopes(
+            fixture,
+            &[
+                crate::agents::AgentId::ClaudeCode,
+                crate::agents::AgentId::Cursor,
+            ],
+            InstallScope::Project,
+            &fixture.project,
+        );
+        let receipts = fixture.store().list().expect("selected receipts readable");
+        let selected = receipts
+            .iter()
+            .filter(|receipt| matches!(receipt.agent(), "claude-code" | "cursor"))
+            .count();
+        assert_eq!(selected, if installed { 2 } else { 0 });
+        for scope in &scopes {
+            let target = scope.skills_root().join("uncharted-ideation");
+            assert_eq!(
+                target.is_dir(),
+                installed,
+                "target state for {}",
+                scope.agent().as_str()
+            );
+            if installed {
+                let inspection = fixture
+                    .store()
+                    .inspect_scope(scope)
+                    .expect("full target content verification");
+                assert_eq!(inspection.installations.len(), 1);
+                assert_eq!(
+                    inspection.installations[0].content,
+                    crate::install::receipt_store::ReceiptContentState::Verified
+                );
+            }
+        }
+    }
+
+    fn assert_batch_journals_finalized(fixture: &InstallFixture) {
+        let store = fixture.store();
+        assert_eq!(
+            store
+                .batch_journal_store()
+                .expect("batch journal store")
+                .pending_count()
+                .expect("validated batch journal cleanup"),
+            0
+        );
+        assert!(
+            store
+                .journal_store()
+                .expect("child install journal store")
+                .read_all()
+                .expect("validated child install journal cleanup")
+                .is_empty()
+        );
+        assert_eq!(
+            journal_json_count(&fixture.data.join("removals")),
+            0,
+            "validated child removal journal cleanup"
+        );
+    }
+
+    #[test]
+    fn subprocess_batch_crash_between_targets_recovers_safely() {
+        if run_batch_crash_test_child() {
+            return;
+        }
+        let (fixture, snapshot) = prepare_batch_isolation_fixture();
+        let test_name =
+            "cli::install_tests::subprocess_batch_crash_between_targets_recovers_safely";
+        let (status, output) =
+            launch_batch_test_process(&fixture, test_name, "install", "between-targets", None);
+        assert_eq!(
+            status.code(),
+            Some(90),
+            "intended exit after target 1: {output}"
+        );
+        assert_writer_lock_released(&fixture);
+        assert_batch_files_unchanged(&fixture, &snapshot);
+
+        let batch = latest_json_record(&fixture.data.join("batches"));
+        assert_eq!(batch["outcome"], "installing");
+        assert_eq!(batch["targets"][0]["state"], "verified");
+        assert_eq!(batch["targets"][1]["state"], "pending");
+        assert!(
+            fixture
+                .project
+                .join(".claude/skills/uncharted-ideation")
+                .is_dir()
+        );
+        assert!(
+            !fixture
+                .project
+                .join(".cursor/skills/uncharted-ideation")
+                .exists()
+        );
+
+        for attempt in 0..2 {
+            let (recovery_status, recovery_output) = launch_batch_test_process(
+                &fixture,
+                test_name,
+                "recover",
+                "between-targets",
+                Some("success"),
+            );
+            assert_eq!(
+                recovery_status.code(),
+                Some(0),
+                "recovery attempt {attempt}: {recovery_output}"
+            );
+            assert_selected_batch_state(&fixture, false);
+            assert_batch_journals_finalized(&fixture);
+            assert_batch_isolation_unchanged(&fixture, &snapshot);
+        }
+    }
+
+    #[test]
+    fn subprocess_batch_crash_during_second_target_commit_reconciles_child_journal() {
+        if run_batch_crash_test_child() {
+            return;
+        }
+        let (fixture, snapshot) = prepare_batch_isolation_fixture();
+        let test_name = "cli::install_tests::subprocess_batch_crash_during_second_target_commit_reconciles_child_journal";
+        let (status, output) =
+            launch_batch_test_process(&fixture, test_name, "install", "second-target-commit", None);
+        assert_eq!(
+            status.code(),
+            Some(91),
+            "exit during second receipt publication: {output}"
+        );
+        assert_writer_lock_released(&fixture);
+        assert_batch_files_unchanged(&fixture, &snapshot);
+
+        let batch = latest_json_record(&fixture.data.join("batches"));
+        assert_eq!(batch["outcome"], "installing");
+        assert_eq!(batch["targets"][0]["state"], "verified");
+        assert_eq!(batch["targets"][1]["state"], "committing");
+        assert!(
+            fixture
+                .project
+                .join(".cursor/skills/uncharted-ideation")
+                .is_dir()
+        );
+        let child = latest_json_record(&fixture.data.join("operations"));
+        assert_eq!(child["state"], "receiptPublicationPending");
+        assert_eq!(child["receipt"]["agent"], "cursor");
+        let receipt_directory = fixture.data.join("receipts");
+        assert!(
+            receipt_directory
+                .join(batch["targets"][0]["expectedReceiptName"].as_str().unwrap())
+                .is_file()
+        );
+        assert!(
+            !receipt_directory
+                .join(batch["targets"][1]["expectedReceiptName"].as_str().unwrap())
+                .exists()
+        );
+
+        let (recovery_status, recovery_output) = launch_batch_test_process(
+            &fixture,
+            test_name,
+            "recover",
+            "second-target-commit",
+            Some("success"),
+        );
+        assert_eq!(
+            recovery_status.code(),
+            Some(0),
+            "child journal reconciliation: {recovery_output}"
+        );
+        assert_selected_batch_state(&fixture, true);
+        assert_batch_journals_finalized(&fixture);
+        assert_batch_isolation_unchanged(&fixture, &snapshot);
+        let (repeat_status, repeat_output) = launch_batch_test_process(
+            &fixture,
+            test_name,
+            "recover",
+            "second-target-commit",
+            Some("success"),
+        );
+        assert_eq!(
+            repeat_status.code(),
+            Some(0),
+            "idempotent recovery: {repeat_output}"
+        );
+        assert_selected_batch_state(&fixture, true);
+        assert_batch_journals_finalized(&fixture);
+        assert_batch_isolation_unchanged(&fixture, &snapshot);
+    }
+
+    #[test]
+    fn subprocess_batch_crash_during_second_target_commit_preserves_unreceipted_content() {
+        if run_batch_crash_test_child() {
+            return;
+        }
+        let (fixture, snapshot) = prepare_batch_isolation_fixture();
+        let test_name = "cli::install_tests::subprocess_batch_crash_during_second_target_commit_preserves_unreceipted_content";
+        let (status, output) =
+            launch_batch_test_process(&fixture, test_name, "install", "second-target-commit", None);
+        assert_eq!(
+            status.code(),
+            Some(91),
+            "exit with unreceipted second target: {output}"
+        );
+        assert_writer_lock_released(&fixture);
+        assert_batch_files_unchanged(&fixture, &snapshot);
+        let batch = latest_json_record(&fixture.data.join("batches"));
+        assert_eq!(batch["targets"][1]["state"], "committing");
+        let second_receipt_name = batch["targets"][1]["expectedReceiptName"]
+            .as_str()
+            .expect("second target receipt identity");
+        let second_receipt_path = fixture.data.join("receipts").join(second_receipt_name);
+        assert!(
+            !second_receipt_path.exists(),
+            "second target is not receipted yet"
+        );
+        let user_file = fixture
+            .project
+            .join(".cursor/skills/uncharted-ideation/user-added-after-exit.txt");
+        let user_bytes = b"unreceipted user content";
+        fs::write(&user_file, user_bytes).expect("add unreceipted content before recovery");
+
+        for attempt in 0..2 {
+            let (recovery_status, recovery_output) = launch_batch_test_process(
+                &fixture,
+                test_name,
+                "recover",
+                "second-target-commit",
+                Some("conflict"),
+            );
+            assert_eq!(
+                recovery_status.code(),
+                Some(0),
+                "conservative recovery attempt {attempt}: {recovery_output}"
+            );
+            assert_eq!(
+                fs::read(&user_file).expect("unreceipted user file preserved"),
+                user_bytes
+            );
+            assert!(
+                !second_receipt_path.exists(),
+                "recovery did not adopt the modified unreceipted target"
+            );
+            assert_batch_files_unchanged(&fixture, &snapshot);
+            let latest_batch = latest_json_record(&fixture.data.join("batches"));
+            assert_eq!(latest_batch["outcome"], "installing");
+            assert_eq!(latest_batch["targets"][1]["state"], "committing");
+            let child = latest_json_record(&fixture.data.join("operations"));
+            assert_eq!(child["state"], "receiptPublicationPending");
+            assert_eq!(
+                journal_json_count(&fixture.data.join("removals")),
+                0,
+                "recovery did not start compensation before child verification"
+            );
+            assert_writer_lock_released(&fixture);
+        }
+    }
+
+    #[test]
+    fn subprocess_batch_crash_during_compensation_finishes_receipt_backed_removal() {
+        if run_batch_crash_test_child() {
+            return;
+        }
+        let (fixture, snapshot) = prepare_batch_isolation_fixture();
+        let test_name = "cli::install_tests::subprocess_batch_crash_during_compensation_finishes_receipt_backed_removal";
+        let (status, output) = launch_batch_test_process(
+            &fixture,
+            test_name,
+            "install",
+            "compensation-quarantine",
+            None,
+        );
+        assert_eq!(
+            status.code(),
+            Some(92),
+            "exit after receipt-backed quarantine: {output}"
+        );
+        assert_writer_lock_released(&fixture);
+        assert_batch_files_unchanged(&fixture, &snapshot);
+
+        let batch = latest_json_record(&fixture.data.join("batches"));
+        assert_eq!(batch["outcome"], "compensating");
+        assert_eq!(batch["targets"][0]["state"], "compensationPending");
+        assert_eq!(batch["targets"][1]["state"], "compensated");
+        let removal = latest_json_record(&fixture.data.join("removals"));
+        assert_eq!(removal["state"], "destinationRenamePending");
+        assert_eq!(removal["receipt"]["agent"], "claude-code");
+        let quarantine_name = removal["quarantineName"].as_str().expect("quarantine name");
+        assert!(
+            fixture
+                .project
+                .join(".claude/skills")
+                .join(quarantine_name)
+                .is_dir()
+        );
+        assert!(
+            !fixture
+                .project
+                .join(".claude/skills/uncharted-ideation")
+                .exists()
+        );
+
+        let (recovery_status, recovery_output) = launch_batch_test_process(
+            &fixture,
+            test_name,
+            "recover",
+            "compensation-quarantine",
+            Some("success"),
+        );
+        assert_eq!(
+            recovery_status.code(),
+            Some(0),
+            "receipt-backed recovery: {recovery_output}"
+        );
+        assert_selected_batch_state(&fixture, false);
+        assert_batch_journals_finalized(&fixture);
+        assert!(
+            !fixture
+                .project
+                .join(".claude/skills")
+                .join(quarantine_name)
+                .exists()
+        );
+        assert_batch_isolation_unchanged(&fixture, &snapshot);
+        let (repeat_status, repeat_output) = launch_batch_test_process(
+            &fixture,
+            test_name,
+            "recover",
+            "compensation-quarantine",
+            Some("success"),
+        );
+        assert_eq!(
+            repeat_status.code(),
+            Some(0),
+            "idempotent recovery: {repeat_output}"
+        );
+        assert_selected_batch_state(&fixture, false);
+        assert_batch_journals_finalized(&fixture);
+        assert_batch_isolation_unchanged(&fixture, &snapshot);
+    }
+
+    #[test]
+    fn subprocess_batch_crash_after_compensation_intent_preserves_modified_content() {
+        if run_batch_crash_test_child() {
+            return;
+        }
+        let (fixture, snapshot) = prepare_batch_isolation_fixture();
+        let test_name = "cli::install_tests::subprocess_batch_crash_after_compensation_intent_preserves_modified_content";
+        let (status, output) =
+            launch_batch_test_process(&fixture, test_name, "install", "compensation-intent", None);
+        assert_eq!(
+            status.code(),
+            Some(93),
+            "exit after durable compensation intent: {output}"
+        );
+        assert_writer_lock_released(&fixture);
+        assert_batch_files_unchanged(&fixture, &snapshot);
+        let batch = latest_json_record(&fixture.data.join("batches"));
+        assert_eq!(batch["outcome"], "compensating");
+        assert_eq!(batch["targets"][0]["state"], "compensationPending");
+        let modified = fixture
+            .project
+            .join(".claude/skills/uncharted-ideation/SKILL.md");
+        let user_bytes = b"modified after abrupt batch termination";
+        fs::write(&modified, user_bytes).expect("modify installed target before restart");
+        let receipt_name = batch["targets"][0]["expectedReceiptName"]
+            .as_str()
+            .expect("expected receipt name");
+        let receipt_path = fixture.data.join("receipts").join(receipt_name);
+        let receipt_bytes = fs::read(&receipt_path).expect("published first-target receipt");
+
+        for attempt in 0..2 {
+            let (recovery_status, recovery_output) = launch_batch_test_process(
+                &fixture,
+                test_name,
+                "recover",
+                "compensation-intent",
+                Some("conflict"),
+            );
+            assert_eq!(
+                recovery_status.code(),
+                Some(0),
+                "conflict-aware recovery attempt {attempt}: {recovery_output}"
+            );
+            assert_eq!(
+                fs::read(&modified).expect("modified target preserved"),
+                user_bytes
+            );
+            assert_eq!(
+                fs::read(&receipt_path).expect("receipt identity preserved"),
+                receipt_bytes
+            );
+            assert_batch_files_unchanged(&fixture, &snapshot);
+            let latest = latest_json_record(&fixture.data.join("batches"));
+            assert_eq!(latest["outcome"], "partial");
+            assert_eq!(latest["targets"][0]["state"], "partial");
+            assert!(
+                latest["targets"][0]["compensationDetail"]
+                    .as_str()
+                    .is_some()
+            );
+            assert_writer_lock_released(&fixture);
+        }
+        assert_eq!(
+            fixture
+                .store()
+                .batch_journal_store()
+                .expect("preserved batch recovery record")
+                .pending_count()
+                .expect("actionable recovery conflict remains"),
+            1
+        );
+    }
+
+    #[test]
+    fn subprocess_batch_crash_after_terminal_outcome_keeps_successful_batch() {
+        if run_batch_crash_test_child() {
+            return;
+        }
+        let (fixture, snapshot) = prepare_batch_isolation_fixture();
+        let test_name = "cli::install_tests::subprocess_batch_crash_after_terminal_outcome_keeps_successful_batch";
+        let (status, output) =
+            launch_batch_test_process(&fixture, test_name, "install", "terminal-cleanup", None);
+        assert_eq!(
+            status.code(),
+            Some(94),
+            "exit after complete outcome record: {output}"
+        );
+        assert_writer_lock_released(&fixture);
+        assert_batch_files_unchanged(&fixture, &snapshot);
+        let batch = latest_json_record(&fixture.data.join("batches"));
+        assert_eq!(batch["outcome"], "complete");
+        assert_eq!(batch["targets"][0]["state"], "verified");
+        assert_eq!(batch["targets"][1]["state"], "verified");
+        for target in batch["targets"].as_array().expect("terminal targets") {
+            let destination = PathBuf::from(
+                target["destination"]
+                    .as_str()
+                    .expect("terminal destination path"),
+            );
+            assert!(destination.is_dir(), "committed target remains present");
+            let receipt_path = fixture.data.join("receipts").join(
+                target["expectedReceiptName"]
+                    .as_str()
+                    .expect("receipt name"),
+            );
+            let receipt: serde_json::Value = serde_json::from_slice(
+                &fs::read(receipt_path).expect("published target receipt before recovery"),
+            )
+            .expect("published target receipt JSON");
+            assert_eq!(receipt, target["expectedReceipt"]);
+        }
+        assert!(
+            fixture
+                .store()
+                .journal_store()
+                .expect("no child journals after target completion")
+                .read_all()
+                .expect("child journals validate")
+                .is_empty()
+        );
+
+        for attempt in 0..2 {
+            let (recovery_status, recovery_output) = launch_batch_test_process(
+                &fixture,
+                test_name,
+                "recover",
+                "terminal-cleanup",
+                Some("success"),
+            );
+            assert_eq!(
+                recovery_status.code(),
+                Some(0),
+                "recovery attempt {attempt}: {recovery_output}"
+            );
+            assert_selected_batch_state(&fixture, true);
+            assert_batch_journals_finalized(&fixture);
+            assert_batch_isolation_unchanged(&fixture, &snapshot);
+        }
     }
 
     #[test]

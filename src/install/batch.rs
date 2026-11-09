@@ -41,6 +41,7 @@ use super::{
     plan::{InstallPlan, InstallScope, PlanError, build_install_plan_for_agent_scope},
     receipt::InstallationReceipt,
     receipt_store::{NoReceiptFaults, ReceiptContentState, ReceiptStore, SharedSkillStatus},
+    removal::{NoRemovalFaults, RemovalFaultInjector},
     scope::ResolvedScope,
 };
 
@@ -1231,9 +1232,90 @@ pub(crate) fn execute_multi_install_with_faults(
     receipt_faults: &dyn super::receipt_store::ReceiptFaultInjector,
     journal_faults: &dyn JournalFaultInjector,
 ) -> Result<String, BatchInstallError> {
+    let faults = BatchFaults {
+        install: install_faults,
+        receipt: receipt_faults,
+        journal: journal_faults,
+        removal: &NoRemovalFaults,
+        #[cfg(test)]
+        batch: &NoBatchFaults,
+    };
+    execute_multi_install_impl(plan, scopes, store, &faults)
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BatchCrashPoint {
+    TargetVerified(usize),
+    CompensationIntentRecorded,
+    CompleteOutcomeRecorded,
+}
+
+#[cfg(test)]
+pub(crate) trait BatchFaultInjector: Send + Sync {
+    fn reached(&self, _point: BatchCrashPoint) {}
+}
+
+#[cfg(test)]
+struct NoBatchFaults;
+
+#[cfg(test)]
+impl BatchFaultInjector for NoBatchFaults {}
+
+struct BatchFaults<'a> {
+    install: &'a dyn InstallFaultInjector,
+    receipt: &'a dyn super::receipt_store::ReceiptFaultInjector,
+    journal: &'a dyn JournalFaultInjector,
+    removal: &'a dyn RemovalFaultInjector,
+    #[cfg(test)]
+    batch: &'a dyn BatchFaultInjector,
+}
+
+#[cfg(test)]
+pub(crate) struct BatchTestFaults<'a> {
+    faults: BatchFaults<'a>,
+}
+
+#[cfg(test)]
+impl<'a> BatchTestFaults<'a> {
+    pub(crate) fn new(
+        install: &'a dyn InstallFaultInjector,
+        receipt: &'a dyn super::receipt_store::ReceiptFaultInjector,
+        journal: &'a dyn JournalFaultInjector,
+        removal: &'a dyn RemovalFaultInjector,
+        batch: &'a dyn BatchFaultInjector,
+    ) -> Self {
+        Self {
+            faults: BatchFaults {
+                install,
+                receipt,
+                journal,
+                removal,
+                batch,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn execute_multi_install_with_test_faults(
+    plan: &MultiInstallPlan,
+    scopes: &[ResolvedScope],
+    store: &ReceiptStore,
+    faults: &BatchTestFaults<'_>,
+) -> Result<String, BatchInstallError> {
+    execute_multi_install_impl(plan, scopes, store, &faults.faults)
+}
+
+fn execute_multi_install_impl(
+    plan: &MultiInstallPlan,
+    scopes: &[ResolvedScope],
+    store: &ReceiptStore,
+    faults: &BatchFaults<'_>,
+) -> Result<String, BatchInstallError> {
     for scope in scopes {
         store
-            .recover_scope_with_faults(scope, journal_faults, receipt_faults)
+            .recover_scope_with_faults(scope, faults.journal, faults.receipt)
             .map_err(|error| BatchInstallError::PreflightConflict(error.to_string()))?;
     }
     let preflight = inspect_multi_install_preflight(plan, scopes, store)?;
@@ -1260,7 +1342,7 @@ pub(crate) fn execute_multi_install_with_faults(
         .cloned()
         .ok_or_else(|| BatchInstallError::JournalPrepare("empty target list".to_owned()))?;
     let mut reservation = store
-        .reserve(first_receipt, receipt_faults)
+        .reserve(first_receipt, faults.receipt)
         .map_err(|error| BatchInstallError::PreflightConflict(error.to_string()))?;
     reservation
         .validate_receipt_intents(&receipt_intents)
@@ -1282,16 +1364,29 @@ pub(crate) fn execute_multi_install_with_faults(
         .map_err(|error| BatchInstallError::JournalPrepare(error.to_string()))?;
     let mut allowed_batch_directories = Vec::new();
 
+    macro_rules! abort_batch_with_compensation {
+        ($index:expr, $detail:expr, $failure_stage:expr $(,)?) => {
+            return compensate_failed_batch(
+                BatchCompensationContext {
+                    store,
+                    reservation: &mut reservation,
+                    journal_store: &journal_store,
+                    journal: &mut journal,
+                    faults,
+                },
+                $index,
+                $detail,
+                $failure_stage,
+            );
+        };
+    }
+
     for (index, target) in plan.targets.iter().enumerate() {
         if let Err(error) = validate_install_session_preflight_with_batch_directories(
             target.session(),
             &allowed_batch_directories,
         ) {
-            return compensate_failed_batch(
-                store,
-                &mut reservation,
-                &journal_store,
-                &mut journal,
+            abort_batch_with_compensation!(
                 index,
                 format!(
                     "target {} changed before its commit: {error}",
@@ -1301,11 +1396,7 @@ pub(crate) fn execute_multi_install_with_faults(
             );
         }
         if let Err(error) = journal.begin_target(index) {
-            return compensate_failed_batch(
-                store,
-                &mut reservation,
-                &journal_store,
-                &mut journal,
+            abort_batch_with_compensation!(
                 index,
                 format!("batch journal could not record target start: {error}"),
                 TargetFailureStage::BeforeDirectoryCommit,
@@ -1316,9 +1407,9 @@ pub(crate) fn execute_multi_install_with_faults(
             .commit_and_record_under_reservation_at_with_journal(
                 &mut reservation,
                 installed_at,
-                install_faults,
-                receipt_faults,
-                journal_faults,
+                faults.install,
+                faults.receipt,
+                faults.journal,
                 &allowed_batch_directories,
             );
         let receipt = match result {
@@ -1353,15 +1444,7 @@ pub(crate) fn execute_multi_install_with_faults(
                             error
                         )
                     });
-                return compensate_failed_batch(
-                    store,
-                    &mut reservation,
-                    &journal_store,
-                    &mut journal,
-                    index,
-                    detail,
-                    failure_stage,
-                );
+                abort_batch_with_compensation!(index, detail, failure_stage,);
             }
         };
         if let Err(error) = reservation.verify_published_receipt(&receipt) {
@@ -1373,15 +1456,7 @@ pub(crate) fn execute_multi_install_with_faults(
                         "published target receipt verification failed: {error}; batch could not persist target progress: {journal_error}"
                     )
                 });
-            return compensate_failed_batch(
-                store,
-                &mut reservation,
-                &journal_store,
-                &mut journal,
-                index,
-                detail,
-                failure_stage,
-            );
+            abort_batch_with_compensation!(index, detail, failure_stage,);
         }
         if target.plan().destination_snapshot().agents_state() == ComponentState::Missing {
             let current = match inspect_destination_for_agent(
@@ -1404,15 +1479,7 @@ pub(crate) fn execute_multi_install_with_faults(
                                 "committed target parent identity could not be verified: {error}; batch could not persist target progress: {journal_error}"
                             )
                         });
-                    return compensate_failed_batch(
-                        store,
-                        &mut reservation,
-                        &journal_store,
-                        &mut journal,
-                        index,
-                        detail,
-                        failure_stage,
-                    );
+                    abort_batch_with_compensation!(index, detail, failure_stage,);
                 }
             };
             let Some(identity) = current.agents_identity() else {
@@ -1426,15 +1493,7 @@ pub(crate) fn execute_multi_install_with_faults(
                             "committed target parent has no stable filesystem identity; batch could not persist target progress: {journal_error}"
                         )
                     });
-                return compensate_failed_batch(
-                    store,
-                    &mut reservation,
-                    &journal_store,
-                    &mut journal,
-                    index,
-                    detail,
-                    failure_stage,
-                );
+                abort_batch_with_compensation!(index, detail, failure_stage,);
             };
             allowed_batch_directories.push((
                 target.agent().adapter().skill_directory().to_owned(),
@@ -1450,21 +1509,19 @@ pub(crate) fn execute_multi_install_with_faults(
                         "batch journal could not record verified target: {error}; target progress update failed: {journal_error}"
                     )
                 });
-            return compensate_failed_batch(
-                store,
-                &mut reservation,
-                &journal_store,
-                &mut journal,
-                index,
-                detail,
-                failure_stage,
-            );
+            abort_batch_with_compensation!(index, detail, failure_stage,);
         }
+        #[cfg(test)]
+        faults.batch.reached(BatchCrashPoint::TargetVerified(index));
     }
 
     if let Err(error) = journal.finish_complete() {
         return Err(BatchInstallError::Finalization(error.to_string()));
     }
+    #[cfg(test)]
+    faults
+        .batch
+        .reached(BatchCrashPoint::CompleteOutcomeRecorded);
     let output = format_multi_install_success(plan, journal.record());
     let operation_id = journal.record().operation_id.clone();
     journal_store
@@ -1671,15 +1728,27 @@ fn record_failure_progress(
     journal.record_failure_progress(index, commit_progress, receipt_progress)
 }
 
+struct BatchCompensationContext<'a> {
+    store: &'a ReceiptStore,
+    reservation: &'a mut super::receipt_store::ReceiptReservation,
+    journal_store: &'a BatchJournalStore,
+    journal: &'a mut BatchJournal,
+    faults: &'a BatchFaults<'a>,
+}
+
 fn compensate_failed_batch(
-    store: &ReceiptStore,
-    reservation: &mut super::receipt_store::ReceiptReservation,
-    journal_store: &BatchJournalStore,
-    journal: &mut BatchJournal,
+    context: BatchCompensationContext<'_>,
     failed_index: usize,
     detail: String,
     failure_stage: TargetFailureStage,
 ) -> Result<String, BatchInstallError> {
+    let BatchCompensationContext {
+        store,
+        reservation,
+        journal_store,
+        journal,
+        faults,
+    } = context;
     let failed_agent = journal
         .record()
         .targets
@@ -1692,6 +1761,10 @@ fn compensate_failed_batch(
             detail: format!("{detail}; compensation could not be journaled: {error}"),
         });
     }
+    #[cfg(test)]
+    faults
+        .batch
+        .reached(BatchCrashPoint::CompensationIntentRecorded);
 
     if let Err(error) = store.recover_batch_children_under_reservation(
         reservation,
@@ -1709,7 +1782,9 @@ fn compensate_failed_batch(
             continue;
         }
         let expected = journal.record().targets[index].expected_receipt.clone();
-        if let Err(error) = store.compensate_batch_target(reservation, &expected) {
+        if let Err(error) =
+            store.compensate_batch_target_with_faults(reservation, &expected, faults.removal)
+        {
             let _ = journal.mark_partial(index, error.to_string());
             return Err(BatchInstallError::Partial {
                 agent: journal.record().targets[index].agent.clone(),

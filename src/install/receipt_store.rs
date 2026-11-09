@@ -783,6 +783,15 @@ impl ReceiptStore {
         reservation: &ReceiptReservation,
         expected: &InstallationReceipt,
     ) -> Result<bool, RemovalError> {
+        self.compensate_batch_target_with_faults(reservation, expected, &NoRemovalFaults)
+    }
+
+    pub(crate) fn compensate_batch_target_with_faults(
+        &self,
+        reservation: &ReceiptReservation,
+        expected: &InstallationReceipt,
+        removal_faults: &dyn RemovalFaultInjector,
+    ) -> Result<bool, RemovalError> {
         reservation
             .lock
             .validate()
@@ -858,7 +867,7 @@ impl ReceiptStore {
             &removal_store,
             reservation.directory.clone(),
             &reservation.lock,
-            &NoRemovalFaults,
+            removal_faults,
         )?;
         Ok(true)
     }
